@@ -54,6 +54,8 @@
 #include "tams.h"
 #include "libavutil/avstring.h"
 #include "libavutil/error.h"
+#include "libavutil/mem.h"
+#include "libavutil/parseutils.h"
 
 #include <string.h>
 
@@ -1246,5 +1248,75 @@ int ff_tams_parse_flow_segment(const char **p, TAMSFlowSegment *seg)
     }
 
     (*p)++; /* skip '}' */
+    return 0;
+}
+
+/* ====================================================================
+ * Utility functions
+ * ==================================================================== */
+
+int64_t ff_tams_parse_iso8601(const char *str)
+{
+    int64_t t;
+    if (!str || !str[0])
+        return 0;
+    if (av_parse_time(&t, str, 0) < 0)
+        return 0;
+    return t;
+}
+
+int ff_tams_parse_flows_json(const char *json,
+                              TAMSFlow **flows_out, int *nb_flows_out)
+{
+    const char *cursor = json;
+    TAMSFlow *flows = NULL;
+    int nb_flows = 0;
+    int is_array, ret;
+
+    ff_tams_json_skip_ws(&cursor);
+    is_array = (*cursor == '[');
+
+    if (is_array) {
+        cursor++; /* skip '[' */
+        while (1) {
+            TAMSFlow *tmp;
+
+            ff_tams_json_skip_ws(&cursor);
+            if (*cursor == ']')
+                break;
+
+            tmp = av_realloc_array(flows, nb_flows + 1, sizeof(*flows));
+            if (!tmp) {
+                av_free(flows);
+                return AVERROR(ENOMEM);
+            }
+            flows = tmp;
+
+            ret = ff_tams_parse_flow(&cursor, &flows[nb_flows]);
+            if (ret < 0) {
+                av_free(flows);
+                return ret;
+            }
+            nb_flows++;
+
+            ff_tams_json_skip_ws(&cursor);
+            if (*cursor == ',')
+                cursor++;
+        }
+    } else {
+        flows = av_mallocz(sizeof(*flows));
+        if (!flows)
+            return AVERROR(ENOMEM);
+
+        ret = ff_tams_parse_flow(&cursor, &flows[0]);
+        if (ret < 0) {
+            av_free(flows);
+            return ret;
+        }
+        nb_flows = 1;
+    }
+
+    *flows_out    = flows;
+    *nb_flows_out = nb_flows;
     return 0;
 }

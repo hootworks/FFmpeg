@@ -269,4 +269,22 @@ int ff_tams_parse_flow(const char **cursor, TAMSFlow *flow);
  */
 int ff_tams_parse_flow_segment(const char **cursor, TAMSFlowSegment *seg);
 
+/**
+ * Parse an ISO 8601 datetime string into microseconds since the Unix epoch.
+ * Returns 0 if str is NULL, empty, or unparseable.
+ */
+int64_t ff_tams_parse_iso8601(const char *str);
+
+/**
+ * Parse a TAMS /flows JSON response (array or single object) into an
+ * allocated array of TAMSFlow structs.
+ *
+ * On success *flows_out points to an av_malloc'd array of *nb_flows_out
+ * entries.  The caller is responsible for av_free()'ing it.
+ *
+ * @return 0 on success, negative AVERROR on failure
+ */
+int ff_tams_parse_flows_json(const char *json,
+                              TAMSFlow **flows_out, int *nb_flows_out);
+
 #endif /* AVFORMAT_TAMS_H */
