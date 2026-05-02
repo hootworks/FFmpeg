@@ -1011,6 +1011,151 @@ static int test_segment_presigned(void)
 }
 
 /* ====================================================================
+ * ff_tams_parse_iso8601 tests
+ * ==================================================================== */
+
+static int test_parse_iso8601(void)
+{
+    int64_t t;
+
+    /* NULL and empty inputs must return 0 */
+    t = ff_tams_parse_iso8601(NULL);
+    if (t != 0)
+        FAIL("iso8601 NULL: expected 0, got %"PRId64, t);
+
+    t = ff_tams_parse_iso8601("");
+    if (t != 0)
+        FAIL("iso8601 empty: expected 0, got %"PRId64, t);
+
+    /* Invalid string must return 0 */
+    t = ff_tams_parse_iso8601("not-a-date");
+    if (t != 0)
+        FAIL("iso8601 invalid: expected 0, got %"PRId64, t);
+
+    /* Valid UTC datetime must return a non-zero epoch microsecond value */
+    t = ff_tams_parse_iso8601("2018-03-06T09:10:22Z");
+    if (t == 0)
+        FAIL("iso8601 2018-03-06T09:10:22Z: expected non-zero");
+    /* Sanity-check: must be after 2010-01-01 (1262304000s) and before 2030-01-01 */
+    if (t < INT64_C(1262304000) * 1000000 || t > INT64_C(1893456000) * 1000000)
+        FAIL("iso8601 2018-03-06T09:10:22Z: value out of plausible range: %"PRId64, t);
+
+    /* Second valid sample */
+    t = ff_tams_parse_iso8601("2023-09-14T09:45:26Z");
+    if (t == 0)
+        FAIL("iso8601 2023-09-14T09:45:26Z: expected non-zero");
+
+    printf("OK: parse_iso8601\n");
+    return 0;
+}
+
+/* ====================================================================
+ * ff_tams_parse_flows_json tests
+ * ==================================================================== */
+
+static int test_parse_flows_json_single(void)
+{
+    TAMSFlow *flows = NULL;
+    int nb_flows = 0;
+    int ret;
+
+    ret = ff_tams_parse_flows_json(flow_json_video_raw, &flows, &nb_flows);
+    if (ret < 0)
+        FAIL("parse_flows_json_single: returned %d", ret);
+    if (nb_flows != 1)
+        FAIL("parse_flows_json_single: expected 1 flow, got %d", nb_flows);
+    if (!flows)
+        FAIL("parse_flows_json_single: flows is NULL");
+    if (flows[0].format != TAMS_FORMAT_VIDEO)
+        FAIL("parse_flows_json_single: wrong format %d", flows[0].format);
+    if (strcmp(flows[0].id, "0fde9c11-da9d-434a-a113-d3b20a2cf251"))
+        FAIL("parse_flows_json_single: wrong id: %s", flows[0].id);
+    av_free(flows);
+
+    printf("OK: parse_flows_json_single\n");
+    return 0;
+}
+
+static int test_parse_flows_json_array(void)
+{
+    static const char *flow_json_array =
+        "["
+        "    {"
+        "        \"id\": \"4f79cfd1-c057-47f4-8e4d-1b126ca7bf34\","
+        "        \"source_id\": \"2aa143ac-0ab7-4d75-bc32-5c00c13d186f\","
+        "        \"format\": \"urn:x-nmos:format:video\","
+        "        \"codec\": \"video/h264\","
+        "        \"essence_parameters\": {"
+        "            \"frame_width\": 1280,"
+        "            \"frame_height\": 720"
+        "        }"
+        "    },"
+        "    {"
+        "        \"id\": \"94996f2e-0cb5-43d3-ab6c-db5a9cf667aa\","
+        "        \"source_id\": \"2aa143ac-0ab7-4d75-bc32-5c00c13d186f\","
+        "        \"format\": \"urn:x-nmos:format:audio\","
+        "        \"codec\": \"audio/aac\","
+        "        \"essence_parameters\": {"
+        "            \"sample_rate\": 48000,"
+        "            \"channels\": 2"
+        "        }"
+        "    },"
+        "    {"
+        "        \"id\": \"e85efab4-993b-4ad6-9af3-4cd8d0d38860\","
+        "        \"source_id\": \"2aa143ac-0ab7-4d75-bc32-5c00c13d186f\","
+        "        \"format\": \"urn:x-nmos:format:data\","
+        "        \"codec\": \"application/ttml+xml\","
+        "        \"essence_parameters\": {"
+        "            \"data_type\": \"urn:x-tams:data:subtitle\""
+        "        }"
+        "    }"
+        "]";
+
+    TAMSFlow *flows = NULL;
+    int nb_flows = 0;
+    int ret;
+
+    ret = ff_tams_parse_flows_json(flow_json_array, &flows, &nb_flows);
+    if (ret < 0)
+        FAIL("parse_flows_json_array: returned %d", ret);
+    if (nb_flows != 3)
+        FAIL("parse_flows_json_array: expected 3 flows, got %d", nb_flows);
+    if (!flows)
+        FAIL("parse_flows_json_array: flows is NULL");
+    if (flows[0].format != TAMS_FORMAT_VIDEO)
+        FAIL("parse_flows_json_array: flow 0 should be video");
+    if (flows[1].format != TAMS_FORMAT_AUDIO)
+        FAIL("parse_flows_json_array: flow 1 should be audio");
+    if (flows[2].format != TAMS_FORMAT_DATA)
+        FAIL("parse_flows_json_array: flow 2 should be data");
+    if (flows[0].frame_width != 1280 || flows[0].frame_height != 720)
+        FAIL("parse_flows_json_array: flow 0 wrong dimensions");
+    if (flows[1].sample_rate != 48000 || flows[1].channels != 2)
+        FAIL("parse_flows_json_array: flow 1 wrong audio params");
+    av_free(flows);
+
+    printf("OK: parse_flows_json_array\n");
+    return 0;
+}
+
+static int test_parse_flows_json_empty_array(void)
+{
+    TAMSFlow *flows = NULL;
+    int nb_flows = 0;
+    int ret;
+
+    ret = ff_tams_parse_flows_json("[]", &flows, &nb_flows);
+    if (ret < 0)
+        FAIL("parse_flows_json_empty: returned %d", ret);
+    if (nb_flows != 0)
+        FAIL("parse_flows_json_empty: expected 0 flows, got %d", nb_flows);
+    av_free(flows);
+
+    printf("OK: parse_flows_json_empty_array\n");
+    return 0;
+}
+
+/* ====================================================================
  * Main
  * ==================================================================== */
 
@@ -1021,6 +1166,9 @@ int main(int argc, char *argv[])
     /* Timestamp and timerange parsing */
     ret |= test_timestamps();
     ret |= test_timeranges();
+
+    /* ISO 8601 datetime parsing */
+    ret |= test_parse_iso8601();
 
     /* Single flow parsing */
     ret |= test_video_raw();
@@ -1043,8 +1191,13 @@ int main(int argc, char *argv[])
     /* Multi-flow: container mapping */
     ret |= test_multi_container_map();
 
-    /* Multi-flow JSON array */
+    /* Multi-flow JSON array (low-level API) */
     ret |= test_flow_array();
+
+    /* ff_tams_parse_flows_json (high-level API) */
+    ret |= test_parse_flows_json_single();
+    ret |= test_parse_flows_json_array();
+    ret |= test_parse_flows_json_empty_array();
 
     /* Segment parsing */
     ret |= test_segment_full();

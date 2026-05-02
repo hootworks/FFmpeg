@@ -1505,6 +1505,8 @@ static int tams_copy_extradata(AVFormatContext *s, TAMSStreamContext *sc, int ta
     memset(par->extradata + sub_par->extradata_size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
     par->extradata_size = sub_par->extradata_size;
 
+    ffstream(parent_st)->need_context_update = 1;
+
     return 0;
 }
 
