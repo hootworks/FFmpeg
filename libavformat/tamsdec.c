@@ -1,4 +1,6 @@
 /*
+ * Copyright (c) 2026 Nick Ryan <nick.ryan@hoot.works>
+ *
  * This file is part of FFmpeg.
  *
  * FFmpeg is free software; you can redistribute it and/or
@@ -14,32 +16,6 @@
  * You should have received a copy of the GNU Lesser General Public
  * License along with FFmpeg; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
- */
-
-/*
- *
- * Copyright (c) Hoot Works Limited
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * * Redistributions of source code must retain the above copyright notice, this
- *   list of conditions and the following disclaimer.
- * * Redistributions in binary form must reproduce the above copyright notice,
- *   this list of conditions and the following disclaimer in the documentation
- *   and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
  */
 
 /**
@@ -177,26 +153,26 @@ static void tams_log_mapping_summary(AVFormatContext *s)
     const char *flow_type_names[] = {
         "UNKNOWN", "VIDEO", "AUDIO", "DATA", "MULTI", "IMAGE"
     };
-    
+
     av_log(s, AV_LOG_VERBOSE, "TAMS mapping summary:\n");
-    
+
     /* Log all flows with their details */
     av_log(s, AV_LOG_VERBOSE, "  Flows: %d\n", c->nb_flows);
     for (int i = 0; i < c->nb_flows; i++) {
         const TAMSFlow *flow = &c->flows[i];
-        const char *type_name = (flow->format < FF_ARRAY_ELEMS(flow_type_names)) 
+        const char *type_name = (flow->format < FF_ARRAY_ELEMS(flow_type_names))
                                ? flow_type_names[flow->format] : "INVALID";
-        
-        av_log(s, AV_LOG_VERBOSE, "    Flow[%d]: id=%s, format=%s(%d)", 
+
+        av_log(s, AV_LOG_VERBOSE, "    Flow[%d]: id=%s, format=%s(%d)",
                i, flow->id, type_name, flow->format);
-        
+
         if (flow->format == TAMS_FORMAT_VIDEO || flow->format == TAMS_FORMAT_IMAGE) {
             if (flow->frame_rate.num > 0) {
-                av_log(s, AV_LOG_VERBOSE, ", frame_rate=" AVRATIONAL_FORMAT, 
+                av_log(s, AV_LOG_VERBOSE, ", frame_rate=" AVRATIONAL_FORMAT,
                        AVRATIONAL_ARG(flow->frame_rate));
             }
             if (flow->frame_width > 0 && flow->frame_height > 0) {
-                av_log(s, AV_LOG_VERBOSE, ", resolution=%dx%d", 
+                av_log(s, AV_LOG_VERBOSE, ", resolution=%dx%d",
                        flow->frame_width, flow->frame_height);
             }
         } else if (flow->format == TAMS_FORMAT_AUDIO) {
@@ -209,7 +185,7 @@ static void tams_log_mapping_summary(AVFormatContext *s)
         } else if (flow->format == TAMS_FORMAT_MULTI) {
             av_log(s, AV_LOG_VERBOSE, ", sub_flows=%d", flow->nb_flow_collection);
         }
-        
+
         if (flow->timerange.has_start || flow->timerange.has_end) {
             av_log(s, AV_LOG_VERBOSE, ", timerange=[%s%"PRId64"_%"PRId64"%s)",
                    flow->timerange.start_inclusive ? "[" : "(",
@@ -217,10 +193,10 @@ static void tams_log_mapping_summary(AVFormatContext *s)
                    flow->timerange.has_end ? flow->timerange.end : 0,
                    flow->timerange.end_inclusive ? "]" : ")");
         }
-        
+
         av_log(s, AV_LOG_VERBOSE, "\n");
     }
-    
+
     /* Log all streams with their mappings */
     av_log(s, AV_LOG_VERBOSE, "  Streams: %d\n", c->nb_streams);
     for (int i = 0; i < c->nb_streams; i++) {
@@ -229,16 +205,17 @@ static void tams_log_mapping_summary(AVFormatContext *s)
         AVStream *st = s->streams[i];
         const TAMSFlow *flow = &c->flows[sc->flow_index];
         const char *media_type_name = av_get_media_type_string(sc->media_type);
-        
+
         av_log(s, AV_LOG_VERBOSE, "    Stream[%d]: flow_index=%d", i, sc->flow_index);
-        
+
         if (mapping->parent_flow_index >= 0) {
-            av_log(s, AV_LOG_VERBOSE, " (sub-flow, parent_flow_index=%d)", mapping->parent_flow_index);
+            av_log(s, AV_LOG_VERBOSE, " (sub-flow, parent_flow_index=%d)",
+                   mapping->parent_flow_index);
         }
-        
-        av_log(s, AV_LOG_VERBOSE, ", type=%s, seg_ctx_index=%d", 
+
+        av_log(s, AV_LOG_VERBOSE, ", type=%s, seg_ctx_index=%d",
                media_type_name ? media_type_name : "unknown", sc->seg_ctx_index);
-        
+
         if (mapping->has_container_mapping) {
             const TAMSContainerMapping *m = &mapping->container_mapping;
             if (m->has_track_index)
@@ -254,34 +231,34 @@ static void tams_log_mapping_summary(AVFormatContext *s)
             if (m->mxf_package_uid[0])
                 av_log(s, AV_LOG_VERBOSE, ", mxf_package_uid=%s", m->mxf_package_uid);
         }
-        
-        av_log(s, AV_LOG_VERBOSE, ", time_base=" AVRATIONAL_FORMAT, 
+
+        av_log(s, AV_LOG_VERBOSE, ", time_base=" AVRATIONAL_FORMAT,
                AVRATIONAL_ARG(st->time_base));
-        
+
         if (flow->format == TAMS_FORMAT_VIDEO || flow->format == TAMS_FORMAT_IMAGE) {
-            av_log(s, AV_LOG_VERBOSE, ", avg_frame_rate=" AVRATIONAL_FORMAT, 
+            av_log(s, AV_LOG_VERBOSE, ", avg_frame_rate=" AVRATIONAL_FORMAT,
                    AVRATIONAL_ARG(st->avg_frame_rate));
         }
-        
+
         av_log(s, AV_LOG_VERBOSE, "\n");
     }
-    
+
     /* Log segment contexts */
     av_log(s, AV_LOG_VERBOSE, "  Segment contexts: %d\n", c->nb_seg_ctxs);
     for (int i = 0; i < c->nb_seg_ctxs; i++) {
         const TAMSSegmentContext *segc = &c->seg_ctxs[i];
         const TAMSFlow *flow = &c->flows[segc->flow_index];
-        
+
         av_log(s, AV_LOG_VERBOSE, "    TAMSSegmentContext[%d]: flow_index=%d (%s), refcount=%d",
                i, segc->flow_index, flow->id, segc->refcount);
-        
+
         if (segc->is_live) {
             av_log(s, AV_LOG_VERBOSE, ", live=yes, poll=%"PRId64"us", segc->poll_interval);
         }
-        
+
         av_log(s, AV_LOG_VERBOSE, "\n");
     }
-    
+
     /* Show stream to TAMSSegmentContext relationships */
     av_log(s, AV_LOG_VERBOSE, "  Stream->TAMSSegmentContext relationships:\n");
     for (int i = 0; i < c->nb_seg_ctxs; i++) {
@@ -289,7 +266,7 @@ static void tams_log_mapping_summary(AVFormatContext *s)
         int first = 1;
         for (int j = 0; j < c->nb_streams; j++) {
             if (c->streams[j].seg_ctx_index == i) {
-                if (!first) 
+                if (!first)
                     av_log(s, AV_LOG_VERBOSE, ", ");
                 av_log(s, AV_LOG_VERBOSE, "%d", j);
                 first = 0;
@@ -858,7 +835,7 @@ static void tams_build_clean_query(const char *query, char *out, size_t out_size
 
     out[0] = '\0';
     if (out_size < 2) return;
-    
+
     while (*p && len < out_size - 1) {
         const char *amp = strchr(p, '&');
         int plen = amp ? (int)(amp - p) : (int)strlen(p);
@@ -1588,7 +1565,7 @@ static int tams_read_header(AVFormatContext *s)
         }
     }
 
-    // Process each flow to create streams and segment contexts
+    /* Process each flow to create streams and segment contexts. */
     {
         int nb_initial_flows = c->nb_flows;
         for (int i = 0; i < nb_initial_flows; i++) {
@@ -1925,9 +1902,12 @@ retry:
             if (ret < 0)
                 return ret;
 
-            av_log(s, AV_LOG_TRACE, "Got segment packet: pts=%" PRId64 ", dts=%" PRId64
-                    ", duration=%" PRId64 ", stream_index=%d, time_base=" AVRATIONAL_FORMAT "\n", 
-                    pkt->pts, pkt->dts, pkt->duration, pkt->stream_index, AVRATIONAL_ARG(pkt->time_base));
+            av_log(s, AV_LOG_TRACE,
+                   "Got segment packet: pts=%" PRId64 ", dts=%" PRId64
+                   ", duration=%" PRId64 ", stream_index=%d"
+                   ", time_base=" AVRATIONAL_FORMAT "\n",
+                   pkt->pts, pkt->dts, pkt->duration, pkt->stream_index,
+                   AVRATIONAL_ARG(pkt->time_base));
 
             tams_idx = tams_find_stream_for_sub_packet(c, best->seg_ctx_index,
                                                          pkt->stream_index);
@@ -2023,9 +2003,61 @@ static int tams_probe(const AVProbeData *p)
     return 0;
 }
 
-static int tams_seek(AVFormatContext *s, int stream_index, int64_t timestamp, int flags)
+static int tams_seek(AVFormatContext *s, int stream_index,
+                     int64_t timestamp, int flags)
 {
-    return AVERROR_EOF;
+    TAMSContext *c = s->priv_data;
+    int64_t seek_ns;
+
+    if (stream_index < 0 || stream_index >= (int)s->nb_streams)
+        return AVERROR(EINVAL);
+
+    seek_ns = av_rescale_q(timestamp,
+                           s->streams[stream_index]->time_base,
+                           (AVRational){1, TAMS_TIMEBASE});
+
+    for (int i = 0; i < c->nb_seg_ctxs; i++) {
+        TAMSSegmentContext *segc = &c->seg_ctxs[i];
+        const TAMSFlow *flow = &c->flows[segc->flow_index];
+        int64_t tai_ns;
+        int found_idx = 0;
+        int ret;
+
+        if (segc->is_live)
+            return AVERROR(ENOSYS);
+
+        /* Fetch all segment pages for this flow before seeking. */
+        ret = tams_ensure_segments(s, segc);
+        if (ret < 0 && ret != AVERROR_EOF)
+            return ret;
+        if (segc->nb_segments == 0)
+            continue;
+
+        /* Convert output-space seek timestamp to TAI. */
+        tai_ns = seek_ns +
+                 (flow->timerange.has_start ? flow->timerange.start : 0);
+
+        /* Find the last segment whose start is at or before the target. */
+        for (int j = 0; j < segc->nb_segments; j++) {
+            const TAMSFlowSegment *seg = &segc->segments[j];
+            if (seg->timerange.has_start && seg->timerange.start <= tai_ns)
+                found_idx = j;
+        }
+
+        tams_close_segment(segc);
+        segc->cur_segment_index = found_idx;
+        segc->seg_ts_off        = 0;
+        segc->seg_ts_off_set    = 0;
+    }
+
+    for (int i = 0; i < c->nb_streams; i++) {
+        c->streams[i].eof        = 0;
+        c->streams[i].current_ts = seek_ns;
+        c->streams[i].next_pts   = AV_NOPTS_VALUE;
+    }
+
+    ff_read_frame_flush(s);
+    return 0;
 }
 
 #define OFFSET(x) offsetof(TAMSContext, x)

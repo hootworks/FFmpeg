@@ -1,4 +1,6 @@
 /*
+ * Copyright (c) 2026 Nick Ryan <nick.ryan@hoot.works>
+ *
  * This file is part of FFmpeg.
  *
  * FFmpeg is free software; you can redistribute it and/or
@@ -14,32 +16,6 @@
  * You should have received a copy of the GNU Lesser General Public
  * License along with FFmpeg; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
- */
-
-/*
- *
- * Copyright (c) Hoot Works Limited
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * * Redistributions of source code must retain the above copyright notice, this
- *   list of conditions and the following disclaimer.
- * * Redistributions in binary form must reproduce the above copyright notice,
- *   this list of conditions and the following disclaimer in the documentation
- *   and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
  */
 
 /**
@@ -163,7 +139,7 @@ static int json_parse_int(const char **p, int64_t *out)
     /* Skip fractional part if present */
     if (**p == '.') {
         (*p)++;
-    
+
         while (**p >= '0' && **p <= '9')
             (*p)++;
     }
@@ -173,7 +149,7 @@ static int json_parse_int(const char **p, int64_t *out)
         (*p)++;
         if (**p == '+' || **p == '-')
             (*p)++;
-    
+
         while (**p >= '0' && **p <= '9')
             (*p)++;
     }
@@ -219,7 +195,7 @@ int ff_tams_json_skip_value(const char **p)
         char close = (open == '{') ? '}' : ']';
         depth = 1;
         (*p)++;
-    
+
         while (**p && depth > 0) {
             if (**p == '"') {
                 int ret = json_parse_string(p, NULL, 0);
@@ -619,7 +595,7 @@ static int parse_audio_essence(const char **p, TAMSFlow *flow)
             char subkey[64];
             ret = ff_tams_json_expect(p, '{');
             if (ret < 0) return ret;
-        
+
             while (1) {
                 ff_tams_json_skip_ws(p);
                 if (**p == '}')
