@@ -1,0 +1,29 @@
+OK: timestamps
+OK: timeranges
+OK: parse_iso8601
+OK: video_raw (id=0fde9c11-da9d-434a-a113-d3b20a2cf251 format=1)
+OK: video_h264_vfr (id=4f79cfd1-c057-47f4-8e4d-1b126ca7bf34 format=1)
+OK: audio_aac (id=94996f2e-0cb5-43d3-ab6c-db5a9cf667aa format=2)
+OK: data_ttml (id=e85efab4-993b-4ad6-9af3-4cd8d0d38860 format=3)
+OK: video_minimal (id=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee format=1)
+OK: with_timerange (id=bbbbbbbb-cccc-dddd-eeee-ffffffffffff format=1)
+OK: audio_unc (id=cccccccc-dddd-eeee-ffff-aaaaaaaaaaaa format=2)
+OK: multi_separate (id=e85efab4-993b-4ad6-9af3-4cd8d0d38860 format=4)
+OK: multi_container_map (id=8159b781-6033-42e8-b3a1-8a879af5e1aa format=4)
+OK: flow_array (parsed 3 flows)
+OK: parse_flows_json_single
+OK: parse_flows_json_array
+OK: parse_flows_json_empty_array
+OK: segment_full
+OK: segment_minimal
+OK: segment_null_fields
+OK: segment_presigned
+#### The following should fail ####
+OK: bad_json_truncated (correctly failed with -1094995529)
+OK: not_an_object (correctly failed with -1094995529)
+OK: invalid_json (correctly failed with -1094995529)
+OK: unterminated_string (correctly failed with -1094995529)
+OK: missing_brace (correctly failed with -1094995529)
+#### End failing tests ####
+
+ALL TESTS PASSED
