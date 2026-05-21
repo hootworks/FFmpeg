@@ -484,6 +484,7 @@ Muxers/Demuxers:
   spdif*                                Anssi Hannula
   srtdec.c                              Aurelien Jacobs
   swf.c                                 Baptiste Coudurier
+  tams*                             [2] Nick Ryan (CC <nick.ryan@hoot.works>)
   tta.c                                 Alex Beregszaszi
   txd.c                                 Ivo van Poorten
   voc.c                                 Aurelien Jacobs

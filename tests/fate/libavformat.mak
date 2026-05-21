@@ -36,6 +36,10 @@ FATE_LIBAVFORMAT-$(CONFIG_IMF_DEMUXER) += fate-imf
 fate-imf: libavformat/tests/imf$(EXESUF)
 fate-imf: CMD = run libavformat/tests/imf$(EXESUF)
 
+FATE_LIBAVFORMAT-$(CONFIG_TAMS_DEMUXER) += fate-tams
+fate-tams: libavformat/tests/tams$(EXESUF)
+fate-tams: CMD = run libavformat/tests/tams$(EXESUF)
+
 FATE_LIBAVFORMAT += fate-seek_utils
 fate-seek_utils: libavformat/tests/seek_utils$(EXESUF)
 fate-seek_utils: CMD = run libavformat/tests/seek_utils$(EXESUF)

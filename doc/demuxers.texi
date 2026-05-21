@@ -1127,6 +1127,45 @@ the script is directly played, the actual times will match the absolute
 timestamps up to the sound controller's clock accuracy, but if the user
 somehow pauses the playback or seeks, all times will be shifted accordingly.
 
+@section tams
+
+Time-Addressable Media Store demuxer.
+
+This demuxer presents audio and video streams found in TAMS Flows, as specified in
+@url{https://bbc.github.io/tams/main/index.html, Time-addressable Media Store}.
+
+@itemize
+@item
+Access a flow:
+@example
+ffmpeg -i http://<tamsEndpoint>/flows/<flowId> ...
+@end example
+
+@item
+Access a specific timerange within a flow:
+@example
+ffmpeg -i http://<tamsEndpoint>/flows/<flowId>?timerange=<string> ...
+@end example
+
+@item
+Access all flows for a source:
+@example
+ffmpeg http://<tamsEndpoint>/flows?source_id=<sourceId> ...
+@end example
+
+@item
+Access a specific timerange within a source:
+@example
+ffmpeg http://<tamsEndpoint>/flows?source_id=<sourceId>&timerange=<string> ...
+@end example
+
+@item
+Access a TAMS endpoint that requires OAuth2 authentication:
+@example
+ffmpeg -headers "Authorization: Bearer <token>" -i http://<tamsEndpoint>/flows/<flowId> ...
+@end example
+@end itemize
+
 @section tedcaptions
 
 JSON captions used for @url{http://www.ted.com/, TED Talks}.

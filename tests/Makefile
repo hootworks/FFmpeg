@@ -178,6 +178,7 @@ include $(SRC_PATH)/tests/fate/cover-art.mak
 include $(SRC_PATH)/tests/fate/dashenc.mak
 include $(SRC_PATH)/tests/fate/dca.mak
 include $(SRC_PATH)/tests/fate/demux.mak
+include $(SRC_PATH)/tests/fate/tams.mak
 include $(SRC_PATH)/tests/fate/dfa.mak
 include $(SRC_PATH)/tests/fate/dnxhd.mak
 include $(SRC_PATH)/tests/fate/dpcm.mak
