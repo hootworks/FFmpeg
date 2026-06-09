@@ -2064,13 +2064,13 @@ static int tams_seek(AVFormatContext *s, int stream_index,
 #define FLAGS AV_OPT_FLAG_DECODING_PARAM
 
 static const AVOption tams_options[] = {
-    { "live_threshold", "segments_updated threshold for live status in seconds (-1=auto: 2 x segment_duration)",
+    { "live_threshold", "if segments_updated - now() < live_threshold (in seconds) then flow is treated as live (-1=auto: 2 x segment_duration)",
         OFFSET(live_threshold), AV_OPT_TYPE_INT64, {.i64 = -1}, -1, INT_MAX, FLAGS },
-    { "live_timeout", "segments_updated threshold for reverting to non-live status in seconds (-1=auto: 4 x segment_duration)",
+    { "live_timeout", "if segments_updated - now() > live_timeout (in seconds) then live flow is treated as complete (-1=auto: 4 x segment_duration)",
         OFFSET(live_timeout), AV_OPT_TYPE_INT64, {.i64 = -1}, -1, INT_MAX, FLAGS },
-    { "seg_poll_init", "Initial segment poll interval in microseconds (-1=auto: segment_duration)",
+    { "seg_poll_init", "Initial segment poll interval (in microseconds) for live streams (-1=auto: segment_duration)",
         OFFSET(seg_poll_init), AV_OPT_TYPE_INT64, {.i64 = -1}, -1, INT_MAX, FLAGS },
-    { "seg_poll_max", "Max segment poll interval in microseconds",
+    { "seg_poll_max", "Max segment poll interval (in microseconds) when backoff is applied to seg_poll_init for live streams",
         OFFSET(seg_poll_max), AV_OPT_TYPE_INT64, {.i64 = 30000000}, 0, INT_MAX, FLAGS },
     { NULL },
 };
