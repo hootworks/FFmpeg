@@ -129,8 +129,8 @@ typedef struct TAMSContext {
     int nb_flows;
 
     TAMSStreamMapping *stream_mappings;
-    int nb_streams;
-    TAMSStreamContext *streams;
+    TAMSStreamContext *stream_ctxs;
+    int nb_stream_ctxs;
 
     TAMSSegmentContext *seg_ctxs;
     int nb_seg_ctxs;
@@ -198,9 +198,9 @@ static void tams_log_mapping_summary(AVFormatContext *s)
     }
 
     /* Log all streams with their mappings */
-    av_log(s, AV_LOG_VERBOSE, "  Streams: %d\n", c->nb_streams);
-    for (int i = 0; i < c->nb_streams; i++) {
-        const TAMSStreamContext *sc = &c->streams[i];
+    av_log(s, AV_LOG_VERBOSE, "  Stream contexts: %d\n", c->nb_stream_ctxs);
+    for (int i = 0; i < c->nb_stream_ctxs; i++) {
+        const TAMSStreamContext *sc = &c->stream_ctxs[i];
         const TAMSStreamMapping *mapping = &c->stream_mappings[i];
         AVStream *st = s->streams[i];
         const TAMSFlow *flow = &c->flows[sc->flow_index];
@@ -264,8 +264,8 @@ static void tams_log_mapping_summary(AVFormatContext *s)
     for (int i = 0; i < c->nb_seg_ctxs; i++) {
         av_log(s, AV_LOG_VERBOSE, "    TAMSSegmentContext[%d] serves streams: ", i);
         int first = 1;
-        for (int j = 0; j < c->nb_streams; j++) {
-            if (c->streams[j].seg_ctx_index == i) {
+        for (int j = 0; j < c->nb_stream_ctxs; j++) {
+            if (c->stream_ctxs[j].seg_ctx_index == i) {
                 if (!first)
                     av_log(s, AV_LOG_VERBOSE, ", ");
                 av_log(s, AV_LOG_VERBOSE, "%d", j);
@@ -536,21 +536,21 @@ static int tams_add_stream_mapping(TAMSContext *c, int flow_index,
 {
     TAMSStreamMapping *tmp;
 
-    tmp = av_realloc_array(c->stream_mappings, c->nb_streams + 1, sizeof(*tmp));
+    tmp = av_realloc_array(c->stream_mappings, c->nb_stream_ctxs + 1, sizeof(*tmp));
     if (!tmp)
         return AVERROR(ENOMEM);
     c->stream_mappings = tmp;
 
-    c->stream_mappings[c->nb_streams].flow_index = flow_index;
-    c->stream_mappings[c->nb_streams].parent_flow_index = parent_flow_index;
-    c->stream_mappings[c->nb_streams].has_container_mapping = has_container_mapping;
+    c->stream_mappings[c->nb_stream_ctxs].flow_index = flow_index;
+    c->stream_mappings[c->nb_stream_ctxs].parent_flow_index = parent_flow_index;
+    c->stream_mappings[c->nb_stream_ctxs].has_container_mapping = has_container_mapping;
     if (has_container_mapping && m)
-        c->stream_mappings[c->nb_streams].container_mapping = *m;
+        c->stream_mappings[c->nb_stream_ctxs].container_mapping = *m;
     else
-        memset(&c->stream_mappings[c->nb_streams].container_mapping, 0,
-               sizeof(c->stream_mappings[c->nb_streams].container_mapping));
+        memset(&c->stream_mappings[c->nb_stream_ctxs].container_mapping, 0,
+               sizeof(c->stream_mappings[c->nb_stream_ctxs].container_mapping));
 
-    c->nb_streams++;
+    c->nb_stream_ctxs++;
     return 0;
 }
 
@@ -1268,9 +1268,9 @@ static int tams_open_segment(AVFormatContext *s, TAMSSegmentContext *segc)
 
     {
         int segc_index = (int)(segc - c->seg_ctxs);
-        for (int i = 0; i < c->nb_streams; i++) {
-            if (c->streams[i].seg_ctx_index == segc_index)
-                tams_resolve_sub_stream(s, &c->streams[i], segc, &c->stream_mappings[i]);
+        for (int i = 0; i < c->nb_stream_ctxs; i++) {
+            if (c->stream_ctxs[i].seg_ctx_index == segc_index)
+                tams_resolve_sub_stream(s, &c->stream_ctxs[i], segc, &c->stream_mappings[i]);
         }
     }
 
@@ -1495,8 +1495,8 @@ static int tams_copy_extradata(AVFormatContext *s, TAMSStreamContext *sc, int ta
 static int tams_find_stream_for_sub_packet(TAMSContext *c, int seg_ctx_index,
                                             int sub_stream_index)
 {
-    for (int i = 0; i < c->nb_streams; i++) {
-        TAMSStreamContext *sc = &c->streams[i];
+    for (int i = 0; i < c->nb_stream_ctxs; i++) {
+        TAMSStreamContext *sc = &c->stream_ctxs[i];
         if (sc->seg_ctx_index == seg_ctx_index &&
             sc->sub_stream_index == sub_stream_index && !sc->eof)
             return i;
@@ -1576,8 +1576,8 @@ static int tams_read_header(AVFormatContext *s)
         }
     }
 
-    if (c->nb_streams == 0) {
-        av_log(s, AV_LOG_ERROR, "No streams created from TAMS flows\n");
+    if (c->nb_stream_ctxs == 0) {
+        av_log(s, AV_LOG_ERROR, "No stream contexts created from TAMS flows\n");
         return AVERROR_INVALIDDATA;
     }
 
@@ -1591,12 +1591,12 @@ static int tams_read_header(AVFormatContext *s)
             s->duration = av_rescale(max_dur, AV_TIME_BASE, TAMS_TIMEBASE);
     }
 
-    c->streams = av_calloc(c->nb_streams, sizeof(*c->streams));
-    if (!c->streams)
+    c->stream_ctxs = av_calloc(c->nb_stream_ctxs, sizeof(*c->stream_ctxs));
+    if (!c->stream_ctxs)
         return AVERROR(ENOMEM);
 
-    for (int i = 0; i < c->nb_streams; i++) {
-        TAMSStreamContext *sc = &c->streams[i];
+    for (int i = 0; i < c->nb_stream_ctxs; i++) {
+        TAMSStreamContext *sc = &c->stream_ctxs[i];
         TAMSSegmentContext *segc = NULL;
         const TAMSFlow *seg_flow;
 
@@ -1847,8 +1847,8 @@ retry:
     {
         TAMSStreamContext *best = NULL;
 
-        for (int i = 0; i < c->nb_streams; i++) {
-            TAMSStreamContext *sc = &c->streams[i];
+        for (int i = 0; i < c->nb_stream_ctxs; i++) {
+            TAMSStreamContext *sc = &c->stream_ctxs[i];
             if (sc->eof)
                 continue;
             if (!best || sc->current_ts < best->current_ts)
@@ -1867,9 +1867,9 @@ retry:
                 ret = tams_ensure_segments(s, segc);
                 if (ret < 0) {
                     if (ret == AVERROR_EOF) {
-                        for (int i = 0; i < c->nb_streams; i++) {
-                            if (c->streams[i].seg_ctx_index == best->seg_ctx_index)
-                                c->streams[i].eof = 1;
+                        for (int i = 0; i < c->nb_stream_ctxs; i++) {
+                            if (c->stream_ctxs[i].seg_ctx_index == best->seg_ctx_index)
+                                c->stream_ctxs[i].eof = 1;
                         }
                         goto retry;
                     }
@@ -1878,12 +1878,12 @@ retry:
                 ret = tams_open_segment(s, segc);
                 if (ret < 0)
                     return ret;
-                for (int i = 0; i < c->nb_streams; i++) {
-                    if (c->streams[i].seg_ctx_index == best->seg_ctx_index) {
-                        ret = tams_validate_segment_stream(s, &c->streams[i], i);
+                for (int i = 0; i < c->nb_stream_ctxs; i++) {
+                    if (c->stream_ctxs[i].seg_ctx_index == best->seg_ctx_index) {
+                        ret = tams_validate_segment_stream(s, &c->stream_ctxs[i], i);
                         if (ret < 0)
                             return ret;
-                        ret = tams_copy_extradata(s, &c->streams[i], i);
+                        ret = tams_copy_extradata(s, &c->stream_ctxs[i], i);
                         if (ret < 0)
                             return ret;
                     }
@@ -1920,7 +1920,7 @@ retry:
                 int restamp;
 
                 restamp = tams_restamp_packet(s, segc, seg,
-                                              &c->streams[tams_idx],
+                                              &c->stream_ctxs[tams_idx],
                                               tams_idx, pkt);
                 if (restamp == TAMS_PKT_SKIP) {
                     av_packet_unref(pkt);
@@ -1928,7 +1928,7 @@ retry:
                 }
                 if (restamp == TAMS_PKT_EOF) {
                     av_packet_unref(pkt);
-                    c->streams[tams_idx].eof = 1;
+                    c->stream_ctxs[tams_idx].eof = 1;
                     goto retry;
                 }
 
@@ -1955,7 +1955,7 @@ static int tams_close(AVFormatContext *s)
         }
     }
     av_freep(&c->seg_ctxs);
-    av_freep(&c->streams);
+    av_freep(&c->stream_ctxs);
     av_freep(&c->stream_mappings);
     av_dict_free(&c->avio_opts);
     av_freep(&c->flows);
@@ -2050,10 +2050,10 @@ static int tams_seek(AVFormatContext *s, int stream_index,
         segc->seg_ts_off_set    = 0;
     }
 
-    for (int i = 0; i < c->nb_streams; i++) {
-        c->streams[i].eof        = 0;
-        c->streams[i].current_ts = seek_ns;
-        c->streams[i].next_pts   = AV_NOPTS_VALUE;
+    for (int i = 0; i < c->nb_stream_ctxs; i++) {
+        c->stream_ctxs[i].eof        = 0;
+        c->stream_ctxs[i].current_ts = seek_ns;
+        c->stream_ctxs[i].next_pts   = AV_NOPTS_VALUE;
     }
 
     ff_read_frame_flush(s);
