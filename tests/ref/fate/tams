@@ -8,6 +8,7 @@ OK: data_ttml (id=e85efab4-993b-4ad6-9af3-4cd8d0d38860 format=3)
 OK: video_minimal (id=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee format=1)
 OK: with_timerange (id=bbbbbbbb-cccc-dddd-eeee-ffffffffffff format=1)
 OK: audio_unc (id=cccccccc-dddd-eeee-ffff-aaaaaaaaaaaa format=2)
+OK: tag_array_values
 OK: multi_separate (id=e85efab4-993b-4ad6-9af3-4cd8d0d38860 format=4)
 OK: multi_container_map (id=8159b781-6033-42e8-b3a1-8a879af5e1aa format=4)
 OK: flow_array (parsed 3 flows)

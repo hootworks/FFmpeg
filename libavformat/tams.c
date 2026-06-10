@@ -232,6 +232,55 @@ static int json_is_null(const char **p)
 }
 
 /**
+ * Parse a tag value: a JSON string, or an array of strings flattened with ','.
+ * Any other type is skipped and buf is set to empty string.
+ */
+static int json_parse_tag_value(const char **p, char *buf, size_t size)
+{
+    ff_tams_json_skip_ws(p);
+    if (**p == '[') {
+        size_t len = 0;
+        int first = 1;
+        (*p)++; /* skip '[' */
+        while (1) {
+            int ret;
+            ff_tams_json_skip_ws(p);
+            if (**p == ']')
+                break;
+            if (!first && len < size - 1)
+                buf[len++] = ',';
+            first = 0;
+            if (**p == '"') {
+                char elem[TAMS_TAG_VALUE_SIZE];
+                size_t elen, copy;
+                ret = json_parse_string(p, elem, sizeof(elem));
+                if (ret < 0)
+                    return ret;
+                elen = strlen(elem);
+                copy = elen < size - len - 1 ? elen : (size - len - 1);
+                if (copy > 0) {
+                    memcpy(buf + len, elem, copy);
+                    len += copy;
+                }
+            } else {
+                ret = ff_tams_json_skip_value(p);
+                if (ret < 0)
+                    return ret;
+            }
+            ff_tams_json_skip_ws(p);
+            if (**p == ',')
+                (*p)++;
+        }
+        if (**p != ']')
+            return AVERROR_INVALIDDATA;
+        (*p)++; /* skip ']' */
+        buf[len < size ? len : size - 1] = '\0';
+        return 0;
+    }
+    return json_parse_string(p, buf, size);
+}
+
+/**
  * Parse a JSON key: "key" followed by ':'.
  */
 static int json_parse_key(const char **p, char *out, size_t out_size)
@@ -1017,7 +1066,7 @@ int ff_tams_parse_flow(const char **p, TAMSFlow *flow)
                     if (ret < 0) return ret;
                     ret = ff_tams_json_expect(p, ':');
                     if (ret < 0) return ret;
-                    ret = json_parse_string(p, tag->value, sizeof(tag->value));
+                    ret = json_parse_tag_value(p, tag->value, sizeof(tag->value));
                     if (ret < 0) return ret;
                     flow->nb_tags++;
                 } else {
