@@ -594,6 +594,93 @@ static int parse_video_essence(const char **p, TAMSFlow *flow)
         } else if (!strcmp(key, "vfr")) {
             ret = json_parse_bool(p, &flow->vfr);
             if (ret < 0) return ret;
+        } else if (!strcmp(key, "unc_parameters")) {
+            char subkey[64];
+            ret = ff_tams_json_expect(p, '{');
+            if (ret < 0) return ret;
+            while (1) {
+                ff_tams_json_skip_ws(p);
+                if (**p == '}')
+                    break;
+                ret = json_parse_key(p, subkey, sizeof(subkey));
+                if (ret < 0) return ret;
+                if (!strcmp(subkey, "unc_type")) {
+                    ret = json_parse_string(p, str_val, sizeof(str_val));
+                    if (ret < 0) return ret;
+                    if (!strcmp(str_val, "planar"))
+                        flow->video_unc_type = TAMS_VIDEO_UNC_PLANAR;
+                    else if (!strcmp(str_val, "YUYV"))
+                        flow->video_unc_type = TAMS_VIDEO_UNC_YUYV;
+                    else if (!strcmp(str_val, "UYVY"))
+                        flow->video_unc_type = TAMS_VIDEO_UNC_UYVY;
+                    else if (!strcmp(str_val, "AYUV"))
+                        flow->video_unc_type = TAMS_VIDEO_UNC_AYUV;
+                    else if (!strcmp(str_val, "v210"))
+                        flow->video_unc_type = TAMS_VIDEO_UNC_V210;
+                    else if (!strcmp(str_val, "v216"))
+                        flow->video_unc_type = TAMS_VIDEO_UNC_V216;
+                    else if (!strcmp(str_val, "RGB"))
+                        flow->video_unc_type = TAMS_VIDEO_UNC_RGB;
+                    else if (!strcmp(str_val, "RGBx"))
+                        flow->video_unc_type = TAMS_VIDEO_UNC_RGBX;
+                    else if (!strcmp(str_val, "xRGB"))
+                        flow->video_unc_type = TAMS_VIDEO_UNC_XRGB;
+                    else if (!strcmp(str_val, "BGRx"))
+                        flow->video_unc_type = TAMS_VIDEO_UNC_BGRX;
+                    else if (!strcmp(str_val, "xBGR"))
+                        flow->video_unc_type = TAMS_VIDEO_UNC_XBGR;
+                    else if (!strcmp(str_val, "RGBA"))
+                        flow->video_unc_type = TAMS_VIDEO_UNC_RGBA;
+                    else if (!strcmp(str_val, "ARGB"))
+                        flow->video_unc_type = TAMS_VIDEO_UNC_ARGB;
+                    else if (!strcmp(str_val, "BGRA"))
+                        flow->video_unc_type = TAMS_VIDEO_UNC_BGRA;
+                    else if (!strcmp(str_val, "ABGR"))
+                        flow->video_unc_type = TAMS_VIDEO_UNC_ABGR;
+                    else if (!strcmp(str_val, "alpha"))
+                        flow->video_unc_type = TAMS_VIDEO_UNC_ALPHA;
+                } else {
+                    ret = ff_tams_json_skip_value(p);
+                    if (ret < 0) return ret;
+                }
+                ff_tams_json_skip_ws(p);
+                if (**p == ',')
+                    (*p)++;
+            }
+            (*p)++; /* skip '}' */
+        } else if (!strcmp(key, "avc_parameters")) {
+            char subkey[64];
+            int64_t val;
+            ret = ff_tams_json_expect(p, '{');
+            if (ret < 0) return ret;
+            while (1) {
+                ff_tams_json_skip_ws(p);
+                if (**p == '}')
+                    break;
+                ret = json_parse_key(p, subkey, sizeof(subkey));
+                if (ret < 0) return ret;
+                if (!strcmp(subkey, "profile")) {
+                    ret = json_parse_int(p, &val);
+                    if (ret < 0) return ret;
+                    flow->avc_parameters.profile = (int)val;
+                } else if (!strcmp(subkey, "level")) {
+                    ret = json_parse_int(p, &val);
+                    if (ret < 0) return ret;
+                    flow->avc_parameters.level = (int)val;
+                } else if (!strcmp(subkey, "flags")) {
+                    ret = json_parse_int(p, &val);
+                    if (ret < 0) return ret;
+                    flow->avc_parameters.flags = (int)val;
+                } else {
+                    ret = ff_tams_json_skip_value(p);
+                    if (ret < 0) return ret;
+                }
+                ff_tams_json_skip_ws(p);
+                if (**p == ',')
+                    (*p)++;
+            }
+            (*p)++; /* skip '}' */
+            flow->has_avc_parameters = 1;
         } else {
             ret = ff_tams_json_skip_value(p);
             if (ret < 0) return ret;
@@ -684,11 +771,11 @@ static int parse_audio_essence(const char **p, TAMSFlow *flow)
                     ret = json_parse_string(p, str_val, sizeof(str_val));
                     if (ret < 0) return ret;
                     if (!strcmp(str_val, "interleaved"))
-                        flow->unc_type = TAMS_UNC_INTERLEAVED;
+                        flow->audio_unc_type = TAMS_AUDIO_UNC_INTERLEAVED;
                     else if (!strcmp(str_val, "planar"))
-                        flow->unc_type = TAMS_UNC_PLANAR;
+                        flow->audio_unc_type = TAMS_AUDIO_UNC_PLANAR;
                     else if (!strcmp(str_val, "pairs"))
-                        flow->unc_type = TAMS_UNC_PAIRS;
+                        flow->audio_unc_type = TAMS_AUDIO_UNC_PAIRS;
                 } else {
                     ret = ff_tams_json_skip_value(p);
                     if (ret < 0) return ret;

@@ -85,12 +85,38 @@ enum TAMSComponentType {
     TAMS_COMPONENT_RGB,
 };
 
-enum TAMSUncType {
-    TAMS_UNC_UNKNOWN = 0,
-    TAMS_UNC_INTERLEAVED,
-    TAMS_UNC_PLANAR,
-    TAMS_UNC_PAIRS,
+enum TAMSAudioUncType {
+    TAMS_AUDIO_UNC_UNKNOWN = 0,
+    TAMS_AUDIO_UNC_INTERLEAVED,
+    TAMS_AUDIO_UNC_PLANAR,
+    TAMS_AUDIO_UNC_PAIRS,
 };
+
+enum TAMSVideoUncType {
+    TAMS_VIDEO_UNC_UNKNOWN = 0,
+    TAMS_VIDEO_UNC_PLANAR,
+    TAMS_VIDEO_UNC_YUYV,
+    TAMS_VIDEO_UNC_UYVY,
+    TAMS_VIDEO_UNC_AYUV,
+    TAMS_VIDEO_UNC_V210,
+    TAMS_VIDEO_UNC_V216,
+    TAMS_VIDEO_UNC_RGB,
+    TAMS_VIDEO_UNC_RGBX,
+    TAMS_VIDEO_UNC_XRGB,
+    TAMS_VIDEO_UNC_BGRX,
+    TAMS_VIDEO_UNC_XBGR,
+    TAMS_VIDEO_UNC_RGBA,
+    TAMS_VIDEO_UNC_ARGB,
+    TAMS_VIDEO_UNC_BGRA,
+    TAMS_VIDEO_UNC_ABGR,
+    TAMS_VIDEO_UNC_ALPHA,
+};
+
+typedef struct TAMSAvcParameters {
+    int profile;
+    int level;
+    int flags;
+} TAMSAvcParameters;
 
 #define TAMS_MAX_TAGS 32
 #define TAMS_TAG_KEY_SIZE 128
@@ -180,7 +206,10 @@ typedef struct TAMSFlow {
     int coded_frame_size;
     int mp4_oti;
 
-    enum TAMSUncType unc_type;
+    enum TAMSAudioUncType audio_unc_type;
+    enum TAMSVideoUncType video_unc_type;
+    TAMSAvcParameters avc_parameters;
+    int has_avc_parameters;
 
     /* Data essence parameters */
     char data_type[256];
