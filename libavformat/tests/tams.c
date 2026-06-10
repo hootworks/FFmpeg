@@ -1131,6 +1131,50 @@ static int test_parse_flows_json_empty_array(void)
     return 0;
 }
 
+static int test_tag_array_values(void)
+{
+    const char *json =
+        "{"
+        "    \"id\": \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\","
+        "    \"source_id\": \"11111111-2222-3333-4444-555555555555\","
+        "    \"format\": \"urn:x-nmos:format:video\","
+        "    \"codec\": \"video/h264\","
+        "    \"tags\": {"
+        "        \"lang\": [\"en\", \"fr\"],"
+        "        \"auth_classes\": [\"public\"],"
+        "        \"label\": \"simple\""
+        "    },"
+        "    \"essence_parameters\": {"
+        "        \"frame_width\": 1920,"
+        "        \"frame_height\": 1080"
+        "    }"
+        "}";
+    const char *cursor = json;
+    TAMSFlow flow;
+    int ret;
+
+    ret = ff_tams_parse_flow(&cursor, &flow);
+    if (ret < 0)
+        FAIL("tag_array: parse failed: %d", ret);
+    if (flow.nb_tags != 3)
+        FAIL("tag_array: expected 3 tags, got %d", flow.nb_tags);
+    if (strcmp(flow.tags[0].key, "lang"))
+        FAIL("tag_array: wrong tag[0].key: %s", flow.tags[0].key);
+    if (strcmp(flow.tags[0].value, "en,fr"))
+        FAIL("tag_array: wrong tag[0].value: '%s' (expected 'en,fr')", flow.tags[0].value);
+    if (strcmp(flow.tags[1].key, "auth_classes"))
+        FAIL("tag_array: wrong tag[1].key: %s", flow.tags[1].key);
+    if (strcmp(flow.tags[1].value, "public"))
+        FAIL("tag_array: wrong tag[1].value: '%s' (expected 'public')", flow.tags[1].value);
+    if (strcmp(flow.tags[2].key, "label"))
+        FAIL("tag_array: wrong tag[2].key: %s", flow.tags[2].key);
+    if (strcmp(flow.tags[2].value, "simple"))
+        FAIL("tag_array: wrong tag[2].value: '%s' (expected 'simple')", flow.tags[2].value);
+
+    printf("OK: tag_array_values\n");
+    return 0;
+}
+
 /* ====================================================================
  * Main
  * ==================================================================== */
@@ -1160,6 +1204,9 @@ int main(int argc, char *argv[])
 
     /* Uncompressed audio parameters */
     ret |= test_audio_unc();
+
+    /* Tag array values (TAMS 8.0+ schema) */
+    ret |= test_tag_array_values();
 
     /* Multi-flow: separate flows */
     ret |= test_multi_separate();
