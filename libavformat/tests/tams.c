@@ -463,6 +463,11 @@ static int test_video_raw(void)
     if (flow.vert_chroma_subs != 1)
         FAIL("video_raw: wrong vert_chroma_subs: %d", flow.vert_chroma_subs);
 
+    /* Video unc_parameters */
+    if (flow.video_unc_type != TAMS_VIDEO_UNC_UYVY)
+        FAIL("video_raw: wrong video_unc_type: %d (expected TAMS_VIDEO_UNC_UYVY=%d)",
+             flow.video_unc_type, TAMS_VIDEO_UNC_UYVY);
+
     return 0;
 }
 
@@ -488,6 +493,16 @@ static int test_video_h264_vfr(void)
     /* Two tags */
     if (flow.nb_tags != 2)
         FAIL("video_h264_vfr: expected 2 tags, got %d", flow.nb_tags);
+
+    /* avc_parameters */
+    if (!flow.has_avc_parameters)
+        FAIL("video_h264_vfr: has_avc_parameters should be set");
+    if (flow.avc_parameters.profile != 100)
+        FAIL("video_h264_vfr: wrong avc profile: %d", flow.avc_parameters.profile);
+    if (flow.avc_parameters.level != 31)
+        FAIL("video_h264_vfr: wrong avc level: %d", flow.avc_parameters.level);
+    if (flow.avc_parameters.flags != 0)
+        FAIL("video_h264_vfr: wrong avc flags: %d", flow.avc_parameters.flags);
 
     return 0;
 }
@@ -613,8 +628,8 @@ static int test_audio_unc(void)
         FAIL("audio_unc: wrong channels: %d", flow.channels);
     if (flow.bit_depth != 32)
         FAIL("audio_unc: wrong bit_depth");
-    if (flow.unc_type != TAMS_UNC_PLANAR)
-        FAIL("audio_unc: wrong unc_type: %d", flow.unc_type);
+    if (flow.audio_unc_type != TAMS_AUDIO_UNC_PLANAR)
+        FAIL("audio_unc: wrong audio_unc_type: %d", flow.audio_unc_type);
 
     return 0;
 }
