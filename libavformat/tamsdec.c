@@ -479,19 +479,41 @@ static int tams_setup_video_stream(AVStream *st, const TAMSFlow *flow)
         break;
     }
 
-    if (flow->component_type == TAMS_COMPONENT_RGB) {
-        if (flow->bit_depth > 8)
-            st->codecpar->format = AV_PIX_FMT_GBRP10;
-        else
-            st->codecpar->format = AV_PIX_FMT_GBRP;
-    } else if (flow->horiz_chroma_subs > 0 && flow->vert_chroma_subs > 0) {
-        if (flow->horiz_chroma_subs == 2 && flow->vert_chroma_subs == 2) {
-            st->codecpar->format = flow->bit_depth > 8 ? AV_PIX_FMT_YUV420P10 : AV_PIX_FMT_YUV420P;
-        } else if (flow->horiz_chroma_subs == 2 && flow->vert_chroma_subs == 1) {
-            st->codecpar->format = flow->bit_depth > 8 ? AV_PIX_FMT_YUV422P10 : AV_PIX_FMT_YUV422P;
-        } else if (flow->horiz_chroma_subs == 1 && flow->vert_chroma_subs == 1) {
-            st->codecpar->format = flow->bit_depth > 8 ? AV_PIX_FMT_YUV444P10 : AV_PIX_FMT_YUV444P;
+    switch (flow->video_unc_type) {
+    case TAMS_VIDEO_UNC_YUYV:  st->codecpar->format = AV_PIX_FMT_YUYV422;      break;
+    case TAMS_VIDEO_UNC_UYVY:  st->codecpar->format = AV_PIX_FMT_UYVY422;      break;
+    case TAMS_VIDEO_UNC_AYUV:  st->codecpar->format = AV_PIX_FMT_YUVA444P;     break;
+    case TAMS_VIDEO_UNC_V210:  st->codecpar->format = AV_PIX_FMT_YUV422P10;    break;
+    case TAMS_VIDEO_UNC_V216:  st->codecpar->format = AV_PIX_FMT_Y216;         break;
+    case TAMS_VIDEO_UNC_RGB:   st->codecpar->format = AV_PIX_FMT_RGB24;        break;
+    case TAMS_VIDEO_UNC_RGBX:  st->codecpar->format = AV_PIX_FMT_RGB0;         break;
+    case TAMS_VIDEO_UNC_XRGB:  st->codecpar->format = AV_PIX_FMT_0RGB;         break;
+    case TAMS_VIDEO_UNC_BGRX:  st->codecpar->format = AV_PIX_FMT_BGR0;         break;
+    case TAMS_VIDEO_UNC_XBGR:  st->codecpar->format = AV_PIX_FMT_0BGR;         break;
+    case TAMS_VIDEO_UNC_RGBA:  st->codecpar->format = AV_PIX_FMT_RGBA;         break;
+    case TAMS_VIDEO_UNC_ARGB:  st->codecpar->format = AV_PIX_FMT_ARGB;         break;
+    case TAMS_VIDEO_UNC_BGRA:  st->codecpar->format = AV_PIX_FMT_BGRA;         break;
+    case TAMS_VIDEO_UNC_ABGR:  st->codecpar->format = AV_PIX_FMT_ABGR;         break;
+    case TAMS_VIDEO_UNC_ALPHA: st->codecpar->format = AV_PIX_FMT_GRAY8;        break;
+    default:
+        /* TAMS_VIDEO_UNC_UNKNOWN or TAMS_VIDEO_UNC_PLANAR: use chroma-subs logic */
+        if (flow->component_type == TAMS_COMPONENT_RGB) {
+            st->codecpar->format = flow->bit_depth > 8 ? AV_PIX_FMT_GBRP10 : AV_PIX_FMT_GBRP;
+        } else if (flow->horiz_chroma_subs > 0 && flow->vert_chroma_subs > 0) {
+            if (flow->horiz_chroma_subs == 2 && flow->vert_chroma_subs == 2)
+                st->codecpar->format = flow->bit_depth > 8 ? AV_PIX_FMT_YUV420P10 : AV_PIX_FMT_YUV420P;
+            else if (flow->horiz_chroma_subs == 2 && flow->vert_chroma_subs == 1)
+                st->codecpar->format = flow->bit_depth > 8 ? AV_PIX_FMT_YUV422P10 : AV_PIX_FMT_YUV422P;
+            else if (flow->horiz_chroma_subs == 1 && flow->vert_chroma_subs == 1)
+                st->codecpar->format = flow->bit_depth > 8 ? AV_PIX_FMT_YUV444P10 : AV_PIX_FMT_YUV444P;
         }
+        break;
+    }
+
+    if (flow->has_avc_parameters &&
+        st->codecpar->codec_id == AV_CODEC_ID_H264) {
+        st->codecpar->profile = flow->avc_parameters.profile;
+        st->codecpar->level   = flow->avc_parameters.level;
     }
 
     tams_setup_common_stream_tags(st, flow);
