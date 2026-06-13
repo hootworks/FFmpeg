@@ -1360,6 +1360,10 @@ int ff_tams_parse_flow_segment(const char **p, TAMSFlowSegment *seg)
     }
 
     (*p)++; /* skip '}' */
+
+    if (!seg->timerange.has_start || !seg->timerange.has_end)
+        return AVERROR_INVALIDDATA;
+
     return 0;
 }
 
@@ -1430,5 +1434,44 @@ int ff_tams_parse_flows_json(const char *json,
 
     *flows_out    = flows;
     *nb_flows_out = nb_flows;
+    return 0;
+}
+
+int ff_tams_parse_flow_segments_json(const char *json,
+                                      TAMSFlowSegment **segments_inout,
+                                      int *nb_segments_inout)
+{
+    const char *cursor = json;
+    int ret = 0;
+
+    ff_tams_json_skip_ws(&cursor);
+    if (*cursor != '[')
+        return 0;
+    cursor++;
+
+    while (1) {
+        TAMSFlowSegment *tmp;
+
+        ff_tams_json_skip_ws(&cursor);
+        if (*cursor == ']')
+            break;
+
+        tmp = av_realloc_array(*segments_inout, *nb_segments_inout + 1,
+                               sizeof(**segments_inout));
+        if (!tmp)
+            return AVERROR(ENOMEM);
+        *segments_inout = tmp;
+
+        ret = ff_tams_parse_flow_segment(&cursor,
+                                         &(*segments_inout)[*nb_segments_inout]);
+        if (ret < 0)
+            return ret;
+        (*nb_segments_inout)++;
+
+        ff_tams_json_skip_ws(&cursor);
+        if (*cursor == ',')
+            cursor++;
+    }
+
     return 0;
 }
