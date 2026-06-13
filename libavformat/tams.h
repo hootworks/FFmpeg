@@ -292,4 +292,19 @@ int64_t ff_tams_parse_iso8601(const char *str);
 int ff_tams_parse_flows_json(const char *json,
                               TAMSFlow **flows_out, int *nb_flows_out);
 
+/**
+ * Parse a TAMS /flows/{id}/segments JSON array response, appending newly
+ * parsed segments to an existing dynamically-allocated array.
+ *
+ * *segments_inout must either be NULL or point to an av_realloc_array'd
+ * buffer; it is grown as needed.  *nb_segments_inout is updated to reflect
+ * the new count.  On failure the array and count are left in whatever partial
+ * state they were in; the caller is responsible for freeing them.
+ *
+ * @return 0 on success, negative AVERROR on failure
+ */
+int ff_tams_parse_flow_segments_json(const char *json,
+                                      TAMSFlowSegment **segments_inout,
+                                      int *nb_segments_inout);
+
 #endif /* AVFORMAT_TAMS_H */
