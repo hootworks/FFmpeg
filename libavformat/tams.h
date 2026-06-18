@@ -221,8 +221,7 @@ typedef struct TAMSFlow {
 typedef struct TAMSFlowSegment {
     char object_id[512];
     TAMSTimeRange timerange;
-    int64_t ts_offset;
-    int has_ts_offset;
+    int64_t ts_offset;       /* defaults to 0 if absent from JSON */
     int64_t last_duration;
     int has_last_duration;
     char get_url[2048];
