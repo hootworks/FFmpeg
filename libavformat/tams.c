@@ -1333,11 +1333,8 @@ int ff_tams_parse_flow_segment(const char **p, TAMSFlowSegment *seg)
                 ret = ff_tams_parse_timerange(str_val, &seg->timerange);
         } else if (!strcmp(key, "ts_offset")) {
             ret = json_parse_string(p, str_val, sizeof(str_val));
-            if (ret == 0) {
+            if (ret == 0)
                 ret = ff_tams_parse_timestamp(str_val, &seg->ts_offset);
-                if (ret == 0)
-                    seg->has_ts_offset = 1;
-            }
         } else if (!strcmp(key, "last_duration")) {
             ret = json_parse_string(p, str_val, sizeof(str_val));
             if (ret == 0) {
