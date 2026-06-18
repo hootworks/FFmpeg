@@ -1043,6 +1043,7 @@ static int tams_process_flow(AVFormatContext *s, int flow_index)
                 return AVERROR_INVALIDDATA;
             }
             flow = &c->flows[flow_index];
+            item = &flow->flow_collection_items[i];
         }
 
         if (c->flows[sub_index].format == TAMS_FORMAT_MULTI) {
