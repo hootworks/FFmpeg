@@ -644,25 +644,25 @@ static int test_multi_separate(void)
         FAIL("multi_separate: wrong format %d", flow.format);
     if (strcmp(flow.id, "e85efab4-993b-4ad6-9af3-4cd8d0d38860"))
         FAIL("multi_separate: wrong id");
-    if (flow.nb_flow_collection != 3)
+    if (flow.nb_flow_collection_items != 3)
         FAIL("multi_separate: expected 3 collection items, got %d",
-             flow.nb_flow_collection);
+             flow.nb_flow_collection_items);
 
-    if (strcmp(flow.flow_collection[0].id,
+    if (strcmp(flow.flow_collection_items[0].id,
               "4f79cfd1-c057-47f4-8e4d-1b126ca7bf34"))
         FAIL("multi_separate: wrong collection[0].id");
-    if (strcmp(flow.flow_collection[0].role, "video"))
+    if (strcmp(flow.flow_collection_items[0].role, "video"))
         FAIL("multi_separate: wrong collection[0].role");
-    if (flow.flow_collection[0].has_container_mapping)
+    if (flow.flow_collection_items[0].has_container_mapping)
         FAIL("multi_separate: collection[0] should not have container_mapping");
 
-    if (strcmp(flow.flow_collection[1].id,
+    if (strcmp(flow.flow_collection_items[1].id,
               "6101df05-06bb-41b8-8af4-cf7cd33df209"))
         FAIL("multi_separate: wrong collection[1].id");
-    if (strcmp(flow.flow_collection[1].role, "audio"))
+    if (strcmp(flow.flow_collection_items[1].role, "audio"))
         FAIL("multi_separate: wrong collection[1].role");
 
-    if (strcmp(flow.flow_collection[2].role, "subtitles"))
+    if (strcmp(flow.flow_collection_items[2].role, "subtitles"))
         FAIL("multi_separate: wrong collection[2].role");
 
     return 0;
@@ -680,41 +680,41 @@ static int test_multi_container_map(void)
         FAIL("multi_container_map: wrong id");
     if (strcmp(flow.container, "video/mp2t"))
         FAIL("multi_container_map: wrong container: %s", flow.container);
-    if (flow.nb_flow_collection != 3)
+    if (flow.nb_flow_collection_items != 3)
         FAIL("multi_container_map: expected 3 collection items, got %d",
-             flow.nb_flow_collection);
+             flow.nb_flow_collection_items);
 
-    if (strcmp(flow.flow_collection[0].role, "video"))
+    if (strcmp(flow.flow_collection_items[0].role, "video"))
         FAIL("multi_container_map: wrong collection[0].role");
-    if (flow.flow_collection[0].has_container_mapping)
+    if (flow.flow_collection_items[0].has_container_mapping)
         FAIL("multi_container_map: collection[0] should not have container_mapping");
 
-    if (strcmp(flow.flow_collection[1].id,
+    if (strcmp(flow.flow_collection_items[1].id,
               "94996f2e-0cb5-43d3-ab6c-db5a9cf667aa"))
         FAIL("multi_container_map: wrong collection[1].id");
-    if (strcmp(flow.flow_collection[1].role, "L"))
+    if (strcmp(flow.flow_collection_items[1].role, "L"))
         FAIL("multi_container_map: wrong collection[1].role");
-    if (!flow.flow_collection[1].has_container_mapping)
+    if (!flow.flow_collection_items[1].has_container_mapping)
         FAIL("multi_container_map: collection[1] should have container_mapping");
-    if (!flow.flow_collection[1].container_mapping.has_track_index ||
-        flow.flow_collection[1].container_mapping.track_index != 1)
+    if (!flow.flow_collection_items[1].container_mapping.has_track_index ||
+        flow.flow_collection_items[1].container_mapping.track_index != 1)
         FAIL("multi_container_map: wrong collection[1].track_index");
-    if (!flow.flow_collection[1].container_mapping.has_format_track_index ||
-        flow.flow_collection[1].container_mapping.format_track_index != 0)
+    if (!flow.flow_collection_items[1].container_mapping.has_format_track_index ||
+        flow.flow_collection_items[1].container_mapping.format_track_index != 0)
         FAIL("multi_container_map: wrong collection[1].format_track_index");
-    if (!flow.flow_collection[1].container_mapping.has_mp2ts_pid ||
-        flow.flow_collection[1].container_mapping.mp2ts_pid != 257)
+    if (!flow.flow_collection_items[1].container_mapping.has_mp2ts_pid ||
+        flow.flow_collection_items[1].container_mapping.mp2ts_pid != 257)
         FAIL("multi_container_map: wrong collection[1].mp2ts_pid");
 
-    if (strcmp(flow.flow_collection[2].role, "R"))
+    if (strcmp(flow.flow_collection_items[2].role, "R"))
         FAIL("multi_container_map: wrong collection[2].role");
-    if (!flow.flow_collection[2].has_container_mapping)
+    if (!flow.flow_collection_items[2].has_container_mapping)
         FAIL("multi_container_map: collection[2] should have container_mapping");
-    if (flow.flow_collection[2].container_mapping.track_index != 2)
+    if (flow.flow_collection_items[2].container_mapping.track_index != 2)
         FAIL("multi_container_map: wrong collection[2].track_index");
-    if (flow.flow_collection[2].container_mapping.format_track_index != 1)
+    if (flow.flow_collection_items[2].container_mapping.format_track_index != 1)
         FAIL("multi_container_map: wrong collection[2].format_track_index");
-    if (flow.flow_collection[2].container_mapping.mp2ts_pid != 258)
+    if (flow.flow_collection_items[2].container_mapping.mp2ts_pid != 258)
         FAIL("multi_container_map: wrong collection[2].mp2ts_pid");
 
     return 0;
