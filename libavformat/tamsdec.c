@@ -106,6 +106,10 @@ typedef struct TAMSSegmentContext {
      * survives tams_compact_segments() without keeping old entries alive. */
     int     has_fetch_cursor;
     int64_t fetch_cursor_ns;
+    /* Per-segment timestamp offset, computed once from the first packet of
+     * each segment: cur_pts_offset = seg->ts_offset - flow_start. */
+    int64_t cur_pts_offset;
+    int     cur_pts_offset_set;
 } TAMSSegmentContext;
 
 typedef struct TAMSStreamContext {
@@ -119,6 +123,7 @@ typedef struct TAMSStreamContext {
     int sub_stream_index;
     enum AVMediaType media_type;
     int64_t current_ts;
+    int64_t next_pts;
     int eof;
     int extradata_copied;
 } TAMSStreamContext;
@@ -1421,6 +1426,7 @@ static void tams_close_segment(TAMSSegmentContext *segc)
 {
     if (segc->sub_ctx)
         avformat_close_input(&segc->sub_ctx);
+    segc->cur_pts_offset_set = 0;
 }
 
 /*
@@ -1704,6 +1710,7 @@ static int tams_read_header(AVFormatContext *s)
                          : sc->flow_index;
 
         sc->current_ts = INT64_MIN;
+        sc->next_pts   = AV_NOPTS_VALUE;
         sc->sub_stream_index = -1;
 
         switch (c->flows[sc->flow_index].format) {
@@ -1810,17 +1817,20 @@ static int tams_restamp_packet(AVFormatContext *s,
     dur_ns = av_rescale_q(pkt->duration, sub_st->time_base, st->time_base);
 
     /* Step 2: per-segment timestamp offset
-     * presentation_pts = container_pts + ts_offset - flow_start */
+     * presentation_pts = container_pts + cur_pts_offset
+     * where cur_pts_offset = seg->ts_offset - flow_start.
+     * Computed once from the first packet of each segment. */
 
-    {
-        int64_t flow_start = flow->timerange.has_start ? flow->timerange.start : 0;
-        int64_t ts_off     = seg->ts_offset - flow_start;
-
-        if (pts_ns != AV_NOPTS_VALUE)
-            pts_ns += ts_off;
-        if (dts_ns != AV_NOPTS_VALUE)
-            dts_ns += ts_off;
+    if (!segc->cur_pts_offset_set) {
+        int64_t flow_start        = flow->timerange.has_start ? flow->timerange.start : 0;
+        segc->cur_pts_offset      = seg->ts_offset - flow_start;
+        segc->cur_pts_offset_set  = 1;
     }
+
+    if (pts_ns != AV_NOPTS_VALUE)
+        pts_ns += segc->cur_pts_offset;
+    if (dts_ns != AV_NOPTS_VALUE)
+        dts_ns += segc->cur_pts_offset;
 
     /* Write results back into the packet unconditionally so that
      * TAMS_PKT_DISCARD callers receive a fully populated packet. */
@@ -1858,6 +1868,9 @@ static int tams_restamp_packet(AVFormatContext *s,
             return TAMS_PKT_DISCARD;
         }
     }
+
+    if (pts_ns != AV_NOPTS_VALUE && dur_ns > 0)
+        sc->next_pts = pts_ns + dur_ns;
 
     return TAMS_PKT_OK;
 }
