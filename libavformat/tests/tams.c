@@ -929,7 +929,7 @@ static int test_segment_full(void)
         FAIL("segment_full: timerange not parsed");
     if (seg.timerange.start != 0 || seg.timerange.end != INT64_C(5000000000))
         FAIL("segment_full: wrong timerange");
-    if (!seg.has_ts_offset || seg.ts_offset != INT64_C(-700000000))
+    if (seg.ts_offset != INT64_C(-700000000))
         FAIL("segment_full: wrong ts_offset: %"PRId64, seg.ts_offset);
     if (!seg.has_last_duration || seg.last_duration != INT64_C(40000000))
         FAIL("segment_full: wrong last_duration: %"PRId64, seg.last_duration);
@@ -952,8 +952,8 @@ static int test_segment_minimal(void)
 
     if (strcmp(seg.object_id, "seg-002.mp4"))
         FAIL("segment_minimal: wrong object_id");
-    if (seg.has_ts_offset)
-        FAIL("segment_minimal: should not have ts_offset");
+    if (seg.ts_offset != 0)
+        FAIL("segment_minimal: ts_offset should default to 0");
     if (seg.has_last_duration)
         FAIL("segment_minimal: should not have last_duration");
     if (seg.get_url[0])
@@ -973,8 +973,8 @@ static int test_segment_null_fields(void)
     if (ret < 0)
         FAIL("segment_null: parse failed: %d", ret);
 
-    if (seg.has_ts_offset)
-        FAIL("segment_null: null ts_offset should not set has_ts_offset");
+    if (seg.ts_offset != 0)
+        FAIL("segment_null: null ts_offset should default to 0");
     if (seg.has_last_duration)
         FAIL("segment_null: null last_duration should not set has_last_duration");
 
