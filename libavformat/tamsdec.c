@@ -57,9 +57,12 @@
  * Return codes from tams_restamp_packet(), used by tams_read_packet() to
  * decide what to do with each packet after timestamp conversion.
  */
-#define TAMS_PKT_OK   0  /* timestamps updated, packet is ready to return    */
-#define TAMS_PKT_SKIP 1  /* packet falls before the flow's start, discard it */
-#define TAMS_PKT_EOF  2  /* packet falls at or past the flow's end, mark EOF  */
+#define TAMS_PKT_OK      0  /* packet PTS is within the required segment timerange    */
+#define TAMS_PKT_DISCARD 1  /* packet PTS is outside the required segment timerange,
+                               DTS is before the segment end,
+                               it might be required for decode, mark discard         */
+#define TAMS_PKT_EOF     2  /* packet PTS is outside the required segment timerange,
+                               and DTS is at or past the segment end, mark EOF       */
 
 /* MIME type to AVCodecID mapping for TAMS codec field */
 static const struct {
@@ -103,11 +106,6 @@ typedef struct TAMSSegmentContext {
      * survives tams_compact_segments() without keeping old entries alive. */
     int     has_fetch_cursor;
     int64_t fetch_cursor_ns;
-    /* Per-current-segment timestamp offset.
-     * Computed once from the first packet seen in each segment so that
-     * timestamps are seamlessly continuous across segment boundaries. */
-    int64_t seg_ts_off;
-    int     seg_ts_off_set;
 } TAMSSegmentContext;
 
 typedef struct TAMSStreamContext {
@@ -123,7 +121,6 @@ typedef struct TAMSStreamContext {
     int64_t current_ts;
     int eof;
     int extradata_copied;
-    int64_t next_pts;  /* expected next output PTS = last_pts + last_duration */
 } TAMSStreamContext;
 
 typedef struct TAMSContext {
@@ -1706,7 +1703,6 @@ static int tams_read_header(AVFormatContext *s)
                          : sc->flow_index;
 
         sc->current_ts = INT64_MIN;
-        sc->next_pts   = AV_NOPTS_VALUE;
         sc->sub_stream_index = -1;
 
         switch (c->flows[sc->flow_index].format) {
@@ -1778,42 +1774,16 @@ static int tams_read_header(AVFormatContext *s)
  *     nanosecond timebase (1/1000000000) that is set on every output stream.
  *
  *   Step 2 - per-segment timestamp offset
- *     A single offset (seg_ts_off, stored on the segment context and shared
- *     across all streams that live in the same container) is computed once
- *     from the very first packet of each segment and then applied to all
- *     subsequent packets in that segment.  Three sources are tried in order:
- *
- *       a) Explicit ts_offset in the segment JSON.
- *          The TAMS spec defines ts_offset as the value added to each
- *          container timestamp to obtain a TAI timestamp.  When present this
- *          is the authoritative mapping.  The flow's timerange start is then
- *          subtracted to produce a 0-based presentation time.
- *
- *       b) Continuity correction (preferred fallback).
- *          When ts_offset is absent and we have already seen at least one
- *          packet from this stream (sc->next_pts is set), the offset is
- *          chosen so that the first packet of the new segment lands exactly
- *          at sc->next_pts (= last_pts + last_duration of the previous
- *          segment).  This produces seamless output regardless of whether the
- *          declared segment timeranges have small overlaps or gaps - a common
- *          occurrence when the TAMS server computes boundaries from wall-clock
- *          times rather than exact sample counts.
- *
- *       c) Timerange-start fallback.
- *          Used for the very first segment where no prior continuity data
- *          exists.  The segment's timerange start is used as the implied
- *          ts_offset, assuming the container starts at PTS 0.  The flow's
- *          timerange start is subtracted to give pts=0 at the beginning of
- *          the flow.
+ *     The TAMS spec defines ts_offset as the value added to each container
+ *     timestamp to obtain a TAI timestamp (defaults to 0:0 when absent).
+ *     Subtracting the flow's timerange start produces a 0-based presentation
+ *     time:  presentation_pts = container_pts + ts_offset - flow_start.
  *
  *   Step 3 - flow boundary filtering
- *     Packets whose PTS falls before 0 (i.e. before the flow's declared
- *     start) are discarded.  Packets at or after the flow's declared duration
- *     mark the stream as exhausted.
- *
- * After a successful return (TAMS_PKT_OK) sc->next_pts is updated to
- * pts + duration so that the next segment transition can use continuity
- * correction.
+ *     Packets whose PTS falls outside the flow's declared timerange are
+ *     handled based on their DTS relative to the segment end:
+ *     - DTS before segment end  -> TAMS_PKT_DISCARD (may be a decode reference)
+ *     - DTS at/past segment end -> TAMS_PKT_EOF
  */
 static int tams_restamp_packet(AVFormatContext *s,
                                TAMSSegmentContext *segc,
@@ -1838,81 +1808,21 @@ static int tams_restamp_packet(AVFormatContext *s,
            : AV_NOPTS_VALUE;
     dur_ns = av_rescale_q(pkt->duration, sub_st->time_base, st->time_base);
 
-    /* Step 2: per-segment timestamp offset */
+    /* Step 2: per-segment timestamp offset
+     * presentation_pts = container_pts + ts_offset - flow_start */
 
-    /* Compute seg_ts_off once per segment, from the first packet we see.
-     * All streams sharing this segment container are on the same clock, so
-     * the offset is stored on the segment context and reused for every
-     * subsequent packet in the segment. */
-    if (!segc->seg_ts_off_set) {
-        /* Use PTS as the reference timestamp if available, otherwise DTS. */
-        int64_t raw_ref   = (pts_ns != AV_NOPTS_VALUE) ? pts_ns : dts_ns;
+    {
         int64_t flow_start = flow->timerange.has_start ? flow->timerange.start : 0;
+        int64_t ts_off     = seg->ts_offset - flow_start;
 
-        if (seg->has_ts_offset) {
-            /* (a) Explicit ts_offset: authoritative mapping from the TAMS spec.
-             * The spec says: TAI_time = container_pts + ts_offset.
-             * Subtracting flow_start normalises to 0-based presentation time. */
-            segc->seg_ts_off = seg->ts_offset - flow_start;
-            av_log(s, AV_LOG_DEBUG,
-                   "TAMS seg[%d] ts_off=%"PRId64" ns (explicit ts_offset)\n",
-                   segc->cur_flow_segment_index, segc->seg_ts_off);
-
-        } else if (raw_ref != AV_NOPTS_VALUE && sc->next_pts != AV_NOPTS_VALUE) {
-            /* (b) Continuity correction: anchor this segment's first sample to
-             * exactly where the previous segment left off.  This absorbs any
-             * overlap or gap caused by the server computing timerange boundaries
-             * from wall-clock time rather than exact sample counts, and also
-             * handles containers whose first PTS is not zero (e.g. AAC pre-roll). */
-            segc->seg_ts_off = sc->next_pts - raw_ref;
-            av_log(s, AV_LOG_DEBUG,
-                   "TAMS seg[%d] ts_off=%"PRId64" ns (continuity: next_pts=%"PRId64
-                   " raw_ref=%"PRId64")\n",
-                   segc->cur_flow_segment_index, segc->seg_ts_off,
-                   sc->next_pts, raw_ref);
-
-        } else {
-            /* (c) Timerange-start fallback: used for the very first segment
-             * when no prior continuity data is available.  Assumes the segment
-             * container starts at PTS 0, which is true for the vast majority of
-             * TAMS-produced media objects. */
-            int64_t tai_off = seg->timerange.start;
-            segc->seg_ts_off = tai_off - flow_start;
-            av_log(s, AV_LOG_DEBUG,
-                   "TAMS seg[%d] ts_off=%"PRId64" ns (timerange.start fallback)\n",
-                   segc->cur_flow_segment_index, segc->seg_ts_off);
-        }
-
-        segc->seg_ts_off_set = 1;
+        if (pts_ns != AV_NOPTS_VALUE)
+            pts_ns += ts_off;
+        if (dts_ns != AV_NOPTS_VALUE)
+            dts_ns += ts_off;
     }
 
-    /* Apply the offset to convert container-relative times to output times. */
-
-    if (pts_ns != AV_NOPTS_VALUE)
-        pts_ns += segc->seg_ts_off;
-    if (dts_ns != AV_NOPTS_VALUE)
-        dts_ns += segc->seg_ts_off;
-
-    /* Step 3: flow boundary filtering */
-
-    /* Discard packets that precede the flow's start.  This can happen with
-     * the timerange-start fallback (case c) when a container has pre-roll
-     * frames with negative effective PTS, or when ts_offset places the first
-     * container frame slightly before the declared flow start. */
-    if (pts_ns != AV_NOPTS_VALUE && pts_ns < 0)
-        return TAMS_PKT_SKIP;
-
-    /* Stop reading this stream when we reach or pass the flow's declared end.
-     * flow_dur is the total duration in nanoseconds (0-based); it equals
-     * timerange.end - timerange.start and matches st->duration. */
-    if (flow->timerange.has_end) {
-        int64_t flow_dur = flow->timerange.end
-                         - (flow->timerange.has_start ? flow->timerange.start : 0);
-        if (pts_ns != AV_NOPTS_VALUE && pts_ns >= flow_dur)
-            return TAMS_PKT_EOF;
-    }
-
-    /* Write results back into the packet */
+    /* Write results back into the packet unconditionally so that
+     * TAMS_PKT_DISCARD callers receive a fully populated packet. */
 
     pkt->pts          = pts_ns;
     pkt->dts          = dts_ns;
@@ -1926,11 +1836,27 @@ static int tams_restamp_packet(AVFormatContext *s,
     else if (dts_ns != AV_NOPTS_VALUE)
         sc->current_ts = dts_ns;
 
-    /* Record the expected start of the next segment for continuity correction
-     * (case b above).  Only updated when both pts and duration are valid to
-     * avoid advancing the cursor on frames with unknown timing. */
-    if (pts_ns != AV_NOPTS_VALUE && dur_ns > 0)
-        sc->next_pts = pts_ns + dur_ns;
+    /* Step 3: flow boundary filtering */
+
+    if (pts_ns != AV_NOPTS_VALUE) {
+        int outside = (pts_ns < 0);
+        if (!outside && flow->timerange.has_end) {
+            int64_t flow_start = flow->timerange.has_start ? flow->timerange.start : 0;
+            int64_t flow_dur   = flow->timerange.end - flow_start;
+            outside = (pts_ns >= flow_dur);
+        }
+        if (outside) {
+            if (seg->timerange.has_end) {
+                int64_t flow_start = flow->timerange.has_start ? flow->timerange.start : 0;
+                int64_t seg_end_ns = seg->timerange.end - flow_start;
+                if (dts_ns != AV_NOPTS_VALUE && dts_ns < seg_end_ns)
+                    return TAMS_PKT_DISCARD;
+                return TAMS_PKT_EOF;
+            }
+            /* Segment has no declared end; packet may still be a decode reference. */
+            return TAMS_PKT_DISCARD;
+        }
+    }
 
     return TAMS_PKT_OK;
 }
@@ -1996,7 +1922,6 @@ retry:
             if (ret == AVERROR_EOF) {
                 tams_close_segment(segc);
                 segc->cur_flow_segment_index++;
-                segc->seg_ts_off_set = 0;
                 continue;
             }
             if (ret < 0)
@@ -2018,9 +1943,9 @@ retry:
                 restamp = tams_restamp_packet(s, segc, seg,
                                               s->streams[tams_index]->priv_data,
                                               tams_index, pkt);
-                if (restamp == TAMS_PKT_SKIP) {
-                    av_packet_unref(pkt);
-                    continue;
+                if (restamp == TAMS_PKT_DISCARD) {
+                    pkt->flags |= AV_PKT_FLAG_DISCARD;
+                    return 0;
                 }
                 if (restamp == TAMS_PKT_EOF) {
                     av_packet_unref(pkt);
@@ -2133,8 +2058,6 @@ static int tams_seek(AVFormatContext *s, int stream_index,
         segc->cur_flow_segment_index = 0;
         segc->fetch_cursor_ns   = tai_ns;
         segc->has_fetch_cursor  = 1;
-        segc->seg_ts_off        = 0;
-        segc->seg_ts_off_set    = 0;
 
         ret = tams_ensure_segments(s, segc);
         if (ret < 0 && ret != AVERROR_EOF)
@@ -2158,7 +2081,6 @@ static int tams_seek(AVFormatContext *s, int stream_index,
         TAMSStreamContext *sc = s->streams[i]->priv_data;
         sc->eof        = 0;
         sc->current_ts = seek_ns;
-        sc->next_pts   = AV_NOPTS_VALUE;
     }
 
     ff_read_frame_flush(s);
