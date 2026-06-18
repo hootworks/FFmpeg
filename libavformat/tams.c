@@ -1012,12 +1012,12 @@ static int parse_flow_collection(const char **p, TAMSFlow *flow)
         if (**p == ']')
             break;
 
-        if (flow->nb_flow_collection >= TAMS_MAX_COLLECTION_ITEMS) {
+        if (flow->nb_flow_collection_items >= TAMS_MAX_COLLECTION_ITEMS) {
             ret = ff_tams_json_skip_value(p);
             if (ret < 0) return ret;
         } else {
             TAMSFlowCollectionItem *item =
-                &flow->flow_collection[flow->nb_flow_collection];
+                &flow->flow_collection_items[flow->nb_flow_collection_items];
             memset(item, 0, sizeof(*item));
 
             ret = ff_tams_json_expect(p, '{');
@@ -1050,7 +1050,7 @@ static int parse_flow_collection(const char **p, TAMSFlow *flow)
                     (*p)++;
             }
             (*p)++;
-            flow->nb_flow_collection++;
+            flow->nb_flow_collection_items++;
         }
 
         ff_tams_json_skip_ws(p);
