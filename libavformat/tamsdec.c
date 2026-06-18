@@ -77,6 +77,7 @@ static const struct {
     { "audio/aac",       AV_CODEC_ID_AAC },
     { "audio/mp4a-latm", AV_CODEC_ID_AAC },
     { "audio/opus",      AV_CODEC_ID_OPUS },
+    { "audio/mp2",       AV_CODEC_ID_MP2 },
     { "audio/mp3",       AV_CODEC_ID_MP3 },
     { "audio/mpeg",      AV_CODEC_ID_MP3 },
     { "audio/flac",      AV_CODEC_ID_FLAC },
@@ -410,6 +411,17 @@ static int tams_validate_segment_stream(AVFormatContext *s,
         return 0;
 
     par = segc->sub_ctx->streams[sc->sub_stream_index]->codecpar;
+
+    if (flow->codec[0]) {
+        enum AVCodecID expected = tams_codec_lookup(flow->codec);
+        if (expected != AV_CODEC_ID_NONE && par->codec_id != AV_CODEC_ID_NONE &&
+            par->codec_id != expected) {
+            av_log(s, AV_LOG_ERROR,
+                   "TAMS flow %.8s: segment codec %s does not match flow codec %s\n",
+                   flow->id, avcodec_get_name(par->codec_id), flow->codec);
+            return AVERROR_INVALIDDATA;
+        }
+    }
 
     if (flow->format == TAMS_FORMAT_VIDEO || flow->format == TAMS_FORMAT_IMAGE) {
         if (flow->frame_width > 0 && par->width != flow->frame_width) {
