@@ -35,6 +35,11 @@
 
 #define TAMS_TIMEBASE INT64_C(1000000000)
 #define TAMS_UUID_SIZE 37
+#define TAMS_MAX_TAGS 32
+#define TAMS_TAG_KEY_SIZE 128
+#define TAMS_TAG_VALUE_SIZE 256
+#define TAMS_MAX_COLLECTION_ITEMS 16
+#define TAMS_ROLE_SIZE 64
 
 /**
  * TAMS format URN strings, shared between probe and parsing.
@@ -117,12 +122,6 @@ typedef struct TAMSAvcParameters {
     int level;
     int flags;
 } TAMSAvcParameters;
-
-#define TAMS_MAX_TAGS 32
-#define TAMS_TAG_KEY_SIZE 128
-#define TAMS_TAG_VALUE_SIZE 256
-#define TAMS_MAX_COLLECTION_ITEMS 16
-#define TAMS_ROLE_SIZE 64
 
 typedef struct TAMSTag {
     char key[TAMS_TAG_KEY_SIZE];
@@ -215,8 +214,8 @@ typedef struct TAMSFlow {
     char data_type[256];
 
     /* Multi-flow collection */
-    TAMSFlowCollectionItem flow_collection[TAMS_MAX_COLLECTION_ITEMS];
-    int nb_flow_collection;
+    TAMSFlowCollectionItem flow_collection_items[TAMS_MAX_COLLECTION_ITEMS];
+    int nb_flow_collection_items;
 } TAMSFlow;
 
 typedef struct TAMSFlowSegment {
