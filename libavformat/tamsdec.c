@@ -1382,6 +1382,18 @@ static int tams_open_segment(AVFormatContext *s, TAMSSegmentContext *segc)
             if (sc->seg_ctx_index == segc_index)
                 tams_resolve_sub_stream(s, sc, segc);
         }
+        for (int j = 0; j < segc->sub_ctx->nb_streams; j++) {
+            int used = 0;
+            for (int i = 0; i < s->nb_streams; i++) {
+                const TAMSStreamContext *sc = s->streams[i]->priv_data;
+                if (sc->seg_ctx_index == segc_index && sc->sub_stream_index == j) {
+                    used = 1;
+                    break;
+                }
+            }
+            if (!used)
+                segc->sub_ctx->streams[j]->discard = AVDISCARD_ALL;
+        }
     }
 
     return 0;
@@ -1978,12 +1990,8 @@ retry:
             if (ret < 0)
                 return ret;
 
-            av_log(s, AV_LOG_TRACE,
-                   "Got sub-stream segment packet: pts=%" PRId64 ", dts=%" PRId64
-                   ", duration=%" PRId64 ", stream_index=%d"
-                   ", time_base=" AVRATIONAL_FORMAT "\n",
-                   pkt->pts, pkt->dts, pkt->duration, pkt->stream_index,
-                   AVRATIONAL_ARG(pkt->time_base));
+            av_log(s, AV_LOG_TRACE, "Sub-stream segment packet: ");
+            av_pkt_dump_log2(s, AV_LOG_TRACE, pkt, 0, s->streams[pkt->stream_index]);
 
             tams_index = tams_find_stream_for_sub_packet(s, best->seg_ctx_index,
                                                          pkt->stream_index);
@@ -2008,10 +2016,8 @@ retry:
                     goto retry;
                 }
 
-                av_log(s, AV_LOG_TRACE,
-                       "TAMS packet: pts=%" PRId64 " dts=%" PRId64
-                       " duration=%" PRId64 " stream=%d\n",
-                       pkt->pts, pkt->dts, pkt->duration, pkt->stream_index);
+                av_log(s, AV_LOG_TRACE, "Mapped TAMS packet: ");
+                av_pkt_dump_log2(s, AV_LOG_TRACE, pkt, 0, s->streams[pkt->stream_index]);
 
                 return 0;
             }
