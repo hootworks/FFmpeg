@@ -61,7 +61,9 @@
 #define TAMS_PKT_DISCARD 1  /* packet PTS is outside the required segment timerange,
                                DTS is before the segment end,
                                it might be required for decode, mark discard         */
-#define TAMS_PKT_EOF     2  /* packet PTS is outside the required segment timerange,
+#define TAMS_PKT_EOSEG   2  /* packet PTS is outside the required segment timerange,
+                               and DTS is at or past the segment end, mark EOSEG     */
+#define TAMS_PKT_EOF     3  /* packet PTS is outside the required flow timerange,
                                and DTS is at or past the segment end, mark EOF       */
 
 /* MIME type to AVCodecID mapping for TAMS codec field */
@@ -1848,24 +1850,41 @@ static int tams_restamp_packet(AVFormatContext *s,
         sc->current_ts = dts_ns;
 
     /* Step 3: flow boundary filtering */
-
     if (pts_ns != AV_NOPTS_VALUE) {
-        int outside = (pts_ns < 0);
-        if (!outside && flow->timerange.has_end) {
-            int64_t flow_start = flow->timerange.has_start ? flow->timerange.start : 0;
-            int64_t flow_dur   = flow->timerange.end - flow_start;
-            outside = (pts_ns >= flow_dur);
+        int64_t flow_start = flow->timerange.has_start ? flow->timerange.start : 0;
+
+        /* Handle Flow and Segment start boundaries */
+        if (pts_ns < 0)
+            return TAMS_PKT_DISCARD;
+
+        if (seg->timerange.has_start) {
+            int64_t seg_start_ns = seg->timerange.start - flow_start;
+            if (pts_ns <= (seg_start_ns - seg->timerange.start_inclusive))
+                return TAMS_PKT_DISCARD;
         }
-        if (outside) {
-            if (seg->timerange.has_end) {
-                int64_t flow_start = flow->timerange.has_start ? flow->timerange.start : 0;
-                int64_t seg_end_ns = seg->timerange.end - flow_start;
-                if (dts_ns != AV_NOPTS_VALUE && dts_ns < seg_end_ns)
+
+        /* Handle Flow end boundary, but discard if this packet may be needed by another one */
+        if (flow->timerange.has_end) {
+            int64_t flow_dur = flow->timerange.end - flow_start;
+
+            if ((pts_ns > flow->timerange.end && flow->timerange.end_inclusive) || pts_ns >= flow->timerange.end) {
+                if (dts_ns != AV_NOPTS_VALUE && dts_ns < flow_dur)
                     return TAMS_PKT_DISCARD;
+
                 return TAMS_PKT_EOF;
             }
-            /* Segment has no declared end; packet may still be a decode reference. */
-            return TAMS_PKT_DISCARD;
+        }
+
+        /* Handle segment end boundary */
+        if (seg->timerange.has_end) {
+            int64_t seg_end_ns = seg->timerange.end - flow_start;
+
+            if ((pts_ns > seg->timerange.end && seg->timerange.end_inclusive) || pts_ns >= seg->timerange.end) {
+                if (dts_ns != AV_NOPTS_VALUE && dts_ns <= seg_end_ns)
+                    return TAMS_PKT_DISCARD;
+
+                return TAMS_PKT_EOSEG;
+            }
         }
     }
 
@@ -1965,6 +1984,11 @@ retry:
                     av_packet_unref(pkt);
                     ((TAMSStreamContext *)s->streams[tams_index]->priv_data)->eof = 1;
                     goto retry;
+                }
+                if (restamp == TAMS_PKT_EOSEG) {
+                    tams_close_segment(segc);
+                    segc->cur_flow_segment_index++;
+                    continue;
                 }
 
                 av_log(s, AV_LOG_TRACE, "Mapped TAMS packet: ");
