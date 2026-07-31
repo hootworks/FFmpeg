@@ -1788,12 +1788,15 @@ static int tams_read_header(AVFormatContext *s)
  *     timestamp to obtain a TAI timestamp (defaults to 0:0 when absent).
  *     Subtracting the flow's timerange start produces a 0-based presentation
  *     time:  presentation_pts = container_pts + ts_offset - flow_start.
+ *     This offset is computed once from the first packet of each segment
+ *     and cached in segc->cur_pts_offset for the rest of the segment.
  *
- *   Step 3 - flow boundary filtering
- *     Packets whose PTS falls outside the flow's declared timerange are
- *     handled based on their DTS relative to the segment end:
- *     - DTS before segment end  -> TAMS_PKT_DISCARD (may be a decode reference)
- *     - DTS at/past segment end -> TAMS_PKT_EOF
+ *   Step 3 - flow/segment boundary filtering
+ *     - PTS before flow/segment start                      -> TAMS_PKT_DISCARD (may be a decode reference)
+ *     - PTS at/past flow end, DTS before flow end          -> TAMS_PKT_DISCARD (may be a decode reference)
+ *     - PTS at/past flow end, DTS at/past flow end         -> TAMS_PKT_EOF
+ *     - PTS at/past segment end, DTS at/before segment end -> TAMS_PKT_DISCARD (may be a decode reference)
+ *     - PTS at/past segment end, DTS past segment end      -> TAMS_PKT_EOSEG
  */
 static int tams_restamp_packet(AVFormatContext *s,
                                TAMSSegmentContext *segc,
