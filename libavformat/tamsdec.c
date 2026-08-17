@@ -191,7 +191,7 @@ static int tams_check_live(TAMSContext *c, const TAMSFlow *flow)
 {
     int64_t seg_updated, age, threshold;
 
-    seg_updated = ff_tams_parse_iso8601(flow->segments_updated);
+    seg_updated = ff_tams_iso8601_from_str(flow->segments_updated);
     if (!seg_updated)
         return 0;
 
@@ -211,7 +211,7 @@ static int tams_check_live_expired(TAMSContext *c, const TAMSFlow *flow)
 {
     int64_t seg_updated, age, timeout;
 
-    seg_updated = ff_tams_parse_iso8601(flow->segments_updated);
+    seg_updated = ff_tams_iso8601_from_str(flow->segments_updated);
     if (!seg_updated)
         return 1;
 
@@ -940,7 +940,6 @@ static int tams_fetch_sub_flow(AVFormatContext *s, const char *flow_id)
     AVIOContext *pb = NULL;
     AVDictionary *opts = NULL;
     AVBPrint buf;
-    TAMSFlow *tmp;
     char url[4096];
     char base_url[2048];
     int ret;
@@ -979,23 +978,11 @@ static int tams_fetch_sub_flow(AVFormatContext *s, const char *flow_id)
 
     av_log(s, AV_LOG_DEBUG, "TAMS sub-flow JSON:\n%s\n", buf.str);
 
-    tmp = av_realloc_array(c->flows, c->nb_flows + 1, sizeof(*c->flows));
-    if (!tmp) {
-        av_bprint_finalize(&buf, NULL);
-        return AVERROR(ENOMEM);
-    }
-    c->flows = tmp;
-    memset(&c->flows[c->nb_flows], 0, sizeof(*c->flows));
-
-    {
-        const char *cursor = buf.str;
-        ret = ff_tams_parse_flow(&cursor, &c->flows[c->nb_flows]);
-    }
+    ret = ff_tams_flows_from_json(buf.str, &c->flows, &c->nb_flows);
     av_bprint_finalize(&buf, NULL);
     if (ret < 0)
         return ret;
 
-    c->nb_flows++;
     return c->nb_flows - 1;
 }
 
@@ -1122,7 +1109,7 @@ static int tams_fetch_segments(AVFormatContext *s, TAMSSegmentContext *segc)
 
     av_log(s, AV_LOG_DEBUG, "TAMS segments JSON:\n%s\n", buf.str);
 
-    ret = ff_tams_parse_flow_segments_json(buf.str,
+    ret = ff_tams_flow_segments_from_json(buf.str,
                                            &segc->flow_segments, &segc->nb_flow_segments);
     av_bprint_finalize(&buf, NULL);
     if (ret < 0)
@@ -1630,7 +1617,7 @@ static int tams_read_header(AVFormatContext *s)
     av_log(s, AV_LOG_DEBUG, "TAMS JSON response:\n%s\n", buf.str);
 
     /* Parse flow(s) from JSON */
-    ret = ff_tams_parse_flows_json(buf.str, &c->flows, &c->nb_flows);
+    ret = ff_tams_flows_from_json(buf.str, &c->flows, &c->nb_flows);
     av_bprint_finalize(&buf, NULL);
     if (ret < 0)
         return ret;
@@ -1657,7 +1644,7 @@ static int tams_read_header(AVFormatContext *s)
             if (tlen > 0 && tlen < (int)sizeof(tr_val)) {
                 memcpy(tr_val, tr_str, tlen);
                 tr_val[tlen] = '\0';
-                if (ff_tams_parse_timerange(tr_val, &url_tr) >= 0)
+                if (ff_tams_timerange_from_str(tr_val, &url_tr) >= 0)
                     has_url_tr = 1;
             }
         }
