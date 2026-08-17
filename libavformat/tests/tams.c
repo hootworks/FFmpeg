@@ -28,6 +28,8 @@
 
 #include "libavformat/tams.c"
 
+#include "libavutil/bprint.h"
+#include "libavutil/macros.h"
 #include "libavutil/mem.h"
 
 #include <inttypes.h>
@@ -360,9 +362,9 @@ static int test_flow_parsing(const char *test_name, const char *flow_json,
     TAMSFlow flow;
     int ret;
 
-    ret = ff_tams_parse_flow(&cursor, &flow);
+    ret = tams_flow_from_json(&cursor, &flow);
     if (ret < 0)
-        FAIL("%s: ff_tams_parse_flow returned %d", test_name, ret);
+        FAIL("%s: tams_flow_from_json returned %d", test_name, ret);
 
     if (!flow.id[0])
         FAIL("%s: id not parsed", test_name);
@@ -384,7 +386,7 @@ static int test_flow_parsing_fails(const char *test_name, const char *flow_json)
     TAMSFlow flow;
     int ret;
 
-    ret = ff_tams_parse_flow(&cursor, &flow);
+    ret = tams_flow_from_json(&cursor, &flow);
     if (ret >= 0)
         FAIL("%s: expected failure but got success", test_name);
 
@@ -770,7 +772,7 @@ static int test_flow_array(void)
             break;
         if (count >= 3)
             FAIL("flow_array: too many flows");
-        ret = ff_tams_parse_flow(&cursor, &flows[count]);
+        ret = tams_flow_from_json(&cursor, &flows[count]);
         if (ret < 0)
             FAIL("flow_array: parse flow %d failed: %d", count, ret);
         count++;
@@ -816,29 +818,29 @@ static int test_timestamps(void)
     int64_t ts;
     int ret;
 
-    ret = ff_tams_parse_timestamp("0:0", &ts);
+    ret = ff_tams_timestamp_from_str("0:0", &ts);
     if (ret < 0 || ts != 0)
         FAIL("timestamp 0:0 -> %"PRId64, ts);
 
-    ret = ff_tams_parse_timestamp("1:40000000", &ts);
+    ret = ff_tams_timestamp_from_str("1:40000000", &ts);
     if (ret < 0 || ts != INT64_C(1040000000))
         FAIL("timestamp 1:40000000 -> %"PRId64, ts);
 
-    ret = ff_tams_parse_timestamp("100:0", &ts);
+    ret = ff_tams_timestamp_from_str("100:0", &ts);
     if (ret < 0 || ts != INT64_C(100000000000))
         FAIL("timestamp 100:0 -> %"PRId64, ts);
 
-    ret = ff_tams_parse_timestamp("-1:500000000", &ts);
+    ret = ff_tams_timestamp_from_str("-1:500000000", &ts);
     if (ret < 0 || ts != INT64_C(-1500000000))
         FAIL("timestamp -1:500000000 -> %"PRId64, ts);
 
     /* Invalid: no colon */
-    ret = ff_tams_parse_timestamp("12345", &ts);
+    ret = ff_tams_timestamp_from_str("12345", &ts);
     if (ret >= 0)
         FAIL("timestamp '12345' should fail");
 
     /* Invalid: empty */
-    ret = ff_tams_parse_timestamp("", &ts);
+    ret = ff_tams_timestamp_from_str("", &ts);
     if (ret >= 0)
         FAIL("timestamp '' should fail");
 
@@ -852,7 +854,7 @@ static int test_timeranges(void)
     int ret;
 
     /* Standard inclusive-exclusive range */
-    ret = ff_tams_parse_timerange("[0:0_10:0)", &tr);
+    ret = ff_tams_timerange_from_str("[0:0_10:0)", &tr);
     if (ret < 0)
         FAIL("timerange [0:0_10:0)");
     if (!tr.has_start || !tr.has_end)
@@ -863,14 +865,14 @@ static int test_timeranges(void)
         FAIL("timerange [0:0_10:0): wrong inclusivity");
 
     /* Eternity: _ */
-    ret = ff_tams_parse_timerange("_", &tr);
+    ret = ff_tams_timerange_from_str("_", &tr);
     if (ret < 0)
         FAIL("timerange _");
     if (tr.has_start || tr.has_end)
         FAIL("timerange _: should have no start/end");
 
     /* Never: () */
-    ret = ff_tams_parse_timerange("()", &tr);
+    ret = ff_tams_timerange_from_str("()", &tr);
     if (ret < 0)
         FAIL("timerange ()");
     if (tr.has_start || tr.has_end)
@@ -879,7 +881,7 @@ static int test_timeranges(void)
         FAIL("timerange (): should not be inclusive");
 
     /* Instantaneous: [1:0] */
-    ret = ff_tams_parse_timerange("[1:0]", &tr);
+    ret = ff_tams_timerange_from_str("[1:0]", &tr);
     if (ret < 0)
         FAIL("timerange [1:0]");
     if (!tr.has_start || !tr.has_end)
@@ -890,7 +892,7 @@ static int test_timeranges(void)
         FAIL("timerange [1:0]: should be inclusive");
 
     /* Fully inclusive range */
-    ret = ff_tams_parse_timerange("[5:500000000_20:0]", &tr);
+    ret = ff_tams_timerange_from_str("[5:500000000_20:0]", &tr);
     if (ret < 0)
         FAIL("timerange [5:500000000_20:0]");
     if (tr.start != INT64_C(5500000000) || tr.end != INT64_C(20000000000))
@@ -899,7 +901,7 @@ static int test_timeranges(void)
         FAIL("timerange [5:500000000_20:0]: wrong inclusivity");
 
     /* Negative timestamp */
-    ret = ff_tams_parse_timerange("[-1:0_0:0)", &tr);
+    ret = ff_tams_timerange_from_str("[-1:0_0:0)", &tr);
     if (ret < 0)
         FAIL("timerange [-1:0_0:0)");
     if (tr.start != INT64_C(-1000000000) || tr.end != 0)
@@ -919,7 +921,7 @@ static int test_segment_full(void)
     TAMSFlowSegment seg;
     int ret;
 
-    ret = ff_tams_parse_flow_segment(&cursor, &seg);
+    ret = tams_flow_segment_from_json(&cursor, &seg);
     if (ret < 0)
         FAIL("segment_full: parse failed: %d", ret);
 
@@ -946,7 +948,7 @@ static int test_segment_minimal(void)
     TAMSFlowSegment seg;
     int ret;
 
-    ret = ff_tams_parse_flow_segment(&cursor, &seg);
+    ret = tams_flow_segment_from_json(&cursor, &seg);
     if (ret < 0)
         FAIL("segment_minimal: parse failed: %d", ret);
 
@@ -969,7 +971,7 @@ static int test_segment_null_fields(void)
     TAMSFlowSegment seg;
     int ret;
 
-    ret = ff_tams_parse_flow_segment(&cursor, &seg);
+    ret = tams_flow_segment_from_json(&cursor, &seg);
     if (ret < 0)
         FAIL("segment_null: parse failed: %d", ret);
 
@@ -988,7 +990,7 @@ static int test_segment_presigned(void)
     TAMSFlowSegment seg;
     int ret;
 
-    ret = ff_tams_parse_flow_segment(&cursor, &seg);
+    ret = tams_flow_segment_from_json(&cursor, &seg);
     if (ret < 0)
         FAIL("segment_presigned: parse failed: %d", ret);
 
@@ -1002,7 +1004,7 @@ static int test_segment_presigned(void)
 }
 
 /* ====================================================================
- * ff_tams_parse_iso8601 tests
+ * ff_tams_iso8601_from_str tests
  * ==================================================================== */
 
 static int test_parse_iso8601(void)
@@ -1010,21 +1012,21 @@ static int test_parse_iso8601(void)
     int64_t t;
 
     /* NULL and empty inputs must return 0 */
-    t = ff_tams_parse_iso8601(NULL);
+    t = ff_tams_iso8601_from_str(NULL);
     if (t != 0)
         FAIL("iso8601 NULL: expected 0, got %"PRId64, t);
 
-    t = ff_tams_parse_iso8601("");
+    t = ff_tams_iso8601_from_str("");
     if (t != 0)
         FAIL("iso8601 empty: expected 0, got %"PRId64, t);
 
     /* Invalid string must return 0 */
-    t = ff_tams_parse_iso8601("not-a-date");
+    t = ff_tams_iso8601_from_str("not-a-date");
     if (t != 0)
         FAIL("iso8601 invalid: expected 0, got %"PRId64, t);
 
     /* Valid UTC datetime must return a non-zero epoch microsecond value */
-    t = ff_tams_parse_iso8601("2018-03-06T09:10:22Z");
+    t = ff_tams_iso8601_from_str("2018-03-06T09:10:22Z");
     if (t == 0)
         FAIL("iso8601 2018-03-06T09:10:22Z: expected non-zero");
     /* Sanity-check: must be after 2010-01-01 (1262304000s) and before 2030-01-01 */
@@ -1032,7 +1034,7 @@ static int test_parse_iso8601(void)
         FAIL("iso8601 2018-03-06T09:10:22Z: value out of plausible range: %"PRId64, t);
 
     /* Second valid sample */
-    t = ff_tams_parse_iso8601("2023-09-14T09:45:26Z");
+    t = ff_tams_iso8601_from_str("2023-09-14T09:45:26Z");
     if (t == 0)
         FAIL("iso8601 2023-09-14T09:45:26Z: expected non-zero");
 
@@ -1041,7 +1043,7 @@ static int test_parse_iso8601(void)
 }
 
 /* ====================================================================
- * ff_tams_parse_flows_json tests
+ * ff_tams_flows_from_json tests
  * ==================================================================== */
 
 static int test_parse_flows_json_single(void)
@@ -1050,7 +1052,7 @@ static int test_parse_flows_json_single(void)
     int nb_flows = 0;
     int ret;
 
-    ret = ff_tams_parse_flows_json(flow_json_video_raw, &flows, &nb_flows);
+    ret = ff_tams_flows_from_json(flow_json_video_raw, &flows, &nb_flows);
     if (ret < 0)
         FAIL("parse_flows_json_single: returned %d", ret);
     if (nb_flows != 1)
@@ -1106,7 +1108,7 @@ static int test_parse_flows_json_array(void)
     int nb_flows = 0;
     int ret;
 
-    ret = ff_tams_parse_flows_json(flow_json_array, &flows, &nb_flows);
+    ret = ff_tams_flows_from_json(flow_json_array, &flows, &nb_flows);
     if (ret < 0)
         FAIL("parse_flows_json_array: returned %d", ret);
     if (nb_flows != 3)
@@ -1135,7 +1137,7 @@ static int test_parse_flows_json_empty_array(void)
     int nb_flows = 0;
     int ret;
 
-    ret = ff_tams_parse_flows_json("[]", &flows, &nb_flows);
+    ret = ff_tams_flows_from_json("[]", &flows, &nb_flows);
     if (ret < 0)
         FAIL("parse_flows_json_empty: returned %d", ret);
     if (nb_flows != 0)
@@ -1168,7 +1170,7 @@ static int test_tag_array_values(void)
     TAMSFlow flow;
     int ret;
 
-    ret = ff_tams_parse_flow(&cursor, &flow);
+    ret = tams_flow_from_json(&cursor, &flow);
     if (ret < 0)
         FAIL("tag_array: parse failed: %d", ret);
     if (flow.nb_tags != 3)
@@ -1187,6 +1189,293 @@ static int test_tag_array_values(void)
         FAIL("tag_array: wrong tag[2].value: '%s' (expected 'simple')", flow.tags[2].value);
 
     printf("OK: tag_array_values\n");
+    return 0;
+}
+
+/* ====================================================================
+ * Serialization round-trip tests
+ * ==================================================================== */
+
+static int test_timestamp_roundtrip(void)
+{
+    static const int64_t values[] = {
+        0, 1, INT64_C(1000000000), INT64_C(1040000000), INT64_C(100000000000),
+        INT64_C(-1500000000), INT64_C(-1), INT64_C(999999999),
+        INT64_C(123456789123456789),
+    };
+
+    for (size_t i = 0; i < FF_ARRAY_ELEMS(values); i++) {
+        char buf[32];
+        int64_t out;
+        int ret = ff_tams_timestamp_to_str(values[i], buf, sizeof(buf));
+        if (ret < 0)
+            FAIL("timestamp_roundtrip: serialize %"PRId64" failed: %d", values[i], ret);
+        ret = ff_tams_timestamp_from_str(buf, &out);
+        if (ret < 0)
+            FAIL("timestamp_roundtrip: reparse '%s' failed: %d", buf, ret);
+        if (out != values[i])
+            FAIL("timestamp_roundtrip: %"PRId64" -> '%s' -> %"PRId64, values[i], buf, out);
+    }
+
+    printf("OK: timestamp_roundtrip\n");
+    return 0;
+}
+
+static int test_timerange_roundtrip(void)
+{
+    static const char *strs[] = {
+        "[0:0_10:0)", "[1:0]", "[5:500000000_20:0]", "[-1:0_0:0)",
+        "_", "()", "(5:0_)", "[_20:0]", "(5:0_10:0]",
+    };
+
+    for (size_t i = 0; i < FF_ARRAY_ELEMS(strs); i++) {
+        TAMSTimeRange tr, tr2;
+        char buf[64];
+        int ret = ff_tams_timerange_from_str(strs[i], &tr);
+        if (ret < 0)
+            FAIL("timerange_roundtrip: parse '%s' failed: %d", strs[i], ret);
+        ret = ff_tams_timerange_to_str(&tr, buf, sizeof(buf));
+        if (ret < 0)
+            FAIL("timerange_roundtrip: serialize '%s' failed: %d", strs[i], ret);
+        ret = ff_tams_timerange_from_str(buf, &tr2);
+        if (ret < 0)
+            FAIL("timerange_roundtrip: reparse '%s' (from '%s') failed: %d", buf, strs[i], ret);
+        if (tr.start != tr2.start || tr.end != tr2.end ||
+            tr.has_start != tr2.has_start || tr.has_end != tr2.has_end ||
+            tr.start_inclusive != tr2.start_inclusive ||
+            tr.end_inclusive != tr2.end_inclusive)
+            FAIL("timerange_roundtrip: '%s' -> '%s' did not round-trip", strs[i], buf);
+    }
+
+    printf("OK: timerange_roundtrip\n");
+    return 0;
+}
+
+static int test_flow_video_roundtrip(void)
+{
+    TAMSFlow flow, flow2;
+    AVBPrint buf;
+    const char *json, *cursor;
+    int ret;
+
+    cursor = flow_json_video_h264_vfr;
+    ret = tams_flow_from_json(&cursor, &flow);
+    if (ret < 0)
+        FAIL("flow_video_roundtrip: parse source fixture failed: %d", ret);
+
+    av_bprint_init(&buf, 0, AV_BPRINT_SIZE_UNLIMITED);
+    ret = ff_tams_flow_to_json(&buf, &flow);
+    if (ret < 0)
+        FAIL("flow_video_roundtrip: serialize failed: %d", ret);
+    json = buf.str;
+
+    cursor = json;
+    ret = tams_flow_from_json(&cursor, &flow2);
+    if (ret < 0) {
+        av_bprint_finalize(&buf, NULL);
+        FAIL("flow_video_roundtrip: reparse failed: %d\njson=%s", ret, json);
+    }
+
+    if (strcmp(flow.id, flow2.id) || strcmp(flow.source_id, flow2.source_id))
+        FAIL("flow_video_roundtrip: id/source_id mismatch");
+    if (flow.format != flow2.format || strcmp(flow.codec, flow2.codec))
+        FAIL("flow_video_roundtrip: format/codec mismatch");
+    if (flow.frame_width != flow2.frame_width || flow.frame_height != flow2.frame_height)
+        FAIL("flow_video_roundtrip: dimensions mismatch");
+    if (flow.vfr != flow2.vfr)
+        FAIL("flow_video_roundtrip: vfr mismatch");
+    if (flow.interlace_mode != flow2.interlace_mode ||
+        flow.colorspace != flow2.colorspace ||
+        flow.transfer_characteristic != flow2.transfer_characteristic ||
+        flow.component_type != flow2.component_type)
+        FAIL("flow_video_roundtrip: enum field mismatch");
+    if (flow.horiz_chroma_subs != flow2.horiz_chroma_subs ||
+        flow.vert_chroma_subs != flow2.vert_chroma_subs)
+        FAIL("flow_video_roundtrip: chroma subs mismatch");
+    if (flow.has_avc_parameters != flow2.has_avc_parameters ||
+        flow.avc_parameters.profile != flow2.avc_parameters.profile ||
+        flow.avc_parameters.level != flow2.avc_parameters.level ||
+        flow.avc_parameters.flags != flow2.avc_parameters.flags)
+        FAIL("flow_video_roundtrip: avc_parameters mismatch");
+    if (flow.nb_tags != flow2.nb_tags)
+        FAIL("flow_video_roundtrip: tag count mismatch: %d vs %d", flow.nb_tags, flow2.nb_tags);
+    for (int i = 0; i < flow.nb_tags; i++) {
+        if (strcmp(flow.tags[i].key, flow2.tags[i].key) ||
+            strcmp(flow.tags[i].value, flow2.tags[i].value))
+            FAIL("flow_video_roundtrip: tag %d mismatch", i);
+    }
+
+    av_bprint_finalize(&buf, NULL);
+    printf("OK: flow_video_roundtrip\n");
+    return 0;
+}
+
+static int test_flow_audio_roundtrip(void)
+{
+    TAMSFlow flow, flow2;
+    AVBPrint buf;
+    const char *cursor;
+    int ret;
+
+    cursor = flow_json_audio_aac_multi;
+    ret = tams_flow_from_json(&cursor, &flow);
+    if (ret < 0)
+        FAIL("flow_audio_roundtrip: parse source fixture failed: %d", ret);
+
+    av_bprint_init(&buf, 0, AV_BPRINT_SIZE_UNLIMITED);
+    ret = ff_tams_flow_to_json(&buf, &flow);
+    if (ret < 0)
+        FAIL("flow_audio_roundtrip: serialize failed: %d", ret);
+
+    cursor = buf.str;
+    ret = tams_flow_from_json(&cursor, &flow2);
+    if (ret < 0) {
+        av_bprint_finalize(&buf, NULL);
+        FAIL("flow_audio_roundtrip: reparse failed: %d", ret);
+    }
+
+    if (flow.format != flow2.format || strcmp(flow.codec, flow2.codec))
+        FAIL("flow_audio_roundtrip: format/codec mismatch");
+    if (flow.sample_rate != flow2.sample_rate || flow.channels != flow2.channels)
+        FAIL("flow_audio_roundtrip: sample_rate/channels mismatch");
+    if (flow.bit_depth != flow2.bit_depth)
+        FAIL("flow_audio_roundtrip: bit_depth mismatch");
+    if (flow.coded_frame_size != flow2.coded_frame_size || flow.mp4_oti != flow2.mp4_oti)
+        FAIL("flow_audio_roundtrip: codec_parameters mismatch");
+
+    av_bprint_finalize(&buf, NULL);
+    printf("OK: flow_audio_roundtrip\n");
+    return 0;
+}
+
+static int test_flow_multi_container_map_roundtrip(void)
+{
+    TAMSFlow flow, flow2;
+    AVBPrint buf;
+    const char *cursor;
+    int ret;
+
+    cursor = flow_json_multi_container_map;
+    ret = tams_flow_from_json(&cursor, &flow);
+    if (ret < 0)
+        FAIL("flow_multi_roundtrip: parse source fixture failed: %d", ret);
+
+    av_bprint_init(&buf, 0, AV_BPRINT_SIZE_UNLIMITED);
+    ret = ff_tams_flow_to_json(&buf, &flow);
+    if (ret < 0)
+        FAIL("flow_multi_roundtrip: serialize failed: %d", ret);
+
+    cursor = buf.str;
+    ret = tams_flow_from_json(&cursor, &flow2);
+    if (ret < 0) {
+        av_bprint_finalize(&buf, NULL);
+        FAIL("flow_multi_roundtrip: reparse failed: %d\njson=%s", ret, buf.str);
+    }
+
+    if (flow.format != flow2.format)
+        FAIL("flow_multi_roundtrip: format mismatch");
+    if (flow.nb_flow_collection_items != flow2.nb_flow_collection_items)
+        FAIL("flow_multi_roundtrip: collection item count mismatch: %d vs %d",
+             flow.nb_flow_collection_items, flow2.nb_flow_collection_items);
+    for (int i = 0; i < flow.nb_flow_collection_items; i++) {
+        const TAMSFlowCollectionItem *a = &flow.flow_collection_items[i];
+        const TAMSFlowCollectionItem *b = &flow2.flow_collection_items[i];
+        if (strcmp(a->id, b->id) || strcmp(a->role, b->role))
+            FAIL("flow_multi_roundtrip: collection[%d] id/role mismatch", i);
+        if (a->has_container_mapping != b->has_container_mapping)
+            FAIL("flow_multi_roundtrip: collection[%d] has_container_mapping mismatch", i);
+        if (a->has_container_mapping) {
+            if (a->container_mapping.track_index != b->container_mapping.track_index ||
+                a->container_mapping.format_track_index != b->container_mapping.format_track_index ||
+                a->container_mapping.mp2ts_pid != b->container_mapping.mp2ts_pid)
+                FAIL("flow_multi_roundtrip: collection[%d] container_mapping mismatch", i);
+        }
+    }
+
+    av_bprint_finalize(&buf, NULL);
+    printf("OK: flow_multi_container_map_roundtrip\n");
+    return 0;
+}
+
+static int test_flow_segment_roundtrip(void)
+{
+    TAMSFlowSegment seg, seg2;
+    AVBPrint buf;
+    const char *cursor;
+    int ret;
+
+    cursor = segment_json;
+    ret = tams_flow_segment_from_json(&cursor, &seg);
+    if (ret < 0)
+        FAIL("flow_segment_roundtrip: parse source fixture failed: %d", ret);
+
+    av_bprint_init(&buf, 0, AV_BPRINT_SIZE_UNLIMITED);
+    ret = ff_tams_flow_segment_to_json(&buf, &seg);
+    if (ret < 0)
+        FAIL("flow_segment_roundtrip: serialize failed: %d", ret);
+
+    cursor = buf.str;
+    ret = tams_flow_segment_from_json(&cursor, &seg2);
+    if (ret < 0) {
+        av_bprint_finalize(&buf, NULL);
+        FAIL("flow_segment_roundtrip: reparse failed: %d\njson=%s", ret, buf.str);
+    }
+
+    if (strcmp(seg.object_id, seg2.object_id))
+        FAIL("flow_segment_roundtrip: object_id mismatch");
+    if (seg.timerange.start != seg2.timerange.start ||
+        seg.timerange.end != seg2.timerange.end)
+        FAIL("flow_segment_roundtrip: timerange mismatch");
+    if (seg.ts_offset != seg2.ts_offset)
+        FAIL("flow_segment_roundtrip: ts_offset mismatch: %"PRId64" vs %"PRId64,
+             seg.ts_offset, seg2.ts_offset);
+    if (seg.has_last_duration != seg2.has_last_duration ||
+        (seg.has_last_duration && seg.last_duration != seg2.last_duration))
+        FAIL("flow_segment_roundtrip: last_duration mismatch");
+
+    av_bprint_finalize(&buf, NULL);
+    printf("OK: flow_segment_roundtrip\n");
+    return 0;
+}
+
+static int test_flow_escaping_roundtrip(void)
+{
+    TAMSFlow flow, flow2;
+    AVBPrint buf;
+    const char *cursor;
+    int ret;
+
+    memset(&flow, 0, sizeof(flow));
+    av_strlcpy(flow.id, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", sizeof(flow.id));
+    av_strlcpy(flow.source_id, "11111111-2222-3333-4444-555555555555", sizeof(flow.source_id));
+    flow.format = TAMS_FORMAT_VIDEO;
+    av_strlcpy(flow.codec, "video/h264", sizeof(flow.codec));
+    av_strlcpy(flow.label, "quote\"backslash\\tab\ttab-nl\n", sizeof(flow.label));
+    av_strlcpy(flow.description, "unicode: \xc3\xa9\xc3\xa8 emoji: \xf0\x9f\x98\x80", sizeof(flow.description));
+    flow.frame_width = 1920;
+    flow.frame_height = 1080;
+    flow.pixel_aspect_ratio = (AVRational){1, 1};
+
+    av_bprint_init(&buf, 0, AV_BPRINT_SIZE_UNLIMITED);
+    ret = ff_tams_flow_to_json(&buf, &flow);
+    if (ret < 0)
+        FAIL("flow_escaping_roundtrip: serialize failed: %d", ret);
+
+    cursor = buf.str;
+    ret = tams_flow_from_json(&cursor, &flow2);
+    if (ret < 0) {
+        av_bprint_finalize(&buf, NULL);
+        FAIL("flow_escaping_roundtrip: reparse failed: %d\njson=%s", ret, buf.str);
+    }
+
+    if (strcmp(flow.label, flow2.label))
+        FAIL("flow_escaping_roundtrip: label mismatch: '%s' vs '%s'", flow.label, flow2.label);
+    if (strcmp(flow.description, flow2.description))
+        FAIL("flow_escaping_roundtrip: description mismatch: '%s' vs '%s'",
+             flow.description, flow2.description);
+
+    av_bprint_finalize(&buf, NULL);
+    printf("OK: flow_escaping_roundtrip\n");
     return 0;
 }
 
@@ -1232,7 +1521,7 @@ int main(int argc, char *argv[])
     /* Multi-flow JSON array (low-level API) */
     ret |= test_flow_array();
 
-    /* ff_tams_parse_flows_json (high-level API) */
+    /* ff_tams_flows_from_json (high-level API) */
     ret |= test_parse_flows_json_single();
     ret |= test_parse_flows_json_array();
     ret |= test_parse_flows_json_empty_array();
@@ -1242,6 +1531,15 @@ int main(int argc, char *argv[])
     ret |= test_segment_minimal();
     ret |= test_segment_null_fields();
     ret |= test_segment_presigned();
+
+    /* Serialization round-trips (muxer support) */
+    ret |= test_timestamp_roundtrip();
+    ret |= test_timerange_roundtrip();
+    ret |= test_flow_video_roundtrip();
+    ret |= test_flow_audio_roundtrip();
+    ret |= test_flow_multi_container_map_roundtrip();
+    ret |= test_flow_segment_roundtrip();
+    ret |= test_flow_escaping_roundtrip();
 
     /* Invalid/bad JSON */
     printf("#### The following should fail ####\n");
