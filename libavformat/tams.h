@@ -30,6 +30,7 @@
 #ifndef AVFORMAT_TAMS_H
 #define AVFORMAT_TAMS_H
 
+#include "libavutil/bprint.h"
 #include "libavutil/rational.h"
 #include <stdint.h>
 
@@ -228,67 +229,78 @@ typedef struct TAMSFlowSegment {
 } TAMSFlowSegment;
 
 /**
- * Skip JSON whitespace. Useful for array iteration in the demuxer.
- */
-void ff_tams_json_skip_ws(const char **cursor);
-
-/**
- * Expect and consume a specific character (after skipping whitespace).
- * @return 0 on success, AVERROR_INVALIDDATA if the character does not match
- */
-int ff_tams_json_expect(const char **cursor, char c);
-
-/**
- * Skip a JSON value (string, number, boolean, null, object, or array).
- * @return 0 on success, negative AVERROR on failure
- */
-int ff_tams_json_skip_value(const char **cursor);
-
-/**
  * Parse a TAMS timestamp string into nanoseconds.
  * Format: "{sign?}{seconds}:{nanoseconds}"
  * @return 0 on success, AVERROR_INVALIDDATA on parse error
  */
-int ff_tams_parse_timestamp(const char *str, int64_t *ts);
+int ff_tams_timestamp_from_str(const char *str, int64_t *ts);
+
+/**
+ * Format nanoseconds as a TAMS timestamp string ("{sign?}{seconds}:{nanoseconds}").
+ * Inverse of ff_tams_timestamp_from_str().
+ * @return 0 on success, AVERROR(EINVAL) if out_size is too small
+ */
+int ff_tams_timestamp_to_str(int64_t ts, char *out, size_t out_size);
 
 /**
  * Parse a TAMS timerange string.
  * Format: "{bracket}{start_ts}_{end_ts}{bracket}"
  * @return 0 on success, AVERROR_INVALIDDATA on parse error
  */
-int ff_tams_parse_timerange(const char *str, TAMSTimeRange *tr);
+int ff_tams_timerange_from_str(const char *str, TAMSTimeRange *tr);
 
 /**
- * Parse a TAMS Flow JSON object from a buffer.
- * The cursor is advanced past the parsed object.
- * @return 0 on success, negative AVERROR on failure
+ * Format a TAMSTimeRange as a TAMS timerange string.
+ * Inverse of ff_tams_timerange_from_str(): parsing the output of this function
+ * always reproduces the same TAMSTimeRange, though not necessarily the exact
+ * same string a server might have sent (e.g. the "[ts]" instantaneous
+ * shorthand and eternity/never shorthands are never emitted, only their
+ * equivalent explicit "{bracket}{start}_{end}{bracket}" form).
+ * @return 0 on success, AVERROR(EINVAL) if out_size is too small
  */
-int ff_tams_parse_flow(const char **cursor, TAMSFlow *flow);
-
-/**
- * Parse a TAMS Flow Segment JSON object from a buffer.
- * The cursor is advanced past the parsed object.
- * @return 0 on success, negative AVERROR on failure
- */
-int ff_tams_parse_flow_segment(const char **cursor, TAMSFlowSegment *seg);
+int ff_tams_timerange_to_str(const TAMSTimeRange *tr, char *out, size_t out_size);
 
 /**
  * Parse an ISO 8601 datetime string into microseconds since the Unix epoch.
  * Returns 0 if str is NULL, empty, or unparseable.
  */
-int64_t ff_tams_parse_iso8601(const char *str);
+int64_t ff_tams_iso8601_from_str(const char *str);
 
 /**
- * Parse a TAMS /flows JSON response (array or single object) into an
- * allocated array of TAMSFlow structs.
+ * Skip JSON whitespace. Useful for array iteration in the demuxer.
+ */
+void ff_tams_json_skip_ws(const char **p);
+
+/**
+ * Serialize a TAMSFlow to a JSON object suitable for a PUT /flows/{id} body.
+ * Fields the TAMS spec documents as server-managed (timerange, created,
+ * metadata_updated, segments_updated, collected_by) are intentionally never
+ * emitted, since implementations MUST ignore them in a PUT request.
+ * @return 0 on success, negative AVERROR on failure
+ */
+int ff_tams_flow_to_json(AVBPrint *buf, const TAMSFlow *flow);
+
+/**
+ * Parse a TAMS /flows JSON response (array or single object, e.g. from
+ * GET /flows or GET /flows/{id}), appending newly parsed Flows to an
+ * existing dynamically-allocated array.
  *
- * On success *flows_out points to an av_malloc'd array of *nb_flows_out
- * entries.  The caller is responsible for av_free()'ing it.
+ * *flows_inout must either be NULL or point to an av_realloc_array'd
+ * buffer; it is grown as needed.  *nb_flows_inout is updated to reflect
+ * the new count.  On failure the array and count are left in whatever
+ * partial state they were in; the caller is responsible for freeing them.
  *
  * @return 0 on success, negative AVERROR on failure
  */
-int ff_tams_parse_flows_json(const char *json,
-                              TAMSFlow **flows_out, int *nb_flows_out);
+int ff_tams_flows_from_json(const char *json,
+                            TAMSFlow **flows_inout, int *nb_flows_inout);
+
+/**
+ * Serialize a TAMSFlowSegment to a JSON object suitable for a
+ * POST /flows/{id}/segments body element.
+ * @return 0 on success, negative AVERROR on failure
+ */
+int ff_tams_flow_segment_to_json(AVBPrint *buf, const TAMSFlowSegment *seg);
 
 /**
  * Parse a TAMS /flows/{id}/segments JSON array response, appending newly
@@ -301,8 +313,8 @@ int ff_tams_parse_flows_json(const char *json,
  *
  * @return 0 on success, negative AVERROR on failure
  */
-int ff_tams_parse_flow_segments_json(const char *json,
-                                      TAMSFlowSegment **segments_inout,
-                                      int *nb_segments_inout);
+int ff_tams_flow_segments_from_json(const char *json,
+                                    TAMSFlowSegment **segments_inout,
+                                    int *nb_segments_inout);
 
 #endif /* AVFORMAT_TAMS_H */
