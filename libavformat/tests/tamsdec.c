@@ -45,7 +45,7 @@
 typedef struct RestampFixture {
     AVFormatContext *s;
     AVFormatContext *sub_ctx;
-    TAMSContext c;
+    TAMSDemuxContext c;
     TAMSFlow flow;
     TAMSStreamContext sc;
     TAMSSegmentContext segc;
@@ -120,7 +120,7 @@ static int test_segment_duration_us(void)
 
 static int test_find_flow_by_id(void)
 {
-    TAMSContext c;
+    TAMSDemuxContext c;
     TAMSFlow flows[2];
 
     memset(flows, 0, sizeof(flows));
@@ -145,7 +145,7 @@ static int test_find_flow_by_id(void)
 
 static int test_check_live_recent(void)
 {
-    TAMSContext c;
+    TAMSDemuxContext c;
     TAMSFlow flow;
 
     memset(&c, 0, sizeof(c));
@@ -167,7 +167,7 @@ static int test_check_live_recent(void)
 
 static int test_check_live_stale(void)
 {
-    TAMSContext c;
+    TAMSDemuxContext c;
     TAMSFlow flow;
 
     memset(&c, 0, sizeof(c));
@@ -189,7 +189,7 @@ static int test_check_live_stale(void)
 
 static int test_check_live_no_segments_updated(void)
 {
-    TAMSContext c;
+    TAMSDemuxContext c;
     TAMSFlow flow;
 
     memset(&c, 0, sizeof(c));
@@ -210,7 +210,7 @@ static int test_check_live_no_segments_updated(void)
 
 static int test_get_poll_init(void)
 {
-    TAMSContext c;
+    TAMSDemuxContext c;
     TAMSFlow flow;
 
     memset(&flow, 0, sizeof(flow));
@@ -231,7 +231,7 @@ static int test_get_poll_init(void)
 
 static int test_get_min_buffer_ns(void)
 {
-    TAMSContext c;
+    TAMSDemuxContext c;
     TAMSFlow flow;
 
     memset(&flow, 0, sizeof(flow));
@@ -256,7 +256,7 @@ static int test_get_min_buffer_ns(void)
 
 static int test_buffered_ns(void)
 {
-    TAMSContext c;
+    TAMSDemuxContext c;
     TAMSSegmentContext segc;
     TAMSFlowSegment segs[3];
 
