@@ -19,6 +19,8 @@
  */
 
 /**
+ * TAMS (Time-Addressable Media Store) demuxer.
+ *
  * Demuxes one or more TAMS Flows
  *
  * References
@@ -130,7 +132,7 @@ typedef struct TAMSStreamContext {
     int extradata_copied;
 } TAMSStreamContext;
 
-typedef struct TAMSContext {
+typedef struct TAMSDemuxContext {
     const AVClass *class;
 
     TAMSFlow *flows;
@@ -146,7 +148,7 @@ typedef struct TAMSContext {
     int64_t seg_poll_init;
     int64_t seg_poll_max;
     int64_t min_segment_buffer;
-} TAMSContext;
+} TAMSDemuxContext;
 
 static enum AVCodecID tams_codec_lookup(const char *mime)
 {
@@ -178,7 +180,7 @@ static int64_t tams_segment_duration_us(const TAMSFlow *flow)
     return 1000000;
 }
 
-static int tams_find_flow_by_id(const TAMSContext *c, const char *id)
+static int tams_find_flow_by_id(const TAMSDemuxContext *c, const char *id)
 {
     for (int i = 0; i < c->nb_flows; i++) {
         if (!strcmp(c->flows[i].id, id))
@@ -187,7 +189,7 @@ static int tams_find_flow_by_id(const TAMSContext *c, const char *id)
     return -1;
 }
 
-static int tams_check_live(TAMSContext *c, const TAMSFlow *flow)
+static int tams_check_live(TAMSDemuxContext *c, const TAMSFlow *flow)
 {
     int64_t seg_updated, age, threshold;
 
@@ -207,7 +209,7 @@ static int tams_check_live(TAMSContext *c, const TAMSFlow *flow)
     return age < threshold;
 }
 
-static int tams_check_live_expired(TAMSContext *c, const TAMSFlow *flow)
+static int tams_check_live_expired(TAMSDemuxContext *c, const TAMSFlow *flow)
 {
     int64_t seg_updated, age, timeout;
 
@@ -227,7 +229,7 @@ static int tams_check_live_expired(TAMSContext *c, const TAMSFlow *flow)
     return age > timeout;
 }
 
-static int64_t tams_get_poll_init(TAMSContext *c, const TAMSFlow *flow)
+static int64_t tams_get_poll_init(TAMSDemuxContext *c, const TAMSFlow *flow)
 {
     if (c->seg_poll_init >= 0)
         return c->seg_poll_init;
@@ -236,7 +238,7 @@ static int64_t tams_get_poll_init(TAMSContext *c, const TAMSFlow *flow)
 
 /* Target nanoseconds of segments to pre-buffer ahead of the current position.
  * Defaults to 3 x segment_duration when min_segment_buffer is not set. */
-static int64_t tams_get_min_buffer_ns(TAMSContext *c, const TAMSFlow *flow)
+static int64_t tams_get_min_buffer_ns(TAMSDemuxContext *c, const TAMSFlow *flow)
 {
     if (c->min_segment_buffer >= 0)
         return c->min_segment_buffer * 1000000000LL;
@@ -247,7 +249,7 @@ static int64_t tams_get_min_buffer_ns(TAMSContext *c, const TAMSFlow *flow)
  * Compute total nanoseconds of segment time buffered ahead of
  * cur_flow_segment_index.
  */
-static int64_t tams_buffered_ns(TAMSContext *c, const TAMSSegmentContext *segc)
+static int64_t tams_buffered_ns(TAMSDemuxContext *c, const TAMSSegmentContext *segc)
 {
     int64_t total = 0;
 
@@ -264,7 +266,7 @@ static int64_t tams_buffered_ns(TAMSContext *c, const TAMSSegmentContext *segc)
  */
 static void tams_log_mapping_summary(AVFormatContext *s)
 {
-    TAMSContext *c = s->priv_data;
+    TAMSDemuxContext *c = s->priv_data;
     const char *flow_type_names[] = {
         "UNKNOWN", "VIDEO", "AUDIO", "DATA", "MULTI", "IMAGE"
     };
@@ -406,7 +408,7 @@ static int tams_validate_segment_stream(AVFormatContext *s,
                                         const TAMSStreamContext *sc,
                                         int tams_index)
 {
-    TAMSContext *c = s->priv_data;
+    TAMSDemuxContext *c = s->priv_data;
     TAMSSegmentContext *segc = &c->seg_ctxs[sc->seg_ctx_index];
     const TAMSFlow *flow = &c->flows[sc->flow_index];
     AVCodecParameters *par;
@@ -936,7 +938,7 @@ static int tams_build_segments_url(AVFormatContext *s, const TAMSFlow *flow,
  */
 static int tams_fetch_sub_flow(AVFormatContext *s, const char *flow_id)
 {
-    TAMSContext *c = s->priv_data;
+    TAMSDemuxContext *c = s->priv_data;
     AVIOContext *pb = NULL;
     AVDictionary *opts = NULL;
     AVBPrint buf;
@@ -1005,7 +1007,7 @@ static int tams_fetch_sub_flow(AVFormatContext *s, const char *flow_id)
  */
 static int tams_process_flow(AVFormatContext *s, int flow_index)
 {
-    TAMSContext *c = s->priv_data;
+    TAMSDemuxContext *c = s->priv_data;
     const TAMSFlow *flow = &c->flows[flow_index];
     int seg_flow_index;
 
@@ -1076,7 +1078,7 @@ static int tams_process_flow(AVFormatContext *s, int flow_index)
  */
 static int tams_fetch_segments(AVFormatContext *s, TAMSSegmentContext *segc)
 {
-    TAMSContext *c = s->priv_data;
+    TAMSDemuxContext *c = s->priv_data;
     const TAMSFlow *flow = &c->flows[segc->flow_index];
     AVIOContext *pb = NULL;
     AVDictionary *opts = NULL;
@@ -1317,7 +1319,7 @@ static void tams_resolve_sub_stream(AVFormatContext *s,
  */
 static int tams_open_segment(AVFormatContext *s, TAMSSegmentContext *segc)
 {
-    TAMSContext *c = s->priv_data;
+    TAMSDemuxContext *c = s->priv_data;
     TAMSFlowSegment *seg = &segc->flow_segments[segc->cur_flow_segment_index];
     AVDictionary *opts = NULL;
     char resolved_url[4096];
@@ -1463,7 +1465,7 @@ static void tams_compact_segments(TAMSSegmentContext *segc)
  */
 static int tams_ensure_segments(AVFormatContext *s, TAMSSegmentContext *segc)
 {
-    TAMSContext *c = s->priv_data;
+    TAMSDemuxContext *c = s->priv_data;
     const TAMSFlow *flow = &c->flows[segc->flow_index];
     int64_t needed_ns = tams_get_min_buffer_ns(c, flow);
     int64_t buffered;
@@ -1552,7 +1554,7 @@ static int tams_ensure_segments(AVFormatContext *s, TAMSSegmentContext *segc)
  */
 static int tams_copy_extradata(AVFormatContext *s, TAMSStreamContext *sc, int tams_index)
 {
-    TAMSContext *c = s->priv_data;
+    TAMSDemuxContext *c = s->priv_data;
     TAMSSegmentContext *segc = &c->seg_ctxs[sc->seg_ctx_index];
     AVStream *parent_st = s->streams[tams_index];
     AVCodecParameters *sub_par, *par;
@@ -1599,7 +1601,7 @@ static int tams_find_stream_for_sub_packet(AVFormatContext *s, int seg_ctx_index
 
 static int tams_read_header(AVFormatContext *s)
 {
-    TAMSContext *c = s->priv_data;
+    TAMSDemuxContext *c = s->priv_data;
     AVBPrint buf;
     int ret;
 
@@ -1792,7 +1794,7 @@ static int tams_restamp_packet(AVFormatContext *s,
                                int tams_index,
                                AVPacket *pkt)
 {
-    TAMSContext *c       = s->priv_data;
+    TAMSDemuxContext *c       = s->priv_data;
     const TAMSFlow *flow = &c->flows[sc->flow_index];
     AVStream *st         = s->streams[tams_index];
     AVStream *sub_st     = segc->sub_ctx->streams[pkt->stream_index];
@@ -1886,7 +1888,7 @@ static int tams_restamp_packet(AVFormatContext *s,
 
 static int tams_read_packet(AVFormatContext *s, AVPacket *pkt)
 {
-    TAMSContext *c = s->priv_data;
+    TAMSDemuxContext *c = s->priv_data;
 
 retry:
     {
@@ -1992,7 +1994,7 @@ retry:
 
 static int tams_close(AVFormatContext *s)
 {
-    TAMSContext *c = s->priv_data;
+    TAMSDemuxContext *c = s->priv_data;
 
     if (c->seg_ctxs) {
         for (int i = 0; i < c->nb_seg_ctxs; i++) {
@@ -2053,7 +2055,7 @@ static int tams_probe(const AVProbeData *p)
 static int tams_seek(AVFormatContext *s, int stream_index,
                      int64_t timestamp, int flags)
 {
-    TAMSContext *c = s->priv_data;
+    TAMSDemuxContext *c = s->priv_data;
     int64_t seek_ns;
 
     if (stream_index < 0 || stream_index >= (int)s->nb_streams)
@@ -2115,7 +2117,7 @@ static int tams_seek(AVFormatContext *s, int stream_index,
     return 0;
 }
 
-#define OFFSET(x) offsetof(TAMSContext, x)
+#define OFFSET(x) offsetof(TAMSDemuxContext, x)
 #define FLAGS AV_OPT_FLAG_DECODING_PARAM
 
 static const AVOption tams_options[] = {
@@ -2145,7 +2147,7 @@ const FFInputFormat ff_tams_demuxer = {
     .p.flags        = AVFMT_NO_BYTE_SEEK,
     .p.priv_class   = &tams_class,
     .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
-    .priv_data_size = sizeof(TAMSContext),
+    .priv_data_size = sizeof(TAMSDemuxContext),
     .read_probe     = tams_probe,
     .read_header    = tams_read_header,
     .read_packet    = tams_read_packet,
