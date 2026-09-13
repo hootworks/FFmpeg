@@ -34,6 +34,7 @@
  */
 
 #include "avformat.h"
+#include "internal.h"
 #include "mux.h"
 #include "tams.h"
 
@@ -125,6 +126,7 @@ static void tams_free_container_ctxs(TAMSContainerContext *container_ctxs, int n
     for (int i = 0; i < nb_container_ctxs; i++) {
         av_freep(&container_ctxs[i].stream_indices);
         av_freep(&container_ctxs[i].flow_ctxs);
+        avformat_free_context(container_ctxs[i].sub_ctx);
     }
     av_free(container_ctxs);
 }
@@ -136,6 +138,135 @@ static void tams_free_multi_flow_ctxs(TAMSMultiFlowContext *multi_flow_ctxs, int
     for (int i = 0; i < nb_multi_flow_ctxs; i++)
         av_freep(&multi_flow_ctxs[i].container_indices);
     av_free(multi_flow_ctxs);
+}
+
+/* per-codec default raw elementary-stream muxer, tried when -container isn't
+ * given and the container has exactly one stream. AV_CODEC_ID_RAWVIDEO and
+ * AV_CODEC_ID_PCM_S24LE are deliberately absent: their raw forms have no
+ * header/sync bytes at all and can't be auto-probed, so they fall through
+ * to the mp4 fallback below. */
+static const struct {
+    enum AVCodecID codec_id;
+    const char *muxer_name;
+} tams_default_muxers[] = {
+    { AV_CODEC_ID_H264,       "h264"       },
+    { AV_CODEC_ID_HEVC,       "hevc"       },
+    { AV_CODEC_ID_VP8,        "ivf"        },
+    { AV_CODEC_ID_VP9,        "ivf"        },
+    { AV_CODEC_ID_AV1,        "obu"        },
+    { AV_CODEC_ID_MPEG2VIDEO, "mpeg2video" },
+    { AV_CODEC_ID_AAC,        "adts"       },
+    { AV_CODEC_ID_OPUS,       "opus"       },
+    { AV_CODEC_ID_MP2,        "mp2"        },
+    { AV_CODEC_ID_MP3,        "mp3"        },
+    { AV_CODEC_ID_FLAC,       "flac"       },
+    { AV_CODEC_ID_VORBIS,     "oga"        },
+    { AV_CODEC_ID_AC3,        "ac3"        },
+    { AV_CODEC_ID_EAC3,       "eac3"       },
+    { AV_CODEC_ID_WEBVTT,     "webvtt"     },
+    { AV_CODEC_ID_SUBRIP,     "srt"        },
+};
+
+static const AVOutputFormat *tams_default_raw_oformat(enum AVCodecID codec_id)
+{
+    for (int i = 0; i < FF_ARRAY_ELEMS(tams_default_muxers); i++)
+        if (tams_default_muxers[i].codec_id == codec_id)
+            return av_guess_format(tams_default_muxers[i].muxer_name, NULL, NULL);
+    return NULL;
+}
+
+/* resolve cc->oformat: -container if given, else a per-codec raw-ES default
+ * for a single-stream container, else fragmented mp4 */
+static int tams_resolve_oformat(AVFormatContext *s, TAMSContainerContext *cc)
+{
+    TAMSMuxContext *c = s->priv_data;
+    const AVOutputFormat *oformat;
+
+    if (c->container_name) {
+        oformat = av_guess_format(c->container_name, NULL, NULL);
+        if (!oformat) {
+            av_log(s, AV_LOG_ERROR, "Unknown -container format '%s'\n", c->container_name);
+            return AVERROR_MUXER_NOT_FOUND;
+        }
+        cc->oformat = oformat;
+        return 0;
+    }
+
+    if (cc->nb_streams == 1) {
+        oformat = tams_default_raw_oformat(s->streams[cc->stream_indices[0]]->codecpar->codec_id);
+        if (oformat) {
+            cc->oformat = oformat;
+            return 0;
+        }
+    }
+
+    oformat = av_guess_format("mp4", NULL, NULL);
+    if (!oformat) {
+        av_log(s, AV_LOG_ERROR, "mp4 muxer not available for fragmented-MP4 fallback\n");
+        return AVERROR_MUXER_NOT_FOUND;
+    }
+    cc->oformat = oformat;
+    return 0;
+}
+
+/* allocate cc->sub_ctx and clone this container's mapped streams into it,
+ * following segment_mux_init()'s pattern in segment.c */
+static int tams_build_container_mux(AVFormatContext *s, TAMSContainerContext *cc)
+{
+    AVFormatContext *oc;
+    int ret;
+
+    ret = avformat_alloc_output_context2(&cc->sub_ctx, cc->oformat, NULL, NULL);
+    if (ret < 0)
+        return ret;
+    oc = cc->sub_ctx;
+
+    oc->interrupt_callback = s->interrupt_callback;
+    oc->max_delay          = s->max_delay;
+    oc->opaque             = s->opaque;
+    oc->io_close2          = s->io_close2;
+    oc->io_open            = s->io_open;
+    oc->flags              = s->flags;
+
+    for (int i = 0; i < cc->nb_streams; i++) {
+        AVStream *ist = s->streams[cc->stream_indices[i]];
+        AVCodecParameters *ipar = ist->codecpar, *opar;
+        AVStream *ost = ff_stream_clone(oc, ist);
+
+        if (!ost)
+            return AVERROR(ENOMEM);
+
+        opar = ost->codecpar;
+        if (!oc->oformat->codec_tag ||
+            av_codec_get_id (oc->oformat->codec_tag, ipar->codec_tag) == opar->codec_id ||
+            av_codec_get_tag(oc->oformat->codec_tag, ipar->codec_id) <= 0) {
+            opar->codec_tag = ipar->codec_tag;
+        } else {
+            opar->codec_tag = 0;
+        }
+    }
+
+    return 0;
+}
+
+/* resolve oformat and build the nested muxer for every container */
+static int tams_build_containers(AVFormatContext *s)
+{
+    TAMSMuxContext *c = s->priv_data;
+
+    for (int i = 0; i < c->nb_container_ctxs; i++) {
+        TAMSContainerContext *cc = &c->container_ctxs[i];
+        int ret = tams_resolve_oformat(s, cc);
+
+        if (ret < 0)
+            return ret;
+
+        ret = tams_build_container_mux(s, cc);
+        if (ret < 0)
+            return ret;
+    }
+
+    return 0;
 }
 
 static int tams_is_valid_uuid(const char *s)
@@ -682,7 +813,11 @@ static av_cold void tams_deinit(AVFormatContext *s)
 
 static int tams_write_header(AVFormatContext *s)
 {
-    av_log(s, AV_LOG_ERROR, "TAMS muxer write_header not yet implemented\n");
+    int ret = tams_build_containers(s);
+    if (ret < 0)
+        return ret;
+
+    av_log(s, AV_LOG_ERROR, "TAMS muxer write_header not yet fully implemented\n");
     return AVERROR(ENOSYS);
 }
 
