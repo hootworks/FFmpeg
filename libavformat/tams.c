@@ -28,12 +28,17 @@
  */
 
 #include "tams.h"
+#include "avformat.h"
+#include "avio.h"
+#include "internal.h"
+#include "url.h"
 #include "libavutil/avstring.h"
 #include "libavutil/bprint.h"
 #include "libavutil/error.h"
 #include "libavutil/macros.h"
 #include "libavutil/mem.h"
 #include "libavutil/parseutils.h"
+#include "libavutil/time.h"
 
 #include <inttypes.h>
 #include <stdio.h>
@@ -1859,4 +1864,489 @@ int ff_tams_flow_segments_from_json(const char *json,
     }
 
     return 0;
+}
+
+int ff_tams_service_from_json(const char *json, TAMSService *service)
+{
+    const char *p = json;
+    char key[64];
+    int ret;
+
+    memset(service, 0, sizeof(*service));
+
+    ret = json_expect(&p, '{');
+    if (ret < 0)
+        return ret;
+
+    while (1) {
+        int64_t val;
+
+        ff_tams_json_skip_ws(&p);
+        if (*p == '}')
+            break;
+
+        ret = json_read_key(&p, key, sizeof(key));
+        if (ret < 0)
+            return ret;
+
+        if (json_is_null(&p)) {
+            /* null value: skip */
+        } else if (!strcmp(key, "type")) {
+            ret = json_read_string(&p, service->type, sizeof(service->type));
+        } else if (!strcmp(key, "api_version")) {
+            ret = json_read_string(&p, service->api_version, sizeof(service->api_version));
+        } else if (!strcmp(key, "min_object_timeout")) {
+            ret = json_read_int(&p, &val);
+            if (ret == 0)
+                service->min_object_timeout = val;
+        } else if (!strcmp(key, "min_presigned_url_timeout")) {
+            ret = json_read_int(&p, &val);
+            if (ret == 0)
+                service->min_presigned_url_timeout = val;
+        } else {
+            ret = json_skip_value(&p);
+        }
+
+        if (ret < 0)
+            return ret;
+
+        ff_tams_json_skip_ws(&p);
+        if (*p == ',')
+            p++;
+    }
+
+    return 0;
+}
+
+static int tams_http_request_from_json(const char **p, TAMSHttpRequest *req)
+{
+    char key[64];
+    int ret;
+
+    memset(req, 0, sizeof(*req));
+
+    ret = json_expect(p, '{');
+    if (ret < 0)
+        return ret;
+
+    while (1) {
+        ff_tams_json_skip_ws(p);
+        if (**p == '}')
+            break;
+
+        ret = json_read_key(p, key, sizeof(key));
+        if (ret < 0)
+            return ret;
+
+        if (json_is_null(p)) {
+            /* null value: skip */
+        } else if (!strcmp(key, "url")) {
+            ret = json_read_string(p, req->url, sizeof(req->url));
+        } else if (!strcmp(key, "content-type")) {
+            ret = json_read_string(p, req->content_type, sizeof(req->content_type));
+        } else {
+            ret = json_skip_value(p);
+        }
+
+        if (ret < 0)
+            return ret;
+
+        ff_tams_json_skip_ws(p);
+        if (**p == ',')
+            (*p)++;
+    }
+
+    (*p)++; /* skip '}' */
+
+    if (!req->url[0])
+        return AVERROR_INVALIDDATA;
+
+    return 0;
+}
+
+static int tams_media_object_from_json(const char **p, TAMSMediaObject *obj)
+{
+    char key[64];
+    int ret;
+
+    memset(obj, 0, sizeof(*obj));
+
+    ret = json_expect(p, '{');
+    if (ret < 0)
+        return ret;
+
+    while (1) {
+        ff_tams_json_skip_ws(p);
+        if (**p == '}')
+            break;
+
+        ret = json_read_key(p, key, sizeof(key));
+        if (ret < 0)
+            return ret;
+
+        if (json_is_null(p)) {
+            /* null value: skip */
+        } else if (!strcmp(key, "object_id")) {
+            ret = json_read_string(p, obj->object_id, sizeof(obj->object_id));
+        } else if (!strcmp(key, "put_url")) {
+            ret = tams_http_request_from_json(p, &obj->put_url);
+        } else {
+            ret = json_skip_value(p);
+        }
+
+        if (ret < 0)
+            return ret;
+
+        ff_tams_json_skip_ws(p);
+        if (**p == ',')
+            (*p)++;
+    }
+
+    (*p)++; /* skip '}' */
+
+    if (!obj->object_id[0] || !obj->put_url.url[0])
+        return AVERROR_INVALIDDATA;
+
+    return 0;
+}
+
+int ff_tams_storage_allocation_from_json(const char *json,
+                                         TAMSMediaObject **objects_inout,
+                                         int *nb_objects_inout)
+{
+    const char *p = json;
+    char key[64];
+    int ret;
+
+    ret = json_expect(&p, '{');
+    if (ret < 0)
+        return ret;
+
+    while (1) {
+        ff_tams_json_skip_ws(&p);
+        if (*p == '}')
+            break;
+
+        ret = json_read_key(&p, key, sizeof(key));
+        if (ret < 0)
+            return ret;
+
+        if (json_is_null(&p)) {
+            /* null value: skip */
+        } else if (!strcmp(key, "media_objects")) {
+            ret = json_expect(&p, '[');
+            if (ret < 0)
+                return ret;
+
+            while (1) {
+                TAMSMediaObject *tmp;
+
+                ff_tams_json_skip_ws(&p);
+                if (*p == ']')
+                    break;
+
+                tmp = av_realloc_array(*objects_inout, *nb_objects_inout + 1,
+                                       sizeof(**objects_inout));
+                if (!tmp)
+                    return AVERROR(ENOMEM);
+                *objects_inout = tmp;
+
+                ret = tams_media_object_from_json(&p, &(*objects_inout)[*nb_objects_inout]);
+                if (ret < 0)
+                    return ret;
+                (*nb_objects_inout)++;
+
+                ff_tams_json_skip_ws(&p);
+                if (*p == ',')
+                    p++;
+            }
+            p++; /* skip ']' */
+        } else {
+            ret = json_skip_value(&p);
+        }
+
+        if (ret < 0)
+            return ret;
+
+        ff_tams_json_skip_ws(&p);
+        if (*p == ',')
+            p++;
+    }
+
+    return 0;
+}
+
+/* ====================================================================
+ * Codec MIME type <-> AVCodecID: TAMS Flow.codec strings, one entry per
+ * accepted MIME alias; is_preferred marks the alias ff_tams_mime_from_codec()
+ * maps back to when several alternatives exist for one codec.
+ * ==================================================================== */
+
+static const struct {
+    const char *mime;
+    enum AVCodecID id;
+    int is_preferred;
+} tams_codec_mime_map[] = {
+    { "video/h264",      AV_CODEC_ID_H264,       1 },
+    { "video/hevc",      AV_CODEC_ID_HEVC,       1 },
+    { "video/h265",      AV_CODEC_ID_HEVC,       0 },
+    { "video/vp8",       AV_CODEC_ID_VP8,        1 },
+    { "video/vp9",       AV_CODEC_ID_VP9,        1 },
+    { "video/av1",       AV_CODEC_ID_AV1,        1 },
+    { "video/mpeg2",     AV_CODEC_ID_MPEG2VIDEO, 1 },
+    { "video/raw",       AV_CODEC_ID_RAWVIDEO,   1 },
+    { "audio/aac",       AV_CODEC_ID_AAC,        1 },
+    { "audio/mp4a-latm", AV_CODEC_ID_AAC,        0 },
+    { "audio/opus",      AV_CODEC_ID_OPUS,       1 },
+    { "audio/mp2",       AV_CODEC_ID_MP2,        1 },
+    { "audio/mp3",       AV_CODEC_ID_MP3,        1 },
+    { "audio/mpeg",      AV_CODEC_ID_MP3,        0 },
+    { "audio/flac",      AV_CODEC_ID_FLAC,       1 },
+    { "audio/vorbis",    AV_CODEC_ID_VORBIS,     1 },
+    { "audio/ac3",       AV_CODEC_ID_AC3,        1 },
+    { "audio/eac3",      AV_CODEC_ID_EAC3,       1 },
+    { "audio/pcm",       AV_CODEC_ID_PCM_S24LE,  1 },
+    { "text/vtt",        AV_CODEC_ID_WEBVTT,     1 },
+    { "text/srt",        AV_CODEC_ID_SUBRIP,     1 },
+};
+
+enum AVCodecID ff_tams_codec_from_mime(const char *mime)
+{
+    for (int i = 0; i < FF_ARRAY_ELEMS(tams_codec_mime_map); i++)
+        if (!strcmp(mime, tams_codec_mime_map[i].mime))
+            return tams_codec_mime_map[i].id;
+    return AV_CODEC_ID_NONE;
+}
+
+const char *ff_tams_mime_from_codec(enum AVCodecID codec_id)
+{
+    for (int i = 0; i < FF_ARRAY_ELEMS(tams_codec_mime_map); i++)
+        if (tams_codec_mime_map[i].id == codec_id && tams_codec_mime_map[i].is_preferred)
+            return tams_codec_mime_map[i].mime;
+    return NULL;
+}
+
+/* ====================================================================
+ * Utilities
+ * ==================================================================== */
+
+int ff_tams_same_host(const char *url1, const char *url2)
+{
+    char host1[256] = "", host2[256] = "";
+    av_url_split(NULL, 0, NULL, 0, host1, sizeof(host1), NULL, NULL, 0, url1);
+    av_url_split(NULL, 0, NULL, 0, host2, sizeof(host2), NULL, NULL, 0, url2);
+    return !av_strcasecmp(host1, host2);
+}
+
+int ff_tams_get_base_url(const char *full_url, char *base_url, size_t base_size,
+                                 int *is_exact)
+{
+    const char *query = strchr(full_url, '?');
+    int path_len = query ? (int)(query - full_url) : (int)strlen(full_url);
+    const char *last_slash = NULL;
+
+    /* If the path ends with "/flows", keep it so derived URLs are correct
+     * for both "/flows/<id>" and "/flows?source_id=..." input forms. */
+    if (path_len >= 6 && !strncmp(full_url + path_len - 6, "/flows", 6)) {
+        if (path_len >= (int)base_size)
+            return AVERROR(ENAMETOOLONG);
+        memcpy(base_url, full_url, path_len);
+        base_url[path_len] = '\0';
+        if (is_exact)
+            *is_exact = 1;
+        return 0;
+    }
+
+    if (is_exact)
+        *is_exact = 0;
+
+    for (int i = path_len - 1; i >= 0; i--) {
+        if (full_url[i] == '/') {
+            last_slash = &full_url[i];
+            break;
+        }
+    }
+
+    if (last_slash) {
+        int base_len = (int)(last_slash - full_url);
+        if (base_len >= (int)base_size)
+            return AVERROR(ENAMETOOLONG);
+        memcpy(base_url, full_url, base_len);
+        base_url[base_len] = '\0';
+        return 0;
+    }
+
+    base_url[0] = '\0';
+    return 0;
+}
+
+int ff_tams_flow_url(const char *flows_base_url, const char *flow_id, char *out, size_t out_size)
+{
+    if (snprintf(out, out_size, "%s/%s", flows_base_url, flow_id) >= (int)out_size)
+        return AVERROR(ENAMETOOLONG);
+    return 0;
+}
+
+int ff_tams_flow_subresource_url(const char *flows_base_url, const char *flow_id,
+                                 const char *sub, char *out, size_t out_size)
+{
+    if (snprintf(out, out_size, "%s/%s/%s", flows_base_url, flow_id, sub) >= (int)out_size)
+        return AVERROR(ENAMETOOLONG);
+    return 0;
+}
+
+int ff_tams_service_url(const char *flows_base_url, char *out, size_t out_size)
+{
+    size_t base_len = strlen(flows_base_url);
+
+    if (base_len < 6 || strcmp(flows_base_url + base_len - 6, "/flows"))
+        return AVERROR(EINVAL);
+    if (snprintf(out, out_size, "%.*s/service", (int)(base_len - 6), flows_base_url) >= (int)out_size)
+        return AVERROR(ENAMETOOLONG);
+    return 0;
+}
+
+static int tams_is_transient_error(int ret)
+{
+    switch (ret) {
+    case AVERROR_HTTP_BAD_REQUEST:
+    case AVERROR_HTTP_UNAUTHORIZED:
+    case AVERROR_HTTP_FORBIDDEN:
+    case AVERROR_HTTP_NOT_FOUND:
+    case AVERROR_HTTP_OTHER_4XX:
+        return 0;
+    default:
+        return 1; /* 429, 5xx, and generic network errors: retry */
+    }
+}
+
+int ff_tams_request(AVFormatContext *s, AVDictionary *const *avio_opts,
+                    const char *url, const char *method,
+                    const uint8_t *body, int body_size, const char *content_type,
+                    int retry_max, int64_t retry_backoff_us, AVBPrint *out)
+{
+    for (int attempt = 0; ; attempt++) {
+        AVDictionary *opts = NULL;
+        char headers[256];
+        int ret;
+
+        if (avio_opts && ff_tams_same_host(s->url, url)) {
+            ret = av_dict_copy(&opts, *avio_opts, 0);
+            if (ret < 0)
+                return ret;
+        }
+        if (method)
+            av_dict_set(&opts, "method", method, 0);
+        if (body) {
+            char *hex = av_malloc(2 * (size_t)body_size + 1);
+            if (!hex) {
+                av_dict_free(&opts);
+                return AVERROR(ENOMEM);
+            }
+            ff_data_to_hex(hex, body, body_size, 0);
+            av_dict_set(&opts, "post_data", hex, AV_DICT_DONT_STRDUP_VAL);
+            if (content_type) {
+                snprintf(headers, sizeof(headers), "Content-Type: %s\r\n", content_type);
+                av_dict_set(&opts, "headers", headers, 0);
+            }
+        }
+
+        if (body) {
+            /* AVIOContext's buffering layer doesn't invoke the read
+             * callback once write_flag is set (see fill_buffer() in
+             * aviobuf.c). A POST/PUT response can never be read back 
+             * through s->io_open()'s AVIOContext. Go one layer down
+             * and read the URLContext. (the same pattern whip.c uses
+             * for its SDP-offer POST) */
+            URLContext *uc = NULL;
+            uint8_t buf[4096];
+
+            ret = ffurl_open_whitelist(&uc, url, AVIO_FLAG_READ_WRITE, &s->interrupt_callback,
+                                       &opts, s->protocol_whitelist, s->protocol_blacklist, NULL);
+            av_dict_free(&opts);
+
+            if (ret >= 0) {
+                if (out)
+                    av_bprint_init(out, 0, INT_MAX);
+                while (out) {
+                    int n = ffurl_read(uc, buf, sizeof(buf));
+                    if (n == AVERROR_EOF) {
+                        ret = 0;
+                        break;
+                    }
+                    if (n < 0) {
+                        ret = n;
+                        av_bprint_finalize(out, NULL);
+                        break;
+                    }
+                    av_bprint_append_data(out, (const char *)buf, n);
+                }
+                ffurl_closep(&uc);
+                if (ret >= 0)
+                    return 0;
+            }
+        } else {
+            AVIOContext *pb = NULL;
+
+            ret = s->io_open(s, &pb, url, AVIO_FLAG_READ, &opts);
+            av_dict_free(&opts);
+
+            if (ret >= 0) {
+                if (out) {
+                    av_bprint_init(out, 0, INT_MAX);
+                    ret = avio_read_to_bprint(pb, out, SIZE_MAX);
+                    if (ret < 0)
+                        av_bprint_finalize(out, NULL);
+                }
+                ff_format_io_close(s, &pb);
+                if (ret >= 0)
+                    return 0;
+            }
+        }
+
+        if (!tams_is_transient_error(ret) || attempt >= retry_max)
+            return ret;
+
+        av_log(s, AV_LOG_WARNING, "TAMS request to %s failed (%s), retrying (%d/%d)\n",
+               url, av_err2str(ret), attempt + 1, retry_max);
+
+        if (ff_check_interrupt(&s->interrupt_callback))
+            return AVERROR_EXIT;
+        av_usleep(retry_backoff_us << attempt);
+    }
+}
+
+void ff_tams_log_flow_summary(void *avcl, int level, const TAMSFlow *flow)
+{
+    static const char *const flow_type_names[] = {
+        "UNKNOWN", "VIDEO", "AUDIO", "DATA", "MULTI", "IMAGE"
+    };
+    const char *type_name = (flow->format < FF_ARRAY_ELEMS(flow_type_names))
+                           ? flow_type_names[flow->format] : "INVALID";
+
+    av_log(avcl, level, "id=%s, format=%s(%d)", flow->id, type_name, flow->format);
+
+    if (flow->format == TAMS_FORMAT_VIDEO || flow->format == TAMS_FORMAT_IMAGE) {
+        if (flow->frame_rate.num > 0)
+            av_log(avcl, level, ", frame_rate=" AVRATIONAL_FORMAT, AVRATIONAL_ARG(flow->frame_rate));
+        if (flow->frame_width > 0 && flow->frame_height > 0)
+            av_log(avcl, level, ", resolution=%dx%d", flow->frame_width, flow->frame_height);
+    } else if (flow->format == TAMS_FORMAT_AUDIO) {
+        if (flow->sample_rate > 0)
+            av_log(avcl, level, ", sample_rate=%d", flow->sample_rate);
+        if (flow->channels > 0)
+            av_log(avcl, level, ", channels=%d", flow->channels);
+    } else if (flow->format == TAMS_FORMAT_MULTI) {
+        av_log(avcl, level, ", sub_flows=%d", flow->nb_flow_collection_items);
+    }
+
+    if (flow->timerange.has_start || flow->timerange.has_end) {
+        av_log(avcl, level, ", timerange=[%s%"PRId64"_%"PRId64"%s)",
+               flow->timerange.start_inclusive ? "[" : "(",
+               flow->timerange.has_start ? flow->timerange.start : 0,
+               flow->timerange.has_end ? flow->timerange.end : 0,
+               flow->timerange.end_inclusive ? "]" : ")");
+    }
+
+    av_log(avcl, level, "\n");
 }
