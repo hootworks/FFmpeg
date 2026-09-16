@@ -30,9 +30,13 @@
 #ifndef AVFORMAT_TAMS_H
 #define AVFORMAT_TAMS_H
 
+#include "libavcodec/codec_id.h"
 #include "libavutil/bprint.h"
+#include "libavutil/dict.h"
 #include "libavutil/rational.h"
 #include <stdint.h>
+
+struct AVFormatContext;
 
 #define TAMS_TIMEBASE INT64_C(1000000000)
 #define TAMS_UUID_SIZE 37
@@ -41,6 +45,16 @@
 #define TAMS_TAG_VALUE_SIZE 256
 #define TAMS_MAX_COLLECTION_ITEMS 16
 #define TAMS_ROLE_SIZE 64
+
+/**
+ * The TAMS API version this implementation was written against. Both the
+ * muxer and demuxer compare it to a fetched Service's api_version and warn
+ * (but do not fail) on a mismatch.
+ */
+#define TAMS_API_VERSION "8.1"
+
+#define AVRATIONAL_FORMAT "%d/%d"
+#define AVRATIONAL_ARG(rational) rational.num, rational.den
 
 /**
  * TAMS format URN strings, shared between probe and parsing.
@@ -228,6 +242,34 @@ typedef struct TAMSFlowSegment {
     char get_url[2048];
 } TAMSFlowSegment;
 
+typedef struct TAMSService {
+    char type[64];
+    char api_version[32];
+    int64_t min_object_timeout;        /* whole seconds */
+    int64_t min_presigned_url_timeout; /* whole seconds */
+} TAMSService;
+
+/**
+ * One "http-request.json" object: an HTTP request a client should perform
+ * (here, always the PUT of one Flow Segment's bytes). Only the fields the
+ * muxer actually needs to issue that PUT are parsed; the spec's optional
+ * "body" and arbitrary "headers" are not (this implementation only ever
+ * PUTs presigned URLs that need no such extras).
+ */
+typedef struct TAMSHttpRequest {
+    char url[2048];
+    char content_type[128]; /* the JSON key is "content-type" */
+} TAMSHttpRequest;
+
+/**
+ * One "flow-storage.json" media_objects[] entry, as returned by
+ * POST /flows/{id}/storage.
+ */
+typedef struct TAMSMediaObject {
+    char object_id[512];
+    TAMSHttpRequest put_url;
+} TAMSMediaObject;
+
 /**
  * Parse a TAMS timestamp string into nanoseconds.
  * Format: "{sign?}{seconds}:{nanoseconds}"
@@ -316,5 +358,110 @@ int ff_tams_flow_segment_to_json(AVBPrint *buf, const TAMSFlowSegment *seg);
 int ff_tams_flow_segments_from_json(const char *json,
                                     TAMSFlowSegment **segments_inout,
                                     int *nb_segments_inout);
+
+/**
+ * Parse a GET /service response.
+ * @return 0 on success, negative AVERROR on failure
+ */
+int ff_tams_service_from_json(const char *json, TAMSService *service);
+
+/**
+ * Parse a POST /flows/{id}/storage response ("flow-storage.json"),
+ * appending its media_objects[] entries to an existing dynamically
+ * allocated array.
+ *
+ * *objects_inout must either be NULL or point to an av_realloc_array'd
+ * buffer; it is grown as needed. *nb_objects_inout is updated to reflect
+ * the new count. On failure the array and count are left in whatever
+ * partial state they were in; the caller is responsible for freeing them.
+ *
+ * @return 0 on success, negative AVERROR on failure
+ */
+int ff_tams_storage_allocation_from_json(const char *json,
+                                         TAMSMediaObject **objects_inout,
+                                         int *nb_objects_inout);
+
+/**
+ * Look up the AVCodecID for a TAMS codec MIME string.
+ * @return the codec id, or AV_CODEC_ID_NONE if unrecognized
+ */
+enum AVCodecID ff_tams_codec_from_mime(const char *mime);
+
+/**
+ * Look up the TAMS codec MIME string for an AVCodecID, the inverse of
+ * ff_tams_codec_from_mime(). Where the spec allows several MIME aliases for
+ * one codec, this returns the same one ff_tams_codec_from_mime() maps back.
+ * @return the MIME string, or NULL if codec_id has no TAMS mapping
+ */
+const char *ff_tams_mime_from_codec(enum AVCodecID codec_id);
+
+/**
+ * Log one Flow's identity/essence/timerange summary at the given level.
+ * Shared by the demuxer's and muxer's mapping-summary logging.
+ */
+void ff_tams_log_flow_summary(void *avcl, int level, const TAMSFlow *flow);
+
+/**
+ * Compare the hosts of two URLs (case-insensitively).
+ * @return non-zero if the hosts match
+ */
+int ff_tams_same_host(const char *url1, const char *url2);
+
+/**
+ * Derive the store's "/flows" collection base URL from a full URL that is
+ * either that collection URL itself (optionally with a query string) or a
+ * path below it (e.g. "/flows/{id}"). If full_url's path ends in "/flows",
+ * base_url is set to that exactly and, if is_exact is non-NULL, *is_exact
+ * is set to 1. Otherwise base_url is set to full_url's parent directory
+ * (appropriate when full_url points at a specific sub-resource such as a
+ * Flow id) and *is_exact is set to 0.
+ *
+ * The demuxer, which accepts either URL form, ignores is_exact. The muxer,
+ * which has no specific sub-resource to derive from and so must never
+ * guess, passes is_exact and treats 0 as a hard error.
+ *
+ * @return 0 on success, negative AVERROR on failure
+ */
+int ff_tams_get_base_url(const char *full_url, char *base_url, size_t base_size,
+                                 int *is_exact);
+
+/**
+ * Build the URL for a single Flow: "{flows_base_url}/{flow_id}".
+ * @return 0 on success, AVERROR(ENAMETOOLONG) if out_size is too small
+ */
+int ff_tams_flow_url(const char *flows_base_url, const char *flow_id,
+                     char *out, size_t out_size);
+
+/**
+ * Build the URL for a Flow subresource: "{flows_base_url}/{flow_id}/{sub}"
+ * (e.g. sub="storage" or sub="segments").
+ * @return 0 on success, AVERROR(ENAMETOOLONG) if out_size is too small
+ */
+int ff_tams_flow_subresource_url(const char *flows_base_url, const char *flow_id,
+                                 const char *sub, char *out, size_t out_size);
+
+/**
+ * Build the store-wide "/service" URL from the "/flows" collection base URL.
+ * @return 0 on success, negative AVERROR on failure
+ */
+int ff_tams_service_url(const char *flows_base_url, char *out, size_t out_size);
+
+/**
+ * Issue one TAMS HTTP request with bounded retry and backoff on transient errors
+ * (429, 5xx, and generic network errors). 4xx/malformed responses are not retried.
+ *
+ * method=NULL means GET. A non-NULL body opens for writing (method defaults
+ * to POST unless overridden). avio_opts, when non-NULL, is copied and
+ * passed to s->io_open() for every attempt against the same host as s->url
+ * but it is never sent to a different host (e.g. a presigned storage URL).
+ * If out is non-NULL, the response body is read into it on success (the
+ * caller must av_bprint_finalize() it). Note that *out is only initialized if the
+ * function returns success.
+ * @return 0 on success, negative AVERROR on failure
+ */
+int ff_tams_request(struct AVFormatContext *s, AVDictionary *const *avio_opts,
+                    const char *url, const char *method,
+                    const uint8_t *body, int body_size, const char *content_type,
+                    int retry_max, int64_t retry_backoff_us, AVBPrint *out);
 
 #endif /* AVFORMAT_TAMS_H */
