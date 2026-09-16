@@ -108,6 +108,10 @@ typedef struct TAMSMultiFlowContext {
     int  has_flow_id; /* came from a 'multi_flow=N,id=...' token */
     char source_id[TAMS_UUID_SIZE];
     int  has_source_id; /* came from a 'multi_flow=N,source_id=...' token */
+    char label[256]; /* came from a 'multi_flow=N,label=...' token; ignored if has_flow_id */
+    char description[1024]; /* likewise, from 'description=...' */
+    TAMSTag tags[TAMS_MAX_TAGS]; /* likewise, from one or more 'tags.<name>=...' */
+    int  nb_tags;
     TAMSFlow flow;
 
     int *container_indices; /* indices into TAMSMuxContext.container_ctxs[] belonging here */
@@ -120,9 +124,6 @@ typedef struct TAMSMuxContext {
     /* AVOptions */
     char *flow_map_str;
     char *container_name;
-    char *label;
-    char *description;
-    char *tags_str;
     char *start_timestamp_str;
     int64_t segment_duration; /* seconds; -1 = auto */
     int retry_max;
@@ -531,9 +532,15 @@ static int tams_parse_multi_flow_token(const char *p, const char *tok_end,
     int has_id = 0;
     char source_id[TAMS_UUID_SIZE];
     int has_source_id = 0;
+    char label[256];
+    int has_label = 0;
+    char description[1024];
+    int has_description = 0;
+    TAMSTag tags[TAMS_MAX_TAGS];
+    int nb_tags = 0;
     TAMSMultiFlowContext *tmp_multi_flow_ctxs, *multi_flow_ctx;
 
-    id[0] = source_id[0] = '\0';
+    id[0] = source_id[0] = label[0] = description[0] = '\0';
 
     n = strtol(p, &end, 10);
     if (end == p || n < 0 || (end < tok_end && *end != ','))
@@ -572,6 +579,52 @@ static int tams_parse_multi_flow_token(const char *p, const char *tok_end,
                 return AVERROR(EINVAL);
             has_source_id = 1;
             p = v_end;
+        } else if (!strncmp(p, "label=", 6)) {
+            const char *v = p + 6;
+            const char *v_end = memchr(v, ',', tok_end - v);
+
+            if (!v_end)
+                v_end = tok_end;
+            if (has_label || (size_t)(v_end - v) >= sizeof(label))
+                return AVERROR(EINVAL);
+            memcpy(label, v, v_end - v);
+            label[v_end - v] = '\0';
+            has_label = 1;
+            p = v_end;
+        } else if (!strncmp(p, "description=", 12)) {
+            const char *v = p + 12;
+            const char *v_end = memchr(v, ',', tok_end - v);
+
+            if (!v_end)
+                v_end = tok_end;
+            if (has_description || (size_t)(v_end - v) >= sizeof(description))
+                return AVERROR(EINVAL);
+            memcpy(description, v, v_end - v);
+            description[v_end - v] = '\0';
+            has_description = 1;
+            p = v_end;
+        } else if (!strncmp(p, "tags.", 5)) {
+            const char *name = p + 5;
+            const char *eq = memchr(name, '=', tok_end - name);
+            const char *v, *v_end;
+            size_t name_len;
+
+            if (!eq)
+                return AVERROR(EINVAL);
+            name_len = eq - name;
+            v = eq + 1;
+            v_end = memchr(v, ',', tok_end - v);
+            if (!v_end)
+                v_end = tok_end;
+            if (nb_tags >= TAMS_MAX_TAGS ||
+                name_len >= TAMS_TAG_KEY_SIZE || (size_t)(v_end - v) >= TAMS_TAG_VALUE_SIZE)
+                return AVERROR(EINVAL);
+            memcpy(tags[nb_tags].key, name, name_len);
+            tags[nb_tags].key[name_len] = '\0';
+            memcpy(tags[nb_tags].value, v, v_end - v);
+            tags[nb_tags].value[v_end - v] = '\0';
+            nb_tags++;
+            p = v_end;
         } else {
             return AVERROR(EINVAL); /* unknown attr */
         }
@@ -603,6 +656,14 @@ static int tams_parse_multi_flow_token(const char *p, const char *tok_end,
     if (has_source_id) {
         av_strlcpy(multi_flow_ctx->source_id, source_id, sizeof(multi_flow_ctx->source_id));
         multi_flow_ctx->has_source_id = 1;
+    }
+    if (has_label)
+        av_strlcpy(multi_flow_ctx->label, label, sizeof(multi_flow_ctx->label));
+    if (has_description)
+        av_strlcpy(multi_flow_ctx->description, description, sizeof(multi_flow_ctx->description));
+    if (nb_tags) {
+        memcpy(multi_flow_ctx->tags, tags, nb_tags * sizeof(*tags));
+        multi_flow_ctx->nb_tags = nb_tags;
     }
 
     return 0;
@@ -656,7 +717,8 @@ static int tams_append_mono_container(int stream_index,
  *   flow_attr        := 'id=' uuid | 'source_id=' uuid | 'multi_flow=' integer
  *
  *   multi_flow_token := 'multi_flow=' integer ',' multi_attr (',' multi_attr)*
- *   multi_attr       := 'id=' uuid | 'source_id=' uuid
+ *   multi_attr       := 'id=' uuid | 'source_id=' uuid | 'label=' text |
+ *                        'description=' text | 'tags.' name '=' text
  *
  * An AVStream index may appear in at most one flow_token (hard error on
  * duplicate assignment); it is never required to appear in any. Any stream
@@ -665,7 +727,14 @@ static int tams_append_mono_container(int stream_index,
  * stream requires multi_flow= (container mapping only has meaning inside a
  * multi-Flow's flow_collection). id= may repeat within one flow_token,
  * positionally paired with the streams= list; source_id=/multi_flow= may
- * each appear at most once per token.
+ * each appear at most once per token. label=/description=/tags.<name>= are
+ * only valid on a multi_flow_token (a mono Flow's label/description come
+ * from that AVStream's "title"/"comment" metadata instead, and its tags
+ * from any other AVStream metadata key -- see tams_flow_from_stream()) and
+ * are ignored if that multi_flow_token also has id= (a pinned multi-Flow is
+ * never modified); tags.<name>= may repeat, one 'tags.' attr per tag.
+ * Because ',' and ' ' are the token/attr delimiters, text values may
+ * contain neither.
  */
 static int tams_parse_flow_map(const char *str, int nb_streams,
                                 TAMSContainerContext **container_ctxs_out, int *nb_container_ctxs_out,
@@ -969,77 +1038,45 @@ static int tams_resolve_container_mime(const AVFormatContext *s, const TAMSConta
     return AVERROR(EINVAL);
 }
 
-static int tams_apply_tags(const char *tags_str, TAMSFlow *flow)
+/*
+ * Copy every AVStream metadata entry other than "title"/"comment" (already
+ * consumed as label/description) into flow as a tag.
+ */
+static int tams_apply_stream_tags(AVFormatContext *s, const AVDictionary *metadata, TAMSFlow *flow)
 {
-    const char *p = tags_str;
+    const AVDictionaryEntry *t = NULL;
 
-    if (!p)
-        return 0;
-
-    while (*p) {
-        const char *eq  = strchr(p, '=');
-        const char *end = strchr(p, ',');
-        size_t klen, vlen;
-
-        if (!end)
-            end = p + strlen(p);
-        if (!eq || eq >= end)
-            return AVERROR(EINVAL);
-        klen = eq - p;
-        vlen = end - eq - 1;
+    while ((t = av_dict_iterate(metadata, t))) {
+        if (!strcmp(t->key, "title") || !strcmp(t->key, "comment"))
+            continue;
         if (flow->nb_tags >= TAMS_MAX_TAGS ||
-            klen >= TAMS_TAG_KEY_SIZE || vlen >= TAMS_TAG_VALUE_SIZE)
+            strlen(t->key) >= TAMS_TAG_KEY_SIZE || strlen(t->value) >= TAMS_TAG_VALUE_SIZE) {
+            av_log(s, AV_LOG_ERROR, "TAMS: too many stream metadata tags, or tag '%s' too long\n", t->key);
             return AVERROR(EINVAL);
-
-        memcpy(flow->tags[flow->nb_tags].key, p, klen);
-        flow->tags[flow->nb_tags].key[klen] = '\0';
-        memcpy(flow->tags[flow->nb_tags].value, eq + 1, vlen);
-        flow->tags[flow->nb_tags].value[vlen] = '\0';
+        }
+        av_strlcpy(flow->tags[flow->nb_tags].key, t->key, sizeof(flow->tags[flow->nb_tags].key));
+        av_strlcpy(flow->tags[flow->nb_tags].value, t->value, sizeof(flow->tags[flow->nb_tags].value));
         flow->nb_tags++;
-
-        p = *end == ',' ? end + 1 : end;
     }
 
     return 0;
 }
 
 /*
- * Resolve label/description for one mono Flow: per-AVStream metadata
- * ("title"/"comment") always applies; the global -label/-description
- * options only apply (and are conflict-checked) in the sole-Flow case.
+ * Resolve label/description for one mono Flow from that AVStream's own
+ * "title"/"comment" metadata.
  */
-static int tams_resolve_stream_metadata(AVFormatContext *s, const AVStream *st, int use_global,
-                                        char *label, size_t label_size,
-                                        char *desc, size_t desc_size)
+static void tams_resolve_stream_metadata(const AVStream *st,
+                                         char *label, size_t label_size,
+                                         char *desc, size_t desc_size)
 {
-    TAMSMuxContext *c = s->priv_data;
     AVDictionaryEntry *t;
 
-    label[0] = desc[0] = '\0';
-
     t = av_dict_get(st->metadata, "title", NULL, 0);
-    if (use_global && c->label && t && strcmp(c->label, t->value)) {
-        av_log(s, AV_LOG_ERROR, "TAMS: conflicting label: -label '%s' vs stream metadata title '%s'\n",
-               c->label, t->value);
-        return AVERROR(EINVAL);
-    }
-    av_strlcpy(label, t ? t->value : (use_global && c->label ? c->label : ""), label_size);
+    av_strlcpy(label, t ? t->value : "", label_size);
 
     t = av_dict_get(st->metadata, "comment", NULL, 0);
-    if (use_global && c->description && t && strcmp(c->description, t->value)) {
-        av_log(s, AV_LOG_ERROR, "TAMS: conflicting description: -description '%s' vs stream metadata comment '%s'\n",
-               c->description, t->value);
-        return AVERROR(EINVAL);
-    }
-    av_strlcpy(desc, t ? t->value : (use_global && c->description ? c->description : ""), desc_size);
-
-    return 0;
-}
-
-static int tams_is_sole_flow_case(const TAMSMuxContext *c)
-{
-    return c->nb_container_ctxs == 1 && c->nb_multi_flow_ctxs == 0 &&
-           c->container_ctxs[0].nb_streams == 1;
+    av_strlcpy(desc, t ? t->value : "", desc_size);
 }
 
 /*
@@ -1050,7 +1087,7 @@ static int tams_is_sole_flow_case(const TAMSMuxContext *c)
  */
 static int tams_flow_from_stream(AVFormatContext *s, const AVStream *ist,
                                  const char *container_mime, int shared_container,
-                                 int use_global_metadata, TAMSFlow *flow)
+                                 TAMSFlow *flow)
 {
     const AVCodecParameters *par = ist->codecpar;
     const char *mime;
@@ -1093,18 +1130,12 @@ static int tams_flow_from_stream(AVFormatContext *s, const AVStream *ist,
         av_strlcpy(flow->container, container_mime, sizeof(flow->container));
     flow->generation = 1;
 
-    ret = tams_resolve_stream_metadata(s, ist, use_global_metadata,
-                                       flow->label, sizeof(flow->label),
-                                       flow->description, sizeof(flow->description));
+    tams_resolve_stream_metadata(ist, flow->label, sizeof(flow->label),
+                                 flow->description, sizeof(flow->description));
+
+    ret = tams_apply_stream_tags(s, ist->metadata, flow);
     if (ret < 0)
         return ret;
-
-    if (use_global_metadata) {
-        TAMSMuxContext *c = s->priv_data;
-        ret = tams_apply_tags(c->tags_str, flow);
-        if (ret < 0)
-            return ret;
-    }
 
     return 0;
 }
@@ -1225,8 +1256,9 @@ static void tams_resolve_segment_duration(AVFormatContext *s, TAMSContainerConte
 }
 
 /*
- * GET an existing Flow by id and sanity-check it against the local stream's
- * essence parameters.
+ * GET an existing Flow by id and validate that exactly one Flow object was
+ * returned (guards against a malformed or unexpected response, since
+ * ff_tams_flows_from_json() also accepts a /flows collection array).
  */
 static int tams_get_and_validate_flow(AVFormatContext *s, const char *flow_id, TAMSFlow *out)
 {
@@ -1430,7 +1462,6 @@ static int tams_prematch_pinned_multis(AVFormatContext *s)
 static int tams_resolve_mono_flows(AVFormatContext *s)
 {
     TAMSMuxContext *c = s->priv_data;
-    int sole = tams_is_sole_flow_case(c);
 
     for (int i = 0; i < c->nb_container_ctxs; i++) {
         TAMSContainerContext *cc = &c->container_ctxs[i];
@@ -1463,12 +1494,7 @@ static int tams_resolve_mono_flows(AVFormatContext *s)
                 continue;
             }
 
-            /*
-             * Member of a multi-Flow: no global label/description/tags,
-             * those apply to the multi-Flow object instead
-             */
-            ret = tams_flow_from_stream(s, ist, cc->container_mime, shared_container,
-                                        !cc->has_multi_flow && sole, &fc->flow);
+            ret = tams_flow_from_stream(s, ist, cc->container_mime, shared_container, &fc->flow);
             if (ret < 0)
                 return ret;
 
@@ -1525,13 +1551,10 @@ static int tams_resolve_multi_flows(AVFormatContext *s)
         else
             tams_generate_uuid(mc->flow.source_id);
 
-        if (c->label)
-            av_strlcpy(mc->flow.label, c->label, sizeof(mc->flow.label));
-        if (c->description)
-            av_strlcpy(mc->flow.description, c->description, sizeof(mc->flow.description));
-        ret = tams_apply_tags(c->tags_str, &mc->flow);
-        if (ret < 0)
-            return ret;
+        av_strlcpy(mc->flow.label, mc->label, sizeof(mc->flow.label));
+        av_strlcpy(mc->flow.description, mc->description, sizeof(mc->flow.description));
+        memcpy(mc->flow.tags, mc->tags, mc->nb_tags * sizeof(*mc->tags));
+        mc->flow.nb_tags = mc->nb_tags;
 
         for (int j = 0; j < mc->nb_container_indices; j++) {
             TAMSContainerContext *cc = &c->container_ctxs[mc->container_indices[j]];
@@ -1933,18 +1956,14 @@ static int tams_write_trailer(AVFormatContext *s)
 static const AVOption tams_options[] = {
     { "flow_map", "map AVStreams to Flows/multi-Flows: space-separated "
         "\"flow=streams=0,id=<uuid>,source_id=<uuid>,multi_flow=N\" and "
-        "\"multi_flow=N,id=<uuid>,source_id=<uuid>\" tokens "
-        "(default, and for any stream not mentioned: its own standalone mono Flow)",
+        "\"multi_flow=N,id=<uuid>,source_id=<uuid>,label=<text>,description=<text>,"
+        "tags.<name>=<text>\" tokens (a mono Flow's label/description/tags come from its "
+        "AVStream's metadata instead; default, and for any stream not mentioned: its own "
+        "standalone mono Flow)",
         OFFSET(flow_map_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS },
     { "container", "container format (default: codec-specific raw ES for a single-stream "
         "container, fragmented mp4 for a shared multi-stream container)",
         OFFSET(container_name), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS },
-    { "label", "label for the multi-Flow (or sole Flow)",
-        OFFSET(label), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS },
-    { "description", "description for the multi-Flow (or sole Flow)",
-        OFFSET(description), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS },
-    { "tags", "tags for the multi-Flow (or sole Flow)",
-        OFFSET(tags_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS },
     { "start_timestamp", "TAMS timestamp string overriding the wall-clock timeline origin",
         OFFSET(start_timestamp_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS },
     { "segment_duration", "target segment duration in seconds (-1=auto: existing flow's segment_duration, else 2)",
