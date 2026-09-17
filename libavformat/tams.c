@@ -695,7 +695,9 @@ static void json_write_video_essence(AVBPrint *buf, const TAMSFlow *flow)
     if (flow->aspect_ratio.num) {
         json_write_sep(buf, &first); json_write_rational(buf, "aspect_ratio", flow->aspect_ratio);
     }
-    json_write_sep(buf, &first); json_write_rational(buf, "pixel_aspect_ratio", flow->pixel_aspect_ratio);
+    if (flow->pixel_aspect_ratio.num) {
+        json_write_sep(buf, &first); json_write_rational(buf, "pixel_aspect_ratio", flow->pixel_aspect_ratio);
+    }
     if ((s = tams_component_type_strs[flow->component_type])) {
         json_write_sep(buf, &first); json_write_key_string(buf, "component_type", s);
     }
@@ -1879,7 +1881,8 @@ int ff_tams_service_from_json(const char *json, TAMSService *service)
         return ret;
 
     while (1) {
-        int64_t val;
+        char ts_str[32];
+        int64_t ts_ns;
 
         ff_tams_json_skip_ws(&p);
         if (*p == '}')
@@ -1896,13 +1899,13 @@ int ff_tams_service_from_json(const char *json, TAMSService *service)
         } else if (!strcmp(key, "api_version")) {
             ret = json_read_string(&p, service->api_version, sizeof(service->api_version));
         } else if (!strcmp(key, "min_object_timeout")) {
-            ret = json_read_int(&p, &val);
-            if (ret == 0)
-                service->min_object_timeout = val;
+            ret = json_read_string(&p, ts_str, sizeof(ts_str));
+            if (ret == 0 && (ret = ff_tams_timestamp_from_str(ts_str, &ts_ns)) == 0)
+                service->min_object_timeout = ts_ns / TAMS_TIMEBASE;
         } else if (!strcmp(key, "min_presigned_url_timeout")) {
-            ret = json_read_int(&p, &val);
-            if (ret == 0)
-                service->min_presigned_url_timeout = val;
+            ret = json_read_string(&p, ts_str, sizeof(ts_str));
+            if (ret == 0 && (ret = ff_tams_timestamp_from_str(ts_str, &ts_ns)) == 0)
+                service->min_presigned_url_timeout = ts_ns / TAMS_TIMEBASE;
         } else {
             ret = json_skip_value(&p);
         }
@@ -2227,7 +2230,6 @@ int ff_tams_request(AVFormatContext *s, AVDictionary *const *avio_opts,
 {
     for (int attempt = 0; ; attempt++) {
         AVDictionary *opts = NULL;
-        char headers[256];
         int ret;
 
         if (avio_opts && ff_tams_same_host(s->url, url)) {
@@ -2246,8 +2248,24 @@ int ff_tams_request(AVFormatContext *s, AVDictionary *const *avio_opts,
             ff_data_to_hex(hex, body, body_size, 0);
             av_dict_set(&opts, "post_data", hex, AV_DICT_DONT_STRDUP_VAL);
             if (content_type) {
-                snprintf(headers, sizeof(headers), "Content-Type: %s\r\n", content_type);
-                av_dict_set(&opts, "headers", headers, 0);
+                AVDictionaryEntry *existing = av_dict_get(opts, "headers", NULL, 0);
+                AVBPrint headers;
+
+                av_bprint_init(&headers, 0, AV_BPRINT_SIZE_UNLIMITED);
+                if (existing) {
+                    size_t len = strlen(existing->value);
+                    av_bprintf(&headers, "%s", existing->value);
+                    if (len < 2 || strcmp(existing->value + len - 2, "\r\n"))
+                        av_bprintf(&headers, "\r\n");
+                }
+                av_bprintf(&headers, "Content-Type: %s\r\n", content_type);
+                if (!av_bprint_is_complete(&headers)) {
+                    av_bprint_finalize(&headers, NULL);
+                    av_dict_free(&opts);
+                    return AVERROR(ENOMEM);
+                }
+                av_dict_set(&opts, "headers", headers.str, 0);
+                av_bprint_finalize(&headers, NULL);
             }
         }
 
