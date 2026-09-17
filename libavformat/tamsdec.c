@@ -1757,7 +1757,9 @@ static int tams_restamp_packet(AVFormatContext *s,
         if (flow->timerange.has_end) {
             int64_t flow_dur = flow->timerange.end - flow_start;
 
-            if ((pts_ns > flow->timerange.end && flow->timerange.end_inclusive) || pts_ns >= flow->timerange.end) {
+            int past_flow_end = flow->timerange.end_inclusive ? (pts_ns > flow_dur)
+                                                                : (pts_ns >= flow_dur);
+            if (past_flow_end) {
                 if (dts_ns != AV_NOPTS_VALUE && dts_ns < flow_dur)
                     return TAMS_PKT_DISCARD;
 
@@ -1769,7 +1771,9 @@ static int tams_restamp_packet(AVFormatContext *s,
         if (seg->timerange.has_end) {
             int64_t seg_end_ns = seg->timerange.end - flow_start;
 
-            if ((pts_ns > seg->timerange.end && seg->timerange.end_inclusive) || pts_ns >= seg->timerange.end) {
+            int past_seg_end = seg->timerange.end_inclusive ? (pts_ns > seg_end_ns)
+                                                              : (pts_ns >= seg_end_ns);
+            if (past_seg_end) {
                 if (dts_ns != AV_NOPTS_VALUE && dts_ns <= seg_end_ns)
                     return TAMS_PKT_DISCARD;
 

@@ -125,6 +125,7 @@ typedef struct TAMSMuxContext {
     char *flow_map_str;
     char *container_name;
     char *start_timestamp_str;
+    char *headers_str;
     int64_t segment_duration; /* seconds; -1 = auto */
     int retry_max;
     int64_t retry_backoff_us;
@@ -900,6 +901,18 @@ static av_cold int tams_init(AVFormatContext *s)
         av_log(s, AV_LOG_ERROR, "Invalid -flow_map: %s\n",
                c->flow_map_str ? c->flow_map_str : "(default)");
         return ret;
+    }
+
+    /*
+     * This muxer is AVFMT_NOFILE (it never opens s->pb; every request is
+     * issued explicitly against derived URLs), so the generic -headers
+     * AVOption never reaches a URLContext to be consumed there. Capture it
+     * ourselves for ff_tams_request() to replay on every same-host request.
+     */
+    if (c->headers_str) {
+        ret = av_dict_set(&c->avio_opts, "headers", c->headers_str, 0);
+        if (ret < 0)
+            return ret;
     }
 
     return 0;
@@ -1966,6 +1979,9 @@ static const AVOption tams_options[] = {
         OFFSET(container_name), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS },
     { "start_timestamp", "TAMS timestamp string overriding the wall-clock timeline origin",
         OFFSET(start_timestamp_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS },
+    { "headers", "extra HTTP headers (e.g. \"Authorization: Bearer <token>\\r\\n\") to send "
+        "with every TAMS request",
+        OFFSET(headers_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS },
     { "segment_duration", "target segment duration in seconds (-1=auto: existing flow's segment_duration, else 2)",
         OFFSET(segment_duration), AV_OPT_TYPE_INT64, {.i64 = -1}, -1, INT64_MAX, FLAGS },
     { "retry_max", "maximum retry attempts for transient HTTP errors",
@@ -1985,9 +2001,9 @@ static const AVClass tams_muxer_class = {
 const FFOutputFormat ff_tams_muxer = {
     .p.name         = "tams",
     .p.long_name    = NULL_IF_CONFIG_SMALL("TAMS (Time-Addressable Media Store)"),
-    .p.audio_codec  = AV_CODEC_ID_NONE,
-    .p.video_codec  = AV_CODEC_ID_NONE,
-    .p.subtitle_codec = AV_CODEC_ID_NONE,
+    .p.audio_codec  = AV_CODEC_ID_AAC,
+    .p.video_codec  = AV_CODEC_ID_H264,
+    .p.subtitle_codec = AV_CODEC_ID_SUBRIP,
     .p.flags        = AVFMT_GLOBALHEADER | AVFMT_NOFILE,
     .p.priv_class   = &tams_muxer_class,
     .priv_data_size = sizeof(TAMSMuxContext),
