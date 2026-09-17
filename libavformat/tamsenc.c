@@ -1757,24 +1757,24 @@ static void tams_log_mapping_summary(AVFormatContext *s)
 {
     TAMSMuxContext *c = s->priv_data;
 
-    av_log(s, AV_LOG_VERBOSE, "TAMS mapping summary:\n");
+    av_log(s, AV_LOG_INFO, "TAMS mapping summary:\n");
 
-    av_log(s, AV_LOG_VERBOSE, "  Containers: %d\n", c->nb_container_ctxs);
+    av_log(s, AV_LOG_INFO, "  Containers: %d\n", c->nb_container_ctxs);
     for (int i = 0; i < c->nb_container_ctxs; i++) {
         const TAMSContainerContext *cc = &c->container_ctxs[i];
 
-        av_log(s, AV_LOG_VERBOSE, "    Container[%d]: oformat=%s, owner=%s\n",
+        av_log(s, AV_LOG_INFO, "    Container[%d]: oformat=%s, owner=%s\n",
                i, cc->oformat->name, cc->owner_flow_id);
         for (int j = 0; j < cc->nb_streams; j++) {
-            av_log(s, AV_LOG_VERBOSE, "      stream %d -> ", cc->stream_indices[j]);
-            ff_tams_log_flow_summary(s, AV_LOG_VERBOSE, &cc->flow_ctxs[j].flow);
+            av_log(s, AV_LOG_INFO, "      stream %d -> ", cc->stream_indices[j]);
+            ff_tams_log_flow_summary(s, AV_LOG_INFO, &cc->flow_ctxs[j].flow);
         }
     }
 
-    av_log(s, AV_LOG_VERBOSE, "  Multi-Flows: %d\n", c->nb_multi_flow_ctxs);
+    av_log(s, AV_LOG_INFO, "  Multi-Flows: %d\n", c->nb_multi_flow_ctxs);
     for (int i = 0; i < c->nb_multi_flow_ctxs; i++) {
-        av_log(s, AV_LOG_VERBOSE, "    Multi[%d]: ", i);
-        ff_tams_log_flow_summary(s, AV_LOG_VERBOSE, &c->multi_flow_ctxs[i].flow);
+        av_log(s, AV_LOG_INFO, "    Multi[%d]: ", i);
+        ff_tams_log_flow_summary(s, AV_LOG_INFO, &c->multi_flow_ctxs[i].flow);
     }
 }
 
