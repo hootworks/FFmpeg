@@ -19,6 +19,13 @@ OK: segment_full
 OK: segment_minimal
 OK: segment_null_fields
 OK: segment_presigned
+OK: timestamp_roundtrip
+OK: timerange_roundtrip
+OK: flow_video_roundtrip
+OK: flow_audio_roundtrip
+OK: flow_multi_container_map_roundtrip
+OK: flow_segment_roundtrip
+OK: flow_escaping_roundtrip
 #### The following should fail ####
 OK: bad_json_truncated (correctly failed with -1094995529)
 OK: not_an_object (correctly failed with -1094995529)
