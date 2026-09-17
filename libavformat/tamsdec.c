@@ -228,91 +228,91 @@ static void tams_log_mapping_summary(AVFormatContext *s)
 {
     TAMSDemuxContext *c = s->priv_data;
 
-    av_log(s, AV_LOG_VERBOSE, "TAMS mapping summary:\n");
+    av_log(s, AV_LOG_INFO, "TAMS mapping summary:\n");
 
     /* Log all flows with their details */
-    av_log(s, AV_LOG_VERBOSE, "  Flows: %d\n", c->nb_flows);
+    av_log(s, AV_LOG_INFO, "  Flows: %d\n", c->nb_flows);
     for (int i = 0; i < c->nb_flows; i++) {
-        av_log(s, AV_LOG_VERBOSE, "    Flow[%d]: ", i);
-        ff_tams_log_flow_summary(s, AV_LOG_VERBOSE, &c->flows[i]);
+        av_log(s, AV_LOG_INFO, "    Flow[%d]: ", i);
+        ff_tams_log_flow_summary(s, AV_LOG_INFO, &c->flows[i]);
     }
 
     /* Log all streams with their mappings */
-    av_log(s, AV_LOG_VERBOSE, "  Stream contexts: %d\n", s->nb_streams);
+    av_log(s, AV_LOG_INFO, "  Stream contexts: %d\n", s->nb_streams);
     for (int i = 0; i < s->nb_streams; i++) {
         const TAMSStreamContext *sc = s->streams[i]->priv_data;
         AVStream *st = s->streams[i];
         const TAMSFlow *flow = &c->flows[sc->flow_index];
         const char *media_type_name = av_get_media_type_string(sc->media_type);
 
-        av_log(s, AV_LOG_VERBOSE, "    Stream[%d]: flow_index=%d", i, sc->flow_index);
+        av_log(s, AV_LOG_INFO, "    Stream[%d]: flow_index=%d", i, sc->flow_index);
 
         if (sc->parent_flow_index >= 0) {
-            av_log(s, AV_LOG_VERBOSE, " (sub-flow, parent_flow_index=%d)",
+            av_log(s, AV_LOG_INFO, " (sub-flow, parent_flow_index=%d)",
                    sc->parent_flow_index);
         }
 
-        av_log(s, AV_LOG_VERBOSE, ", type=%s, seg_ctx_index=%d",
+        av_log(s, AV_LOG_INFO, ", type=%s, seg_ctx_index=%d",
                media_type_name ? media_type_name : "unknown", sc->seg_ctx_index);
 
         if (sc->has_container_mapping) {
             const TAMSContainerMapping *m = &sc->container_mapping;
             if (m->has_track_index)
-                av_log(s, AV_LOG_VERBOSE, ", track_index=%d", m->track_index);
+                av_log(s, AV_LOG_INFO, ", track_index=%d", m->track_index);
             if (m->has_format_track_index)
-                av_log(s, AV_LOG_VERBOSE, ", format_track_index=%d", m->format_track_index);
+                av_log(s, AV_LOG_INFO, ", format_track_index=%d", m->format_track_index);
             if (m->has_mp2ts_pid)
-                av_log(s, AV_LOG_VERBOSE, ", mp2ts_pid=%d", m->mp2ts_pid);
+                av_log(s, AV_LOG_INFO, ", mp2ts_pid=%d", m->mp2ts_pid);
             if (m->has_isobmff_track_id)
-                av_log(s, AV_LOG_VERBOSE, ", isobmff_track_id=%d", m->isobmff_track_id);
+                av_log(s, AV_LOG_INFO, ", isobmff_track_id=%d", m->isobmff_track_id);
             if (m->has_mxf_track_id)
-                av_log(s, AV_LOG_VERBOSE, ", mxf_track_id=%d", m->mxf_track_id);
+                av_log(s, AV_LOG_INFO, ", mxf_track_id=%d", m->mxf_track_id);
             if (m->mxf_package_uid[0])
-                av_log(s, AV_LOG_VERBOSE, ", mxf_package_uid=%s", m->mxf_package_uid);
+                av_log(s, AV_LOG_INFO, ", mxf_package_uid=%s", m->mxf_package_uid);
         }
 
-        av_log(s, AV_LOG_VERBOSE, ", time_base=" AVRATIONAL_FORMAT,
+        av_log(s, AV_LOG_INFO, ", time_base=" AVRATIONAL_FORMAT,
                AVRATIONAL_ARG(st->time_base));
 
         if (flow->format == TAMS_FORMAT_VIDEO || flow->format == TAMS_FORMAT_IMAGE) {
-            av_log(s, AV_LOG_VERBOSE, ", avg_frame_rate=" AVRATIONAL_FORMAT,
+            av_log(s, AV_LOG_INFO, ", avg_frame_rate=" AVRATIONAL_FORMAT,
                    AVRATIONAL_ARG(st->avg_frame_rate));
         }
 
-        av_log(s, AV_LOG_VERBOSE, "\n");
+        av_log(s, AV_LOG_INFO, "\n");
     }
 
     /* Log segment contexts */
-    av_log(s, AV_LOG_VERBOSE, "  Segment contexts: %d\n", c->nb_seg_ctxs);
+    av_log(s, AV_LOG_INFO, "  Segment contexts: %d\n", c->nb_seg_ctxs);
     for (int i = 0; i < c->nb_seg_ctxs; i++) {
         const TAMSSegmentContext *segc = &c->seg_ctxs[i];
         const TAMSFlow *flow = &c->flows[segc->flow_index];
 
-        av_log(s, AV_LOG_VERBOSE, "    TAMSSegmentContext[%d]: flow_index=%d (%s), refcount=%d",
+        av_log(s, AV_LOG_INFO, "    TAMSSegmentContext[%d]: flow_index=%d (%s), refcount=%d",
                i, segc->flow_index, flow->id, segc->refcount);
 
         if (segc->is_live) {
-            av_log(s, AV_LOG_VERBOSE, ", live=yes, poll=%"PRId64"us", segc->poll_interval);
+            av_log(s, AV_LOG_INFO, ", live=yes, poll=%"PRId64"us", segc->poll_interval);
         }
 
-        av_log(s, AV_LOG_VERBOSE, "\n");
+        av_log(s, AV_LOG_INFO, "\n");
     }
 
     /* Show stream to TAMSSegmentContext relationships */
-    av_log(s, AV_LOG_VERBOSE, "  Stream->TAMSSegmentContext relationships:\n");
+    av_log(s, AV_LOG_INFO, "  Stream->TAMSSegmentContext relationships:\n");
     for (int i = 0; i < c->nb_seg_ctxs; i++) {
-        av_log(s, AV_LOG_VERBOSE, "    TAMSSegmentContext[%d] serves streams: ", i);
+        av_log(s, AV_LOG_INFO, "    TAMSSegmentContext[%d] serves streams: ", i);
         int first = 1;
         for (int j = 0; j < s->nb_streams; j++) {
             const TAMSStreamContext *scj = s->streams[j]->priv_data;
             if (scj->seg_ctx_index == i) {
                 if (!first)
-                    av_log(s, AV_LOG_VERBOSE, ", ");
-                av_log(s, AV_LOG_VERBOSE, "%d", j);
+                    av_log(s, AV_LOG_INFO, ", ");
+                av_log(s, AV_LOG_INFO, "%d", j);
                 first = 0;
             }
         }
-        av_log(s, AV_LOG_VERBOSE, "\n");
+        av_log(s, AV_LOG_INFO, "\n");
     }
 }
 
