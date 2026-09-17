@@ -1134,6 +1134,41 @@ Time-Addressable Media Store demuxer.
 This demuxer presents audio and video streams found in TAMS Flows, as specified in
 @url{https://bbc.github.io/tams/main/index.html, Time-addressable Media Store}.
 
+This demuxer accepts the following options:
+
+@table @option
+@item live_threshold @var{seconds}
+If @code{segments_updated - now()} is less than this value, the flow is
+treated as live. By default (@code{-1}), 2x @code{segment_duration} is used.
+
+@item live_timeout @var{seconds}
+If @code{segments_updated - now()} exceeds this value, a live flow is
+treated as complete. By default (@code{-1}), 4x @code{segment_duration} is
+used.
+
+@item seg_poll_init @var{microseconds}
+Initial segment poll interval for live streams. By default (@code{-1}),
+@code{segment_duration} is used.
+
+@item seg_poll_max @var{microseconds}
+Maximum segment poll interval for live streams, once backoff is applied to
+@option{seg_poll_init}. Default is 30000000 (30s).
+
+@item min_segment_buffer @var{seconds}
+Target seconds of segments to buffer ahead of the current position. By
+default (@code{-1}), 3x @code{segment_duration} is used.
+
+@item retry_max @var{n}
+Maximum retry attempts for transient HTTP errors talking to the TAMS store.
+Default is 3.
+
+@item retry_backoff @var{microseconds}
+Initial retry backoff, doubling on each subsequent attempt. Default is
+500000 (0.5s).
+@end table
+
+@subsection Examples
+
 @itemize
 @item
 Access a flow:

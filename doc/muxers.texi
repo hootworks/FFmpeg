@@ -3799,6 +3799,152 @@ ffmpeg -i INPUT -f streamhash -hash md5 -
 
 See also the @ref{hash} and @ref{framehash} muxers.
 
+@section tams
+
+Time-Addressable Media Store muxer.
+
+This muxer writes audio and video streams to TAMS Flows, as specified in
+@url{https://bbc.github.io/tams/main/index.html, Time-addressable Media Store}.
+
+The output URL must be the store's @code{/flows} collection endpoint, e.g.
+@code{http://tamsEndpoint/flows}. Each input AVStream is written to a TAMS
+Flow: either its own standalone mono Flow, or a member of a multi-Flow
+sharing one physical container, as directed by the @option{flow_map} option.
+A Flow's essence parameters (codec, dimensions, sample rate, etc.) are always
+taken from the mapped AVStream; if @option{flow_map} pins an existing Flow
+(via @code{id=}), its essence parameters are validated against the stream's
+rather than overwritten.
+
+A mono Flow's @code{label}/@code{description} come from that AVStream's
+@code{title}/@code{comment} metadata (settable via
+@option{-metadata:s:@var{streamindex}}); any other stream metadata key
+becomes a Flow tag. A multi-Flow's @code{label}/@code{description}/tags are
+set via the @code{label=}/@code{description=}/@code{tags.@var{name}=} attrs
+on its @code{multi_flow=@var{N}} @option{flow_map} token instead (ignored if
+that token also pins an existing multi-Flow, since a pinned multi-Flow's
+metadata is never modified).
+
+@table @option
+@item flow_map @var{map}
+Space-separated list of tokens describing how AVStreams map to Flows and,
+for multi-Flows, how streams sharing one container map to one multi-Flow's
+@code{flow_collection}. Two kinds of token are accepted:
+
+@table @code
+@item flow=streams=@var{index}[,@var{index}...][,id=@var{uuid}[,id=@var{uuid}...]][,source_id=@var{uuid}][,multi_flow=@var{N}]
+Maps one or more AVStream indices to one physical container. @code{id=} may
+repeat, positionally paired with the @code{streams=} indices, to pin each
+mapped stream's Flow to an existing Flow id (rather than creating a new
+Flow); @code{source_id=} sets the @code{source_id} for any newly-created
+Flow among them. A token naming more than one stream requires
+@code{multi_flow=@var{N}} as container sharing is only possible within a
+multi-Flow's @code{flow_collection}; @var{N} is an arbitrary integer
+correlating this token with a @code{multi_flow=@var{N}} token (below)
+describing the multi-Flow itself.
+
+@item multi_flow=@var{N},id=@var{uuid}|source_id=@var{uuid}|label=@var{text}|description=@var{text}|tags.@var{name}=@var{text}[,...]
+Sets properties of the multi-Flow correlated by @var{N} with one or more
+@code{flow=...,multi_flow=@var{N}} tokens above. @code{id=} pins it to an
+existing multi-Flow; @code{source_id=} sets the @code{source_id} for a
+newly-created one. @code{tags.@var{name}=@var{text}} may repeat, once per
+tag. This token is only needed to set @code{id=}/@code{source_id=}/
+@code{label=}/@code{description=}/tags; a multi-Flow referenced only via
+@code{multi_flow=@var{N}} on @code{flow=} tokens is otherwise created with
+none of these set.
+@end table
+
+An AVStream index may appear in at most one @code{flow=} token; any stream
+not mentioned in @option{flow_map} (or when @option{flow_map} is omitted
+entirely) defaults to its own standalone mono Flow. Because @code{,} and
+space are the attr and token delimiters, @code{label=}/@code{description=}/
+@code{tags.@var{name}=} values may not contain a comma or a space.
+
+@item container @var{format}
+Force the physical container format for every mapped container (e.g.
+@code{mp4}, @code{h264}). By default, a single-stream container uses a
+codec-specific raw elementary-stream muxer where one exists, and a
+multi-stream (multi-Flow) container uses fragmented MP4.
+
+@item start_timestamp @var{timestamp}
+Override the wall-clock timeline origin with an explicit TAMS timestamp
+string (@code{@{seconds@}:@{nanoseconds@}}, TAI-based). By default, the
+current wall-clock time is used.
+
+@item segment_duration @var{seconds}
+Target segment duration in seconds. By default (@code{-1}), a pinned Flow's
+own @code{segment_duration} is used if it has one, else 2 seconds.
+
+@item retry_max @var{n}
+Maximum retry attempts for transient HTTP errors talking to the TAMS store.
+Default is 3.
+
+@item retry_backoff @var{microseconds}
+Initial retry backoff, doubling on each subsequent attempt. Default is
+500000 (0.5s).
+@end table
+
+@subsection Examples
+
+Mux a single video stream to its own mono Flow, creating a new Flow with a
+random id:
+@example
+ffmpeg -i INPUT -c:v h264 -f tams http://tamsEndpoint/flows
+@end example
+
+Mux to an existing, pinned Flow, validating the stream's essence parameters
+against it:
+@example
+ffmpeg -i INPUT -c:v h264 -f tams \
+  -flow_map "flow=streams=0,id=<flowId>" http://tamsEndpoint/flows
+@end example
+
+Mux video and audio as a shared-container multi-Flow with a label:
+@example
+ffmpeg -i INPUT -c:v h264 -c:a aac -f tams \
+  -flow_map "flow=streams=0,1,multi_flow=0 multi_flow=0,label=MyProgram" \
+  http://tamsEndpoint/flows
+@end example
+
+Set a mono Flow's label/description/tags from stream metadata:
+@example
+ffmpeg -i INPUT -c:v h264 -metadata:s:0 title="My Video" \
+  -metadata:s:0 comment="A description" -metadata:s:0 priority=high \
+  -f tams http://tamsEndpoint/flows
+@end example
+
+Mux a new mono Flow under an existing, pinned Source:
+@example
+ffmpeg -i INPUT -c:v h264 -f tams \
+  -flow_map "flow=streams=0,source_id=<sourceId>" http://tamsEndpoint/flows
+@end example
+
+Mux video and audio, matching each against an existing multi-Flow's
+@code{flow_collection} by essence type rather than pinning either
+individually:
+@example
+ffmpeg -i INPUT -c:v h264 -c:a aac -f tams \
+  -flow_map "flow=streams=0,multi_flow=0 flow=streams=1,multi_flow=0 \
+             multi_flow=0,id=<multiFlowId>" \
+  http://tamsEndpoint/flows
+@end example
+
+Mux video and audio into one shared container, with each sub-Flow
+individually pinned by position (each @code{id=} matched to the
+corresponding @code{streams=} index, in list order) and grouped under an
+existing multi-Flow:
+@example
+ffmpeg -i INPUT -c:v h264 -c:a aac -f tams \
+  -flow_map "flow=streams=0,1,id=<videoFlowId>,id=<audioFlowId>,multi_flow=0 \
+             multi_flow=0,id=<multiFlowId>" \
+  http://tamsEndpoint/flows
+@end example
+
+Mux to a TAMS endpoint that requires OAuth2 bearer authentication:
+@example
+ffmpeg -i INPUT -c:v h264 -f tams \
+  -headers "Authorization: Bearer <token>" http://tamsEndpoint/flows
+@end example
+
 @anchor{tee}
 @section tee
 
