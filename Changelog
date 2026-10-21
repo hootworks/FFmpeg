@@ -3,6 +3,7 @@ releases are sorted from youngest to oldest.
 
 version <next>:
 - DTS:X height channels in the DCA decoder
+- TAMS (Time-Addressable Media Store) demuxer
 
 version 9.1:
 - ASTC image encoding and decoding via libastcenc, with .astc and KTX 1.0 muxers and demuxers

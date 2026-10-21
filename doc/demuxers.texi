@@ -362,6 +362,17 @@ but not emitted as a stream. For a good high-level understanding, refer to:
 
 @subsection Options
 
+A Flow is read live, following new segments as they are registered, while
+its @code{status} is @code{ingesting} or @code{awaiting_content}, or, for
+Flows without a @code{status}, while @code{segments_updated} is recent (see
+@option{live_threshold}). A live Flow ends once its @code{status} becomes
+@code{closed_complete} or no new segments arrive within @option{live_timeout}.
+
+Flows whose segments use separate initialisation objects
+(@code{init_object}) are not supported. Where a segment has no
+@code{ts_offset} but its media timestamps lie outside its timerange, the
+offset is inferred from its first packet.
+
 This demuxer accepts the following options:
 
 @table @option
@@ -1177,6 +1188,81 @@ script layout will be frozen according to that reference. That means that if
 the script is directly played, the actual times will match the absolute
 timestamps up to the sound controller's clock accuracy, but if the user
 somehow pauses the playback or seeks, all times will be shifted accordingly.
+
+@section tams
+
+Time-Addressable Media Store demuxer.
+
+This demuxer presents audio and video streams found in TAMS Flows, as specified in
+@url{https://bbc.github.io/tams/main/index.html, Time-addressable Media Store}.
+
+This demuxer accepts the following options:
+
+@table @option
+@item live_threshold @var{seconds}
+If @code{segments_updated - now()} is less than this value, the flow is
+treated as live. By default (@code{-1}), 2x @code{segment_duration} is used.
+
+@item live_timeout @var{seconds}
+If no new segments have been seen for this long (measured from the later of
+@code{segments_updated} and the last segment fetch that found new segments),
+a live flow is treated as complete. By default (@code{-1}), 4x the larger of
+@code{segment_duration} and the most recent segment's length is used.
+
+@item seg_poll_init @var{microseconds}
+Initial segment poll interval for live streams. By default (@code{-1}),
+@code{segment_duration} is used.
+
+@item seg_poll_max @var{microseconds}
+Maximum segment poll interval for live streams, once backoff is applied to
+@option{seg_poll_init}. Default is 30000000 (30s).
+
+@item min_segment_buffer @var{seconds}
+Target seconds of segments to buffer ahead of the current position. By
+default (@code{-1}), 3x @code{segment_duration} is used.
+
+@item retry_max @var{n}
+Maximum retry attempts for transient HTTP errors talking to the TAMS store.
+Default is 3.
+
+@item retry_backoff @var{microseconds}
+Initial retry backoff, doubling on each subsequent attempt. Default is
+500000 (0.5s).
+@end table
+
+@subsection Examples
+
+@itemize
+@item
+Access a flow:
+@example
+ffmpeg -i http://<tamsEndpoint>/flows/<flowId> ...
+@end example
+
+@item
+Access a specific timerange within a flow:
+@example
+ffmpeg -i http://<tamsEndpoint>/flows/<flowId>?timerange=<string> ...
+@end example
+
+@item
+Access all flows for a source:
+@example
+ffmpeg http://<tamsEndpoint>/flows?source_id=<sourceId> ...
+@end example
+
+@item
+Access a specific timerange within a source:
+@example
+ffmpeg http://<tamsEndpoint>/flows?source_id=<sourceId>&timerange=<string> ...
+@end example
+
+@item
+Access a TAMS endpoint that requires OAuth2 authentication:
+@example
+ffmpeg -headers "Authorization: Bearer <token>" -i http://<tamsEndpoint>/flows/<flowId> ...
+@end example
+@end itemize
 
 @section tedcaptions
 

@@ -607,6 +607,7 @@ OBJS-$(CONFIG_SVS_DEMUXER)               += svs.o
 OBJS-$(CONFIG_SWF_DEMUXER)               += swfdec.o swf.o
 OBJS-$(CONFIG_SWF_MUXER)                 += swfenc.o swf.o
 OBJS-$(CONFIG_TAK_DEMUXER)               += takdec.o apetag.o img2.o rawdec.o
+OBJS-$(CONFIG_TAMS_DEMUXER)              += tamsdec.o tams.o
 OBJS-$(CONFIG_TEDCAPTIONS_DEMUXER)       += tedcaptionsdec.o subtitles.o
 OBJS-$(CONFIG_TEE_MUXER)                 += tee.o tee_common.o
 OBJS-$(CONFIG_THP_DEMUXER)               += thp.o
@@ -806,6 +807,8 @@ TESTPROGS-$(CONFIG_IMF_DEMUXER)          += imf
 TESTPROGS-$(CONFIG_MP3_MUXER)            += id3v2enc id3v2chap
 TESTPROGS-$(CONFIG_AU_MUXER)             += auenc
 TESTPROGS-$(CONFIG_OGG_MUXER)            += ogg_pages
+TESTPROGS-$(CONFIG_TAMS_DEMUXER)         += tams
+TESTPROGS-$(CONFIG_TAMS_DEMUXER)         += tamsdec
 
 TOOLS     = aviocat                                                     \
             ismindex                                                    \
