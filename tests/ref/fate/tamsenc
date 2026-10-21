@@ -1,0 +1,34 @@
+OK: flow_map_default
+OK: flow_map_empty_string
+OK: flow_map_explicit_split
+OK: flow_map_unmentioned_stream_gets_default
+OK: flow_map_id_pin
+OK: flow_map_id_and_source_id
+OK: flow_map_shared_container_requires_multi
+OK: flow_map_shared_container_positional_ids
+OK: flow_map_shared_container_partial_id
+OK: flow_map_new_multi
+OK: flow_map_existing_multi_property_token
+OK: flow_map_multi_source_id
+OK: flow_map_two_independent_multis
+OK: flow_map_standalone_and_grouped_mixed
+OK: is_valid_uuid
+OK: init_missing_multi_flow_fails (correctly failed with -22)
+#### The following should fail ####
+OK: flow_map_bad_token (correctly failed with -22)
+OK: flow_map_out_of_range (correctly failed with -22)
+OK: flow_map_duplicate_assignment (correctly failed with -22)
+OK: flow_map_empty_list (correctly failed with -22)
+OK: flow_map_malformed_index (correctly failed with -22)
+OK: flow_map_shared_container_missing_multi (correctly failed with -22)
+OK: flow_map_too_many_ids (correctly failed with -22)
+OK: flow_map_bad_uuid (correctly failed with -22)
+OK: flow_map_duplicate_source_id (correctly failed with -22)
+OK: flow_map_duplicate_multi_flow_attr (correctly failed with -22)
+OK: flow_map_unknown_attr (correctly failed with -22)
+OK: flow_map_multi_no_attrs (correctly failed with -22)
+OK: flow_map_multi_duplicate_index (correctly failed with -22)
+OK: flow_map_orphan_multi_flow_token (correctly failed with -22)
+#### End failing tests ####
+
+ALL TESTS PASSED
