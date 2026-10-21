@@ -763,8 +763,10 @@ static void json_write_flow_collection(AVBPrint *buf, const TAMSFlow *flow)
             av_bprintf(buf, ",");
         av_bprintf(buf, "{");
         json_write_key_string(buf, "id", item->id);
-        av_bprintf(buf, ",");
-        json_write_key_string(buf, "role", item->role);
+        if (item->role[0]) {
+            av_bprintf(buf, ",");
+            json_write_key_string(buf, "role", item->role);
+        }
         if (item->has_container_mapping) {
             av_bprintf(buf, ",\"container_mapping\":");
             json_write_container_mapping(buf, &item->container_mapping);
@@ -1571,6 +1573,8 @@ static int tams_flow_from_json(const char **p, TAMSFlow *flow)
             ret = json_read_string(p, flow->metadata_updated, sizeof(flow->metadata_updated));
         } else if (!strcmp(key, "segments_updated")) {
             ret = json_read_string(p, flow->segments_updated, sizeof(flow->segments_updated));
+        } else if (!strcmp(key, "status")) {
+            ret = json_read_string(p, flow->status, sizeof(flow->status));
         } else if (!strcmp(key, "flow_collection")) {
             ret = parse_flow_collection(p, flow);
         } else if (!strcmp(key, "essence_parameters")) {
@@ -1636,6 +1640,8 @@ static int tams_flow_segment_from_json(const char **p, TAMSFlowSegment *seg)
             ret = json_read_string(p, str_val, sizeof(str_val));
             if (ret == 0)
                 ret = ff_tams_timestamp_from_str(str_val, &seg->ts_offset);
+            if (ret == 0)
+                seg->has_ts_offset = 1;
         } else if (!strcmp(key, "last_duration")) {
             ret = json_read_string(p, str_val, sizeof(str_val));
             if (ret == 0) {
@@ -1645,6 +1651,9 @@ static int tams_flow_segment_from_json(const char **p, TAMSFlowSegment *seg)
             }
         } else if (!strcmp(key, "get_urls")) {
             ret = parse_get_urls(p, seg->get_url, sizeof(seg->get_url));
+        } else if (!strcmp(key, "init_object")) {
+            seg->has_init_object = 1;
+            ret = json_skip_value(p);
         } else {
             ret = json_skip_value(p);
         }
@@ -1725,6 +1734,9 @@ int ff_tams_flow_to_json(AVBPrint *buf, const TAMSFlow *flow)
     }
     if (flow->metadata_version[0]) {
         json_write_sep(buf, &first); json_write_key_string(buf, "metadata_version", flow->metadata_version);
+    }
+    if (flow->status[0]) {
+        json_write_sep(buf, &first); json_write_key_string(buf, "status", flow->status);
     }
 
     if (flow->format == TAMS_FORMAT_VIDEO || flow->format == TAMS_FORMAT_IMAGE) {
@@ -2108,7 +2120,10 @@ static const struct {
     { "audio/vorbis",    AV_CODEC_ID_VORBIS,     1 },
     { "audio/ac3",       AV_CODEC_ID_AC3,        1 },
     { "audio/eac3",      AV_CODEC_ID_EAC3,       1 },
+    /* one MIME for all PCM; bit_depth selects the sample size */
     { "audio/pcm",       AV_CODEC_ID_PCM_S24LE,  1 },
+    { "audio/pcm",       AV_CODEC_ID_PCM_S16LE,  1 },
+    { "audio/pcm",       AV_CODEC_ID_PCM_S32LE,  1 },
     { "text/vtt",        AV_CODEC_ID_WEBVTT,     1 },
     { "text/srt",        AV_CODEC_ID_SUBRIP,     1 },
 };
@@ -2237,6 +2252,9 @@ int ff_tams_request(AVFormatContext *s, AVDictionary *const *avio_opts,
             if (ret < 0)
                 return ret;
         }
+        /* a stalled connection should fail into the retry below, not hang */
+        if (!av_dict_get(opts, "rw_timeout", NULL, 0))
+            av_dict_set(&opts, "rw_timeout", "15000000", 0);
         if (method)
             av_dict_set(&opts, "method", method, 0);
         if (body) {
