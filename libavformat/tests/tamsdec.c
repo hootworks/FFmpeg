@@ -146,6 +146,7 @@ static int test_find_flow_by_id(void)
 static int test_check_live_recent(void)
 {
     TAMSDemuxContext c;
+    TAMSSegmentContext segc = { 0 };
     TAMSFlow flow;
 
     memset(&c, 0, sizeof(c));
@@ -158,7 +159,7 @@ static int test_check_live_recent(void)
 
     if (!tams_check_live(&c, &flow))
         FAIL("check_live_recent: a just-updated flow should be live");
-    if (tams_check_live_expired(&c, &flow))
+    if (tams_check_live_expired(&c, &segc, &flow))
         FAIL("check_live_recent: a just-updated flow should not be expired");
 
     printf("OK: check_live_recent\n");
@@ -168,6 +169,7 @@ static int test_check_live_recent(void)
 static int test_check_live_stale(void)
 {
     TAMSDemuxContext c;
+    TAMSSegmentContext segc = { 0 };
     TAMSFlow flow;
 
     memset(&c, 0, sizeof(c));
@@ -180,7 +182,7 @@ static int test_check_live_stale(void)
 
     if (tams_check_live(&c, &flow))
         FAIL("check_live_stale: a long-stale flow should not be live");
-    if (!tams_check_live_expired(&c, &flow))
+    if (!tams_check_live_expired(&c, &segc, &flow))
         FAIL("check_live_stale: a long-stale flow should be expired");
 
     printf("OK: check_live_stale\n");
@@ -190,6 +192,7 @@ static int test_check_live_stale(void)
 static int test_check_live_no_segments_updated(void)
 {
     TAMSDemuxContext c;
+    TAMSSegmentContext segc = { 0 };
     TAMSFlow flow;
 
     memset(&c, 0, sizeof(c));
@@ -197,10 +200,43 @@ static int test_check_live_no_segments_updated(void)
 
     if (tams_check_live(&c, &flow))
         FAIL("check_live_no_segments_updated: empty segments_updated should not be live");
-    if (!tams_check_live_expired(&c, &flow))
+    if (!tams_check_live_expired(&c, &segc, &flow))
         FAIL("check_live_no_segments_updated: empty segments_updated should be treated as expired");
 
     printf("OK: check_live_no_segments_updated\n");
+    return 0;
+}
+
+static int test_check_live_status(void)
+{
+    TAMSDemuxContext c;
+    TAMSSegmentContext segc = { 0 };
+    TAMSFlow flow;
+
+    memset(&c, 0, sizeof(c));
+    c.live_threshold = -1;
+    c.live_timeout   = -1;
+
+    /* status wins over a missing/stale segments_updated */
+    memset(&flow, 0, sizeof(flow));
+    av_strlcpy(flow.status, "ingesting", sizeof(flow.status));
+    if (!tams_check_live(&c, &flow))
+        FAIL("check_live_status: an ingesting flow should be live");
+
+    av_strlcpy(flow.segments_updated, "now", sizeof(flow.segments_updated));
+    av_strlcpy(flow.status, "closed_complete", sizeof(flow.status));
+    if (tams_check_live(&c, &flow))
+        FAIL("check_live_status: a closed_complete flow should not be live");
+
+    /* a stale segments_updated is not expired while this reader keeps
+     * seeing new segments */
+    flow.segment_duration = (AVRational){1, 1};
+    av_strlcpy(flow.segments_updated, "2000-01-01T00:00:00Z", sizeof(flow.segments_updated));
+    segc.last_new_seg_us = av_gettime();
+    if (tams_check_live_expired(&c, &segc, &flow))
+        FAIL("check_live_status: recently seen segments should not be expired");
+
+    printf("OK: check_live_status\n");
     return 0;
 }
 
@@ -504,6 +540,8 @@ static int restamp_fixture_init(RestampFixture *f, int64_t flow_end_ns,
 
     memset(&f->sc, 0, sizeof(f->sc));
     f->sc.flow_index = 0;
+    f->sc.next_pts   = AV_NOPTS_VALUE;
+    f->sc.prev_seg_end = AV_NOPTS_VALUE;
 
     memset(&f->segc, 0, sizeof(f->segc));
     f->segc.sub_ctx = f->sub_ctx;
@@ -516,6 +554,7 @@ static int restamp_fixture_init(RestampFixture *f, int64_t flow_end_ns,
     seg_out->timerange.end           = seg_end_ns;
     seg_out->timerange.end_inclusive = seg_end_inclusive;
     seg_out->ts_offset               = ts_offset;
+    seg_out->has_ts_offset           = 1;
 
     return 0;
 }
@@ -736,6 +775,71 @@ static int test_restamp_discard_still_needed_at_flow_end(void)
     return 0;
 }
 
+static int test_restamp_infer_missing_ts_offset(void)
+{
+    RestampFixture f;
+    TAMSFlowSegment seg;
+    AVPacket *pkt;
+    int ret;
+
+    /* segment [5s,10s) without ts_offset whose media starts at 3600s (as
+     * MPEG-TS often does): the offset is inferred from the first packet */
+    if (restamp_fixture_init(&f, INT64_C(10000000000), INT64_C(5000000000), 1,
+                             INT64_C(10000000000), 0, 0, &seg) < 0)
+        FAIL("restamp_infer_ts_offset: fixture init failed");
+    seg.has_ts_offset = 0;
+
+    pkt = make_test_packet(3600000, 3600000, 40);
+    ret = tams_restamp_packet(f.s, &f.segc, &seg, &f.sc, 0, pkt);
+    if (ret != TAMS_PKT_OK || pkt->pts != INT64_C(5000000000))
+        FAIL("restamp_infer_ts_offset: ret=%d pts=%"PRId64, ret, pkt->pts);
+    av_packet_free(&pkt);
+
+    pkt = make_test_packet(3601000, 3601000, 40);
+    ret = tams_restamp_packet(f.s, &f.segc, &seg, &f.sc, 0, pkt);
+    if (ret != TAMS_PKT_OK || pkt->pts != INT64_C(6000000000))
+        FAIL("restamp_infer_ts_offset: second ret=%d pts=%"PRId64, ret, pkt->pts);
+
+    av_packet_free(&pkt);
+    restamp_fixture_free(&f);
+    printf("OK: restamp_infer_missing_ts_offset\n");
+    return 0;
+}
+
+static int test_restamp_keep_continuation_before_segment_start(void)
+{
+    RestampFixture f;
+    TAMSFlowSegment seg;
+    AVPacket *pkt;
+    int ret;
+
+    /* segment [5s,10s); before it this stream delivered up to 4.96s, so a
+     * packet at 4.96s that landed in this segment (audio after a keyframe
+     * cut, or an open-GOP leading picture) is kept */
+    if (restamp_fixture_init(&f, INT64_C(10000000000), INT64_C(5000000000), 1,
+                             INT64_C(10000000000), 0, 0, &seg) < 0)
+        FAIL("restamp_continuation: fixture init failed");
+    f.sc.prev_seg_end = INT64_C(4960000000);
+    f.sc.next_pts     = INT64_C(6000000000); /* a later keyframe came first */
+
+    pkt = make_test_packet(4960, 4960, 20);
+    ret = tams_restamp_packet(f.s, &f.segc, &seg, &f.sc, 0, pkt);
+    if (ret != TAMS_PKT_OK)
+        FAIL("restamp_continuation: expected TAMS_PKT_OK, got %d", ret);
+    av_packet_free(&pkt);
+
+    /* but a packet already covered by what was delivered is discarded */
+    pkt = make_test_packet(4900, 4900, 20);
+    ret = tams_restamp_packet(f.s, &f.segc, &seg, &f.sc, 0, pkt);
+    if (ret != TAMS_PKT_DISCARD)
+        FAIL("restamp_continuation: expected TAMS_PKT_DISCARD, got %d", ret);
+
+    av_packet_free(&pkt);
+    restamp_fixture_free(&f);
+    printf("OK: restamp_keep_continuation_before_segment_start\n");
+    return 0;
+}
+
 /* ====================================================================
  * Main
  * ==================================================================== */
@@ -752,6 +856,7 @@ int main(int argc, char *argv[])
     ret |= test_check_live_recent();
     ret |= test_check_live_stale();
     ret |= test_check_live_no_segments_updated();
+    ret |= test_check_live_status();
 
     ret |= test_get_poll_init();
     ret |= test_get_min_buffer_ns();
@@ -775,6 +880,8 @@ int main(int argc, char *argv[])
     ret |= test_restamp_discard_still_needed_at_segment_end();
     ret |= test_restamp_eof();
     ret |= test_restamp_discard_still_needed_at_flow_end();
+    ret |= test_restamp_infer_missing_ts_offset();
+    ret |= test_restamp_keep_continuation_before_segment_start();
 
     if (ret)
         printf("\nSOME TESTS FAILED\n");
