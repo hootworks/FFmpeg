@@ -12,6 +12,7 @@
 /srtp
 /tams
 /tamsdec
+/tamsenc
 /url
 /seek_utils
 /http
