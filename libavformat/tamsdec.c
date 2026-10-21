@@ -943,7 +943,7 @@ static int tams_refresh_flow(AVFormatContext *s, int flow_index)
 
 /*
  * Process a specified flow.
- * 
+ *
  * For multi-flow each collected sub-flow is processed. Two cases exist and may be
  * mixed within a single multi-flow:
  *
@@ -1323,7 +1323,7 @@ static int tams_open_segment(AVFormatContext *s, TAMSSegmentContext *segc)
             goto fail;
     }
 
-    av_log(s, AV_LOG_VERBOSE, "TAMS opening segment with object ID: %s\n, for flow %s", seg->object_id, c->flows[segc->flow_index].id);
+    av_log(s, AV_LOG_VERBOSE, "TAMS opening segment with object ID %s for flow %s\n", seg->object_id, c->flows[segc->flow_index].id);
 
     ret = avformat_open_input(&segc->sub_ctx, seg_url, NULL, &opts);
     av_dict_free(&opts);
