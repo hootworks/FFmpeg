@@ -362,6 +362,17 @@ but not emitted as a stream. For a good high-level understanding, refer to:
 
 @subsection Options
 
+A Flow is read live, following new segments as they are registered, while
+its @code{status} is @code{ingesting} or @code{awaiting_content}, or, for
+Flows without a @code{status}, while @code{segments_updated} is recent (see
+@option{live_threshold}). A live Flow ends once its @code{status} becomes
+@code{closed_complete} or no new segments arrive within @option{live_timeout}.
+
+Flows whose segments use separate initialisation objects
+(@code{init_object}) are not supported. Where a segment has no
+@code{ts_offset} but its media timestamps lie outside its timerange, the
+offset is inferred from its first packet.
+
 This demuxer accepts the following options:
 
 @table @option
@@ -1193,9 +1204,10 @@ If @code{segments_updated - now()} is less than this value, the flow is
 treated as live. By default (@code{-1}), 2x @code{segment_duration} is used.
 
 @item live_timeout @var{seconds}
-If @code{segments_updated - now()} exceeds this value, a live flow is
-treated as complete. By default (@code{-1}), 4x @code{segment_duration} is
-used.
+If no new segments have been seen for this long (measured from the later of
+@code{segments_updated} and the last segment fetch that found new segments),
+a live flow is treated as complete. By default (@code{-1}), 4x the larger of
+@code{segment_duration} and the most recent segment's length is used.
 
 @item seg_poll_init @var{microseconds}
 Initial segment poll interval for live streams. By default (@code{-1}),
