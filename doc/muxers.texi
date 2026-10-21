@@ -3912,6 +3912,13 @@ taken from the mapped AVStream; if @option{flow_map} pins an existing Flow
 (via @code{id=}), its essence parameters are validated against the stream's
 rather than overwritten.
 
+Every segment is a self-contained Media Object written by a fresh instance of
+the container muxer, uploaded to a presigned URL obtained from the store and
+then registered against the Flow. Flows created by the muxer are given the
+@code{status} @code{ingesting} while segments are written and
+@code{closed_complete} once the output is finalized, which lets the TAMS
+demuxer follow the Flow live.
+
 A mono Flow's @code{label}/@code{description} come from that AVStream's
 @code{title}/@code{comment} metadata (settable via
 @option{-metadata:s:@var{streamindex}}); any other stream metadata key
@@ -3957,10 +3964,12 @@ space are the attr and token delimiters, @code{label=}/@code{description=}/
 @code{tags.@var{name}=} values may not contain a comma or a space.
 
 @item container @var{format}
-Force the physical container format for every mapped container (e.g.
-@code{mp4}, @code{h264}). By default, a single-stream container uses a
-codec-specific raw elementary-stream muxer where one exists, and a
-multi-stream (multi-Flow) container uses fragmented MP4.
+Force the physical container format for every mapped container. Supported
+values are @code{mp4}, @code{mov}, @code{mpegts} and @code{matroska}, plus
+the codec-specific raw elementary-stream muxers (e.g. @code{h264}). By
+default, a single-stream container uses a raw elementary-stream muxer where
+one exists (Matroska for Vorbis, MOV for raw video), and anything else,
+including a multi-stream (multi-Flow) container, uses MP4.
 
 @item start_timestamp @var{timestamp}
 Override the wall-clock timeline origin with an explicit TAMS timestamp
@@ -3969,7 +3978,10 @@ current wall-clock time is used.
 
 @item segment_duration @var{seconds}
 Target segment duration in seconds. By default (@code{-1}), a pinned Flow's
-own @code{segment_duration} is used if it has one, else 2 seconds.
+own @code{segment_duration} is used if it has one, else 2 seconds. A segment
+is cut at the first keyframe of the container's first video stream (else its
+first stream) at or after this duration, so the actual segment length also
+depends on the encoder's GOP size.
 
 @item retry_max @var{n}
 Maximum retry attempts for transient HTTP errors talking to the TAMS store.
