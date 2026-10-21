@@ -123,6 +123,14 @@ FATE_LIBAVFORMAT-$(CONFIG_TAMS_DEMUXER) += fate-tams
 fate-tams: libavformat/tests/tams$(EXESUF)
 fate-tams: CMD = run libavformat/tests/tams$(EXESUF)
 
+FATE_LIBAVFORMAT-$(CONFIG_TAMS_DEMUXER) += fate-tamsdec
+fate-tamsdec: libavformat/tests/tamsdec$(EXESUF)
+fate-tamsdec: CMD = run libavformat/tests/tamsdec$(EXESUF)
+
+FATE_LIBAVFORMAT-$(CONFIG_TAMS_MUXER) += fate-tamsenc
+fate-tamsenc: libavformat/tests/tamsenc$(EXESUF)
+fate-tamsenc: CMD = run libavformat/tests/tamsenc$(EXESUF)
+
 FATE_LIBAVFORMAT += fate-seek_utils
 fate-seek_utils: libavformat/tests/seek_utils$(EXESUF)
 fate-seek_utils: CMD = run libavformat/tests/seek_utils$(EXESUF)
