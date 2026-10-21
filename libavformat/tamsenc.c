@@ -42,6 +42,7 @@
 #include "libavutil/avstring.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
+#include "libavutil/pixdesc.h"
 #include "libavutil/random_seed.h"
 #include "libavutil/time.h"
 #include "libavutil/uuid.h"
@@ -55,6 +56,7 @@ typedef struct TAMSFlowContext {
     char source_id[TAMS_UUID_SIZE];
     int  has_source_id;  /* came from -flow_map source_id= on this token */
     TAMSFlow flow;
+    int  created;        /* Flow was created by this muxer */
 } TAMSFlowContext;
 
 /* one physical container / nested muxer i.e. one 'flow=' token from -flow_map */
@@ -86,8 +88,10 @@ typedef struct TAMSContainerContext {
     int64_t segment_duration_ns;
     int64_t segment_start_pts;  /* TAMS-ns, relative to c->start_tai_ns */
     int64_t next_boundary_ns;
+    int64_t segment_end_ns;     /* max pts + duration written to this segment */
     int has_segment_data;
     int64_t segment_index;
+    int error;                  /* sticky: a failed flush leaves sub_ctx unusable */
 
     /*
      * Eager pre-allocated storage for the *next* segment, requested at this
@@ -113,6 +117,7 @@ typedef struct TAMSMultiFlowContext {
     TAMSTag tags[TAMS_MAX_TAGS]; /* likewise, from one or more 'tags.<name>=...' */
     int  nb_tags;
     TAMSFlow flow;
+    int  created; /* Flow was created by this muxer */
 
     int *container_indices; /* indices into TAMSMuxContext.container_ctxs[] belonging here */
     int  nb_container_indices;
@@ -184,7 +189,7 @@ static void tams_free_multi_flow_ctxs(TAMSMultiFlowContext *multi_flow_ctxs, int
  * given and the container has exactly one stream. AV_CODEC_ID_RAWVIDEO and
  * AV_CODEC_ID_PCM_S24LE are deliberately absent: their raw forms have no
  * header/sync bytes at all and can't be auto-probed, so they fall through
- * to the mp4 fallback below.
+ * to the mp4 (mov for raw video) fallback below.
  */
 static const struct {
     enum AVCodecID codec_id;
@@ -201,7 +206,7 @@ static const struct {
     { AV_CODEC_ID_MP2,        "mp2"        },
     { AV_CODEC_ID_MP3,        "mp3"        },
     { AV_CODEC_ID_FLAC,       "flac"       },
-    { AV_CODEC_ID_VORBIS,     "oga"        },
+    { AV_CODEC_ID_VORBIS,     "matroska"   }, /* Ogg breaks across segments */
     { AV_CODEC_ID_AC3,        "ac3"        },
     { AV_CODEC_ID_EAC3,       "eac3"       },
     { AV_CODEC_ID_WEBVTT,     "webvtt"     },
@@ -243,7 +248,10 @@ static int tams_resolve_oformat(AVFormatContext *s, TAMSContainerContext *cc)
         }
     }
 
-    oformat = av_guess_format("mp4", NULL, NULL);
+    /* mp4 cannot carry raw video */
+    oformat = av_guess_format(cc->nb_streams == 1 &&
+                              s->streams[cc->stream_indices[0]]->codecpar->codec_id == AV_CODEC_ID_RAWVIDEO
+                              ? "mov" : "mp4", NULL, NULL);
     if (!oformat) {
         av_log(s, AV_LOG_ERROR, "mp4 muxer not available for fragmented-MP4 fallback\n");
         return AVERROR_MUXER_NOT_FOUND;
@@ -288,6 +296,19 @@ static int tams_build_container_mux(AVFormatContext *s, TAMSContainerContext *cc
             opar->codec_tag = ipar->codec_tag;
         } else {
             opar->codec_tag = 0;
+        }
+
+        /*
+         * This muxer advertises AVFMT_GLOBALHEADER, so parameter sets may
+         * live only in extradata; raw elementary-stream segments need them
+         * in-band at every keyframe to be decodable on their own.
+         */
+        if (opar->extradata_size > 0 &&
+            (!strcmp(oc->oformat->name, "h264") || !strcmp(oc->oformat->name, "hevc") ||
+             !strcmp(oc->oformat->name, "mpeg2video"))) {
+            ret = ff_stream_add_bitstream_filter(ost, "dump_extra", "freq=keyframe");
+            if (ret < 0)
+                return ret;
         }
     }
 
@@ -1026,6 +1047,23 @@ static int tams_validate_streams(AVFormatContext *s)
 static int tams_resolve_container_mime(const AVFormatContext *s, const TAMSContainerContext *cc,
                                char *out, size_t out_size)
 {
+    static const struct {
+        const char *muxer_name;
+        const char *mime;
+    } containers[] = {
+        { "mpegts",   "video/mp2t"       },
+        { "mov",      "video/quicktime"  },
+        { "matroska", "video/x-matroska" },
+        { "mxf",      "application/mxf"  },
+    };
+
+    for (int i = 0; i < FF_ARRAY_ELEMS(containers); i++) {
+        if (!strcmp(cc->oformat->name, containers[i].muxer_name)) {
+            av_strlcpy(out, containers[i].mime, out_size);
+            return 0;
+        }
+    }
+
     if (!strcmp(cc->oformat->name, "mp4")) {
         enum AVMediaType dominant = AVMEDIA_TYPE_DATA;
 
@@ -1093,6 +1131,56 @@ static void tams_resolve_stream_metadata(const AVStream *st,
 }
 
 /*
+ * video/raw Flows must carry bit_depth and unc_parameters.unc_type; derive
+ * them (plus component type and chroma subsampling) from the pixel format.
+ */
+static int tams_raw_video_params(AVFormatContext *s, int pix_fmt, TAMSFlow *flow)
+{
+    static const struct {
+        enum AVPixelFormat pix_fmt;
+        enum TAMSVideoUncType unc_type;
+    } packed[] = {
+        { AV_PIX_FMT_YUYV422, TAMS_VIDEO_UNC_YUYV },
+        { AV_PIX_FMT_UYVY422, TAMS_VIDEO_UNC_UYVY },
+        { AV_PIX_FMT_RGB24,   TAMS_VIDEO_UNC_RGB  },
+        { AV_PIX_FMT_RGB0,    TAMS_VIDEO_UNC_RGBX },
+        { AV_PIX_FMT_0RGB,    TAMS_VIDEO_UNC_XRGB },
+        { AV_PIX_FMT_BGR0,    TAMS_VIDEO_UNC_BGRX },
+        { AV_PIX_FMT_0BGR,    TAMS_VIDEO_UNC_XBGR },
+        { AV_PIX_FMT_RGBA,    TAMS_VIDEO_UNC_RGBA },
+        { AV_PIX_FMT_ARGB,    TAMS_VIDEO_UNC_ARGB },
+        { AV_PIX_FMT_BGRA,    TAMS_VIDEO_UNC_BGRA },
+        { AV_PIX_FMT_ABGR,    TAMS_VIDEO_UNC_ABGR },
+    };
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(pix_fmt);
+
+    if (!desc)
+        return AVERROR(EINVAL);
+
+    flow->bit_depth = desc->comp[0].depth;
+    flow->component_type = desc->flags & AV_PIX_FMT_FLAG_RGB ? TAMS_COMPONENT_RGB
+                                                              : TAMS_COMPONENT_YCBCR;
+    if (!(desc->flags & AV_PIX_FMT_FLAG_RGB) && desc->nb_components >= 3) {
+        flow->horiz_chroma_subs = 1 << desc->log2_chroma_w;
+        flow->vert_chroma_subs  = 1 << desc->log2_chroma_h;
+    }
+
+    if (desc->flags & AV_PIX_FMT_FLAG_PLANAR) {
+        flow->video_unc_type = TAMS_VIDEO_UNC_PLANAR;
+        return 0;
+    }
+    for (int i = 0; i < FF_ARRAY_ELEMS(packed); i++) {
+        if (packed[i].pix_fmt == pix_fmt) {
+            flow->video_unc_type = packed[i].unc_type;
+            return 0;
+        }
+    }
+
+    av_log(s, AV_LOG_ERROR, "TAMS: raw pixel format %s has no TAMS unc_type\n", desc->name);
+    return AVERROR(EINVAL);
+}
+
+/*
  * Build a fresh TAMSFlow from a mapped AVStream's codec parameters.
  * When shared_container is true, this Flow is one member of a
  * container shared with other Flow and this Flow only contributes essence params
@@ -1117,6 +1205,11 @@ static int tams_flow_from_stream(AVFormatContext *s, const AVStream *ist,
             flow->frame_rate = ist->avg_frame_rate;
         if (par->bits_per_raw_sample > 0)
             flow->bit_depth = par->bits_per_raw_sample;
+        if (par->codec_id == AV_CODEC_ID_RAWVIDEO) {
+            ret = tams_raw_video_params(s, par->format, flow);
+            if (ret < 0)
+                return ret;
+        }
         break;
     case AVMEDIA_TYPE_AUDIO:
         flow->format      = TAMS_FORMAT_AUDIO;
@@ -1124,6 +1217,8 @@ static int tams_flow_from_stream(AVFormatContext *s, const AVStream *ist,
         flow->channels     = par->ch_layout.nb_channels;
         if (par->bits_per_raw_sample > 0)
             flow->bit_depth = par->bits_per_raw_sample;
+        else if (av_get_bits_per_sample(par->codec_id) > 0)
+            flow->bit_depth = av_get_bits_per_sample(par->codec_id);
         if (par->frame_size > 0)
             flow->coded_frame_size = par->frame_size;
         break;
@@ -1358,9 +1453,43 @@ static int tams_create_flow(AVFormatContext *s, TAMSFlow *flow)
     ret = tams_request(s, url, "PUT", (const uint8_t *)json.str, json.len, "application/json", NULL);
     av_bprint_finalize(&json, NULL);
     if (ret < 0)
-        av_log(s, AV_LOG_ERROR, "TAMS: failed to create Flow %s: %s\n", flow->id, av_err2str(ret));
+        av_log(s, AV_LOG_ERROR, "TAMS: failed to PUT Flow %s: %s\n", flow->id, av_err2str(ret));
 
     return ret;
+}
+
+/*
+ * Flows created here are marked "ingesting" while segments are written and
+ * "closed_complete" once the trailer is written (API 8.2 Flow status), so
+ * readers can tell a live Flow from a finished one.
+ */
+static int tams_set_created_flow_status(AVFormatContext *s, const char *status)
+{
+    TAMSMuxContext *c = s->priv_data;
+    int ret = 0;
+
+    for (int i = 0; i < c->nb_container_ctxs; i++) {
+        TAMSContainerContext *cc = &c->container_ctxs[i];
+        for (int j = 0; j < cc->nb_streams; j++) {
+            TAMSFlowContext *fc = &cc->flow_ctxs[j];
+            if (!fc->created)
+                continue;
+            av_strlcpy(fc->flow.status, status, sizeof(fc->flow.status));
+            ret = tams_create_flow(s, &fc->flow);
+            if (ret < 0)
+                return ret;
+        }
+    }
+    for (int i = 0; i < c->nb_multi_flow_ctxs; i++) {
+        TAMSMultiFlowContext *mc = &c->multi_flow_ctxs[i];
+        if (!mc->created)
+            continue;
+        av_strlcpy(mc->flow.status, status, sizeof(mc->flow.status));
+        ret = tams_create_flow(s, &mc->flow);
+        if (ret < 0)
+            return ret;
+    }
+    return 0;
 }
 
 /*
@@ -1378,6 +1507,7 @@ static int tams_prematch_pinned_multis(AVFormatContext *s)
     for (int i = 0; i < c->nb_multi_flow_ctxs; i++) {
         TAMSMultiFlowContext *mc = &c->multi_flow_ctxs[i];
         uint8_t claimed[TAMS_MAX_COLLECTION_ITEMS] = { 0 };
+        const char *item_type[TAMS_MAX_COLLECTION_ITEMS] = { 0 };
         int ret;
 
         if (!mc->has_flow_id)
@@ -1408,6 +1538,32 @@ static int tams_prematch_pinned_multis(AVFormatContext *s)
         }
 
         /*
+         * Since API 8.2 a collection item's role is optional (and free-form),
+         * so derive each entry's essence type from its own Flow's format
+         * when the role is not one of "video"/"audio"/"data".
+         */
+        for (int m = 0; m < mc->flow.nb_flow_collection_items; m++) {
+            TAMSFlowCollectionItem *item = &mc->flow.flow_collection_items[m];
+            TAMSFlow *member;
+
+            if (claimed[m] || !strcmp(item->role, "video") ||
+                !strcmp(item->role, "audio") || !strcmp(item->role, "data"))
+                continue;
+
+            member = av_mallocz(sizeof(*member));
+            if (!member)
+                return AVERROR(ENOMEM);
+            ret = tams_get_and_validate_flow(s, item->id, member);
+            if (ret >= 0)
+                item_type[m] = member->format == TAMS_FORMAT_VIDEO ? "video" :
+                               member->format == TAMS_FORMAT_AUDIO ? "audio" :
+                               member->format == TAMS_FORMAT_DATA  ? "data"  : NULL;
+            av_free(member);
+            if (ret < 0)
+                return ret;
+        }
+
+        /*
          * Match every unpinned member stream against a remaining,
          * essence-type compatible flow_collection entry
          */
@@ -1428,7 +1584,9 @@ static int tams_prematch_pinned_multis(AVFormatContext *s)
                            want == AVMEDIA_TYPE_AUDIO ? "audio" : "data";
 
                 for (int m = 0; m < mc->flow.nb_flow_collection_items; m++) {
-                    if (claimed[m] || strcmp(mc->flow.flow_collection_items[m].role, want_role))
+                    const char *type = item_type[m] ? item_type[m]
+                                                    : mc->flow.flow_collection_items[m].role;
+                    if (claimed[m] || strcmp(type, want_role))
                         continue;
                     if (match >= 0) {
                         av_log(s, AV_LOG_ERROR,
@@ -1520,9 +1678,11 @@ static int tams_resolve_mono_flows(AVFormatContext *s)
             else
                 tams_generate_uuid(fc->flow.source_id);
 
+            av_strlcpy(fc->flow.status, "ingesting", sizeof(fc->flow.status));
             ret = tams_create_flow(s, &fc->flow);
             if (ret < 0)
                 return ret;
+            fc->created = 1;
         }
 
         tams_resolve_segment_duration(s, cc);
@@ -1613,9 +1773,11 @@ static int tams_resolve_multi_flows(AVFormatContext *s)
             }
         }
 
+        av_strlcpy(mc->flow.status, "ingesting", sizeof(mc->flow.status));
         ret = tams_create_flow(s, &mc->flow);
         if (ret < 0)
             return ret;
+        mc->created = 1;
     }
 
     return 0;
@@ -1629,6 +1791,8 @@ static int tams_resolve_multi_flows(AVFormatContext *s)
  */
 static int tams_alloc_next_storage(AVFormatContext *s, TAMSContainerContext *cc)
 {
+    /* only presigned PUT URLs are supported, so say so (API 8.2) */
+    static const char body[] = "{\"limit\":1,\"presigned\":true}";
     TAMSMuxContext *c = s->priv_data;
     char url[2100];
     AVBPrint resp;
@@ -1641,7 +1805,7 @@ static int tams_alloc_next_storage(AVFormatContext *s, TAMSContainerContext *cc)
     if (ret < 0)
         return ret;
 
-    ret = tams_request(s, url, "POST", (const uint8_t *)"{\"limit\":1}", 11,
+    ret = tams_request(s, url, "POST", (const uint8_t *)body, strlen(body),
                        "application/json", &resp);
     if (ret < 0) {
         av_log(s, AV_LOG_ERROR, "TAMS: failed to allocate storage for Flow %s: %s\n",
@@ -1677,7 +1841,61 @@ static int tams_alloc_next_storage(AVFormatContext *s, TAMSContainerContext *cc)
  * reopen a fresh dyn-buf and eagerly allocate storage for the segment
  * after that.
  */
-static int tams_flush_segment(AVFormatContext *s, TAMSContainerContext *cc, int is_final)
+/*
+ * ts_offset for the segment just written by cc->sub_ctx (whose trailer has
+ * been written but which has not been freed yet): flow_ts - media_ts.
+ * Formats without timestamps restart at 0 in every segment; for the others
+ * the nested muxer keeps the input's continuous timestamps, plus any
+ * negative-ts shift lavf applied and mpegts's fixed mux delay.
+ */
+static int64_t tams_segment_ts_offset(const TAMSMuxContext *c, const TAMSContainerContext *cc,
+                                      int64_t seg_start_tai)
+{
+    const AVFormatContext *oc = cc->sub_ctx;
+    const AVStream *st = oc->streams[cc->reference_stream_index];
+    int64_t offset = c->start_tai_ns;
+
+    /* raw FLAC frames carry their sample number, so stay continuous */
+    if ((oc->oformat->flags & AVFMT_NOTIMESTAMPS) && strcmp(oc->oformat->name, "flac"))
+        return seg_start_tai;
+
+    offset -= av_rescale_q(cffstream(st)->mux_ts_offset, st->time_base,
+                           (AVRational){ 1, TAMS_TIMEBASE });
+    /* mpegtsenc.c shifts every pts/dts by twice max_delay */
+    if (!strcmp(oc->oformat->name, "mpegts") && oc->max_delay > 0)
+        offset -= 2 * av_rescale(oc->max_delay, TAMS_TIMEBASE, AV_TIME_BASE);
+    return offset;
+}
+
+/*
+ * Restart the nested muxer so every segment object is self-contained
+ * (own headers, init data, moov, ...), like segment.c does.
+ */
+static int tams_restart_container_mux(AVFormatContext *s, TAMSContainerContext *cc)
+{
+    int ret;
+
+    avformat_free_context(cc->sub_ctx);
+    cc->sub_ctx = NULL;
+
+    ret = tams_build_container_mux(s, cc);
+    if (ret < 0)
+        return ret;
+    ret = avio_open_dyn_buf(&cc->sub_ctx->pb);
+    if (ret < 0)
+        return ret;
+    ret = avformat_write_header(cc->sub_ctx, NULL);
+    if (ret < 0)
+        av_log(s, AV_LOG_ERROR, "TAMS: nested muxer write_header failed: %s\n", av_err2str(ret));
+    return ret;
+}
+
+/*
+ * Upload and register the segment covering [segment_start_pts, end_ns).
+ * The nested muxer's trailer must already have been written.
+ */
+static int tams_flush_segment(AVFormatContext *s, TAMSContainerContext *cc,
+                              int64_t end_ns, int is_final)
 {
     TAMSMuxContext *c = s->priv_data;
     uint8_t *data = NULL;
@@ -1695,7 +1913,7 @@ static int tams_flush_segment(AVFormatContext *s, TAMSContainerContext *cc, int 
     tr.start = c->start_tai_ns + cc->segment_start_pts;
     tr.has_end = 1;
     tr.end_inclusive = 0;
-    tr.end = c->start_tai_ns + cc->next_boundary_ns;
+    tr.end = c->start_tai_ns + FFMAX(end_ns, cc->segment_start_pts + 1);
 
     if (!cc->next_put_url) {
         av_log(s, AV_LOG_ERROR, "TAMS: no pre-allocated storage for Flow %s\n", cc->owner_flow_id);
@@ -1713,7 +1931,7 @@ static int tams_flush_segment(AVFormatContext *s, TAMSContainerContext *cc, int 
 
     av_strlcpy(seg.object_id, cc->next_object_id, sizeof(seg.object_id));
     seg.timerange = tr;
-    seg.ts_offset = tr.start;
+    seg.ts_offset = tams_segment_ts_offset(c, cc, tr.start);
 
     av_bprint_init(&json, 0, INT_MAX);
     ret = ff_tams_flow_segment_to_json(&json, &seg);
@@ -1735,10 +1953,10 @@ static int tams_flush_segment(AVFormatContext *s, TAMSContainerContext *cc, int 
 
     cc->segment_index++;
     cc->has_segment_data  = 0;
-    cc->segment_start_pts = cc->next_boundary_ns;
+    cc->segment_start_pts = end_ns;
 
     if (!is_final) {
-        ret = avio_open_dyn_buf(&cc->sub_ctx->pb);
+        ret = tams_restart_container_mux(s, cc);
         if (ret < 0)
             goto end;
         ret = tams_alloc_next_storage(s, cc);
@@ -1900,25 +2118,38 @@ static int tams_write_packet(AVFormatContext *s, AVPacket *pkt)
     int64_t ts_ns = AV_NOPTS_VALUE;
     int ret;
 
+    if (cc->error)
+        return cc->error;
+
     if (pkt->pts != AV_NOPTS_VALUE)
         ts_ns = av_rescale_q(pkt->pts, s->streams[pkt->stream_index]->time_base,
                              (AVRational){ 1, TAMS_TIMEBASE });
 
+    /* cut at the first reference keyframe at/after the planned boundary */
     if (sub_idx == cc->reference_stream_index && (pkt->flags & AV_PKT_FLAG_KEY) &&
         cc->has_segment_data && ts_ns != AV_NOPTS_VALUE && ts_ns >= cc->next_boundary_ns) {
-        ret = tams_flush_segment(s, cc, 0);
+        av_write_frame(cc->sub_ctx, NULL);
+        ret = av_write_trailer(cc->sub_ctx);
+        if (ret >= 0)
+            ret = tams_flush_segment(s, cc, ts_ns, 0);
         if (ret < 0)
-            return ret;
+            return cc->error = ret;
         cc->next_boundary_ns = ts_ns + cc->segment_duration_ns;
     }
 
     if (!cc->has_segment_data) {
         cc->has_segment_data = 1;
+        cc->segment_end_ns   = INT64_MIN;
         if (sub_idx == cc->reference_stream_index && ts_ns != AV_NOPTS_VALUE) {
             cc->segment_start_pts = ts_ns;
             cc->next_boundary_ns  = ts_ns + cc->segment_duration_ns;
         }
     }
+
+    if (ts_ns != AV_NOPTS_VALUE)
+        cc->segment_end_ns = FFMAX(cc->segment_end_ns, ts_ns +
+                                   av_rescale_q(pkt->duration, s->streams[pkt->stream_index]->time_base,
+                                                (AVRational){ 1, TAMS_TIMEBASE }));
 
     return ff_write_chained(cc->sub_ctx, sub_idx, pkt, s, 0);
 }
@@ -1927,7 +2158,7 @@ static int tams_finalize_container(AVFormatContext *s, TAMSContainerContext *cc)
 {
     int ret, final_ret = 0;
 
-    if (!cc->sub_ctx || !cc->sub_ctx->pb)
+    if (cc->error || !cc->sub_ctx || !cc->sub_ctx->pb)
         return 0;
 
     av_write_frame(cc->sub_ctx, NULL);
@@ -1936,7 +2167,9 @@ static int tams_finalize_container(AVFormatContext *s, TAMSContainerContext *cc)
         final_ret = ret;
 
     if (avio_tell(cc->sub_ctx->pb) > 0 || cc->has_segment_data) {
-        ret = tams_flush_segment(s, cc, 1);
+        int64_t end_ns = cc->segment_end_ns != INT64_MIN ? cc->segment_end_ns
+                                                         : cc->next_boundary_ns;
+        ret = tams_flush_segment(s, cc, end_ns, 1);
         if (ret < 0 && final_ret >= 0)
             final_ret = ret;
     } else {
@@ -1959,6 +2192,9 @@ static int tams_write_trailer(AVFormatContext *s)
         if (r < 0 && ret >= 0)
             ret = r;
     }
+
+    if (ret >= 0)
+        ret = tams_set_created_flow_status(s, "closed_complete");
 
     return ret;
 }
@@ -2004,7 +2240,7 @@ const FFOutputFormat ff_tams_muxer = {
     .p.audio_codec  = AV_CODEC_ID_AAC,
     .p.video_codec  = AV_CODEC_ID_H264,
     .p.subtitle_codec = AV_CODEC_ID_SUBRIP,
-    .p.flags        = AVFMT_GLOBALHEADER | AVFMT_NOFILE,
+    .p.flags        = AVFMT_GLOBALHEADER | AVFMT_NOFILE | AVFMT_TS_NEGATIVE,
     .p.priv_class   = &tams_muxer_class,
     .priv_data_size = sizeof(TAMSMuxContext),
     .init           = tams_init,
