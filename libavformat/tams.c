@@ -2290,7 +2290,7 @@ int ff_tams_request(AVFormatContext *s, AVDictionary *const *avio_opts,
         if (body) {
             /* AVIOContext's buffering layer doesn't invoke the read
              * callback once write_flag is set (see fill_buffer() in
-             * aviobuf.c). A POST/PUT response can never be read back 
+             * aviobuf.c). A POST/PUT response can never be read back
              * through s->io_open()'s AVIOContext. Go one layer down
              * and read the URLContext. (the same pattern whip.c uses
              * for its SDP-offer POST) */

@@ -1223,7 +1223,7 @@ static int test_timestamp_roundtrip(void)
 
 static int test_timerange_roundtrip(void)
 {
-    static const char *strs[] = {
+    static const char *const strs[] = {
         "[0:0_10:0)", "[1:0]", "[5:500000000_20:0]", "[-1:0_0:0)",
         "_", "()", "(5:0_)", "[_20:0]", "(5:0_10:0]",
     };
