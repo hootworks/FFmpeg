@@ -57,13 +57,13 @@ typedef struct RestampFixture {
 
 static int test_codec_lookup(void)
 {
-    if (tams_codec_lookup("video/h264") != AV_CODEC_ID_H264)
+    if (ff_tams_codec_from_mime("video/h264") != AV_CODEC_ID_H264)
         FAIL("codec_lookup: video/h264 wrong");
-    if (tams_codec_lookup("audio/aac") != AV_CODEC_ID_AAC)
+    if (ff_tams_codec_from_mime("audio/aac") != AV_CODEC_ID_AAC)
         FAIL("codec_lookup: audio/aac wrong");
-    if (tams_codec_lookup("audio/mp2") != AV_CODEC_ID_MP2)
+    if (ff_tams_codec_from_mime("audio/mp2") != AV_CODEC_ID_MP2)
         FAIL("codec_lookup: audio/mp2 wrong");
-    if (tams_codec_lookup("video/mp2t") != AV_CODEC_ID_NONE)
+    if (ff_tams_codec_from_mime("video/mp2t") != AV_CODEC_ID_NONE)
         FAIL("codec_lookup: unknown mime should return AV_CODEC_ID_NONE");
 
     printf("OK: codec_lookup\n");
@@ -76,12 +76,12 @@ static int test_codec_lookup(void)
 
 static int test_same_host(void)
 {
-    if (!tams_same_host("http://example.com/flows/1",
+    if (!ff_tams_same_host("http://example.com/flows/1",
                         "http://example.com/flows/1/segments"))
         FAIL("same_host: identical hosts should match");
-    if (!tams_same_host("http://EXAMPLE.com/a", "http://example.com/b"))
+    if (!ff_tams_same_host("http://EXAMPLE.com/a", "http://example.com/b"))
         FAIL("same_host: host comparison should be case-insensitive");
-    if (tams_same_host("http://example.com/a", "http://other.com/b"))
+    if (ff_tams_same_host("http://example.com/a", "http://other.com/b"))
         FAIL("same_host: different hosts should not match");
 
     printf("OK: same_host\n");
@@ -358,19 +358,19 @@ static int test_build_base_url(void)
 
     /* /flows/<id>: strips only the last path segment, back to the /flows
      * collection endpoint so other flow ids can be appended later */
-    if (tams_build_base_url("http://host/flows/abc-123", base, sizeof(base)) < 0)
+    if (ff_tams_get_base_url("http://host/flows/abc-123", base, sizeof(base), NULL) < 0)
         FAIL("build_base_url: call failed");
     if (strcmp(base, "http://host/flows"))
         FAIL("build_base_url: expected 'http://host/flows', got '%s'", base);
 
     /* /flows?source_id=...: already at the collection endpoint, special-
      * cased to keep the "/flows" suffix rather than stripping it */
-    if (tams_build_base_url("http://host/flows?source_id=x", base, sizeof(base)) < 0)
+    if (ff_tams_get_base_url("http://host/flows?source_id=x", base, sizeof(base), NULL) < 0)
         FAIL("build_base_url: call failed (flows list)");
     if (strcmp(base, "http://host/flows"))
         FAIL("build_base_url: expected 'http://host/flows', got '%s'", base);
 
-    if (tams_build_base_url("relative-id", base, sizeof(base)) < 0)
+    if (ff_tams_get_base_url("relative-id", base, sizeof(base), NULL) < 0)
         FAIL("build_base_url: call failed (no slash)");
     if (base[0])
         FAIL("build_base_url: expected empty base, got '%s'", base);
