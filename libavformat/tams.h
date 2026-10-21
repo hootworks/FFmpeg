@@ -51,7 +51,7 @@ struct AVFormatContext;
  * muxer and demuxer compare it to a fetched Service's api_version and warn
  * (but do not fail) on a mismatch.
  */
-#define TAMS_API_VERSION "8.1"
+#define TAMS_API_VERSION "8.2"
 
 #define AVRATIONAL_FORMAT "%d/%d"
 #define AVRATIONAL_ARG(rational) rational.num, rational.den
@@ -197,6 +197,7 @@ typedef struct TAMSFlow {
     char created[64];
     char metadata_updated[64];
     char segments_updated[64];
+    char status[32];         /* API 8.2 flow-status.json, may be empty */
 
     /* Video/Image essence parameters */
     int frame_width;
@@ -237,6 +238,8 @@ typedef struct TAMSFlowSegment {
     char object_id[512];
     TAMSTimeRange timerange;
     int64_t ts_offset;       /* defaults to 0 if absent from JSON */
+    int has_ts_offset;
+    int has_init_object;     /* API 8.2 init segments; not supported */
     int64_t last_duration;
     int has_last_duration;
     char get_url[2048];
