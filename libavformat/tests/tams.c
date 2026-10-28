@@ -351,6 +351,39 @@ const char *segment_json_null_fields =
     "    \"last_duration\": null"
     "}";
 
+const char *flow_json_array =
+    "["
+    "    {"
+    "        \"id\": \"4f79cfd1-c057-47f4-8e4d-1b126ca7bf34\","
+    "        \"source_id\": \"2aa143ac-0ab7-4d75-bc32-5c00c13d186f\","
+    "        \"format\": \"urn:x-nmos:format:video\","
+    "        \"codec\": \"video/h264\","
+    "        \"essence_parameters\": {"
+    "            \"frame_width\": 1280,"
+    "            \"frame_height\": 720"
+    "        }"
+    "    },"
+    "    {"
+    "        \"id\": \"94996f2e-0cb5-43d3-ab6c-db5a9cf667aa\","
+    "        \"source_id\": \"2aa143ac-0ab7-4d75-bc32-5c00c13d186f\","
+    "        \"format\": \"urn:x-nmos:format:audio\","
+    "        \"codec\": \"audio/aac\","
+    "        \"essence_parameters\": {"
+    "            \"sample_rate\": 48000,"
+    "            \"channels\": 2"
+    "        }"
+    "    },"
+    "    {"
+    "        \"id\": \"e85efab4-993b-4ad6-9af3-4cd8d0d38860\","
+    "        \"source_id\": \"2aa143ac-0ab7-4d75-bc32-5c00c13d186f\","
+    "        \"format\": \"urn:x-nmos:format:data\","
+    "        \"codec\": \"application/ttml+xml\","
+    "        \"essence_parameters\": {"
+    "            \"data_type\": \"urn:x-tams:data:subtitle\""
+    "        }"
+    "    }"
+    "]";
+
 /* ====================================================================
  * Test helpers
  * ==================================================================== */
@@ -722,78 +755,6 @@ static int test_multi_container_map(void)
     return 0;
 }
 
-static int test_flow_array(void)
-{
-    const char *flow_json_array =
-        "["
-        "    {"
-        "        \"id\": \"4f79cfd1-c057-47f4-8e4d-1b126ca7bf34\","
-        "        \"source_id\": \"2aa143ac-0ab7-4d75-bc32-5c00c13d186f\","
-        "        \"format\": \"urn:x-nmos:format:video\","
-        "        \"codec\": \"video/h264\","
-        "        \"essence_parameters\": {"
-        "            \"frame_width\": 1280,"
-        "            \"frame_height\": 720"
-        "        }"
-        "    },"
-        "    {"
-        "        \"id\": \"94996f2e-0cb5-43d3-ab6c-db5a9cf667aa\","
-        "        \"source_id\": \"2aa143ac-0ab7-4d75-bc32-5c00c13d186f\","
-        "        \"format\": \"urn:x-nmos:format:audio\","
-        "        \"codec\": \"audio/aac\","
-        "        \"essence_parameters\": {"
-        "            \"sample_rate\": 48000,"
-        "            \"channels\": 2"
-        "        }"
-        "    },"
-        "    {"
-        "        \"id\": \"e85efab4-993b-4ad6-9af3-4cd8d0d38860\","
-        "        \"source_id\": \"2aa143ac-0ab7-4d75-bc32-5c00c13d186f\","
-        "        \"format\": \"urn:x-nmos:format:data\","
-        "        \"codec\": \"application/ttml+xml\","
-        "        \"essence_parameters\": {"
-        "            \"data_type\": \"urn:x-tams:data:subtitle\""
-        "        }"
-        "    }"
-        "]";
-
-    const char *cursor = flow_json_array;
-    TAMSFlow flows[3];
-    int ret, count = 0;
-
-    ff_tams_json_skip_ws(&cursor);
-    if (*cursor != '[')
-        FAIL("flow_array: expected '['");
-    cursor++;
-
-    while (1) {
-        ff_tams_json_skip_ws(&cursor);
-        if (*cursor == ']')
-            break;
-        if (count >= 3)
-            FAIL("flow_array: too many flows");
-        ret = tams_flow_from_json(&cursor, &flows[count]);
-        if (ret < 0)
-            FAIL("flow_array: parse flow %d failed: %d", count, ret);
-        count++;
-        ff_tams_json_skip_ws(&cursor);
-        if (*cursor == ',')
-            cursor++;
-    }
-
-    if (count != 3)
-        FAIL("flow_array: expected 3 flows, got %d", count);
-    if (flows[0].format != TAMS_FORMAT_VIDEO)
-        FAIL("flow_array: flow 0 should be video");
-    if (flows[1].format != TAMS_FORMAT_AUDIO)
-        FAIL("flow_array: flow 1 should be audio");
-    if (flows[2].format != TAMS_FORMAT_DATA)
-        FAIL("flow_array: flow 2 should be data");
-
-    printf("OK: flow_array (parsed %d flows)\n", count);
-    return 0;
-}
-
 static int test_bad_json(void)
 {
     /* Truncate flow_json_video_h264_vfr halfway */
@@ -1071,39 +1032,6 @@ static int test_parse_flows_json_single(void)
 
 static int test_parse_flows_json_array(void)
 {
-    static const char *flow_json_array =
-        "["
-        "    {"
-        "        \"id\": \"4f79cfd1-c057-47f4-8e4d-1b126ca7bf34\","
-        "        \"source_id\": \"2aa143ac-0ab7-4d75-bc32-5c00c13d186f\","
-        "        \"format\": \"urn:x-nmos:format:video\","
-        "        \"codec\": \"video/h264\","
-        "        \"essence_parameters\": {"
-        "            \"frame_width\": 1280,"
-        "            \"frame_height\": 720"
-        "        }"
-        "    },"
-        "    {"
-        "        \"id\": \"94996f2e-0cb5-43d3-ab6c-db5a9cf667aa\","
-        "        \"source_id\": \"2aa143ac-0ab7-4d75-bc32-5c00c13d186f\","
-        "        \"format\": \"urn:x-nmos:format:audio\","
-        "        \"codec\": \"audio/aac\","
-        "        \"essence_parameters\": {"
-        "            \"sample_rate\": 48000,"
-        "            \"channels\": 2"
-        "        }"
-        "    },"
-        "    {"
-        "        \"id\": \"e85efab4-993b-4ad6-9af3-4cd8d0d38860\","
-        "        \"source_id\": \"2aa143ac-0ab7-4d75-bc32-5c00c13d186f\","
-        "        \"format\": \"urn:x-nmos:format:data\","
-        "        \"codec\": \"application/ttml+xml\","
-        "        \"essence_parameters\": {"
-        "            \"data_type\": \"urn:x-tams:data:subtitle\""
-        "        }"
-        "    }"
-        "]";
-
     TAMSFlow *flows = NULL;
     int nb_flows = 0;
     int ret;
@@ -1517,9 +1445,6 @@ int main(int argc, char *argv[])
 
     /* Multi-flow: container mapping */
     ret |= test_multi_container_map();
-
-    /* Multi-flow JSON array (low-level API) */
-    ret |= test_flow_array();
 
     /* ff_tams_flows_from_json (high-level API) */
     ret |= test_parse_flows_json_single();
