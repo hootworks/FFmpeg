@@ -19,12 +19,10 @@
  */
 
 /**
- * Tests for the TAMS muxer's -flow_map option parser (pure functions,
- * no I/O).
+ * @file
+ * Tests for TAMS muxer internals.
  *
  * @author Nick Ryan
- * @file
- * @ingroup lavu_tams
  */
 
 #include "libavformat/tamsenc.c"
@@ -39,6 +37,10 @@
     return 1; \
 } while (0)
 
+/* ====================================================================
+ * Flow map test helpers
+ * ==================================================================== */
+
 static void free_result(TAMSContainerContext *containers, int nb_containers,
                          TAMSMultiFlowContext *multis, int nb_multis)
 {
@@ -46,8 +48,24 @@ static void free_result(TAMSContainerContext *containers, int nb_containers,
     tams_free_multi_flow_ctxs(multis, nb_multis);
 }
 
+static int test_flow_map_fails(const char *test_name, const char *str, int nb_streams)
+{
+    TAMSContainerContext *containers;
+    TAMSMultiFlowContext *multis;
+    int nb_containers, nb_multis, ret;
+
+    ret = tams_parse_flow_map(str, nb_streams, &containers, &nb_containers, &multis, &nb_multis);
+    if (ret >= 0) {
+        free_result(containers, nb_containers, multis, nb_multis);
+        FAIL("%s: expected failure but got success", test_name);
+    }
+
+    printf("OK: %s (correctly failed with %d)\n", test_name, ret);
+    return 0;
+}
+
 /* ====================================================================
- * Default / no -flow_map
+ * Flow map tests
  * ==================================================================== */
 
 static int test_flow_map_default(void)
@@ -89,10 +107,6 @@ static int test_flow_map_empty_string(void)
     return 0;
 }
 
-/* ====================================================================
- * Single flow= tokens: streams=, id=, source_id=
- * ==================================================================== */
-
 static int test_flow_map_explicit_split(void)
 {
     TAMSContainerContext *containers;
@@ -121,8 +135,7 @@ static int test_flow_map_unmentioned_stream_gets_default(void)
     TAMSMultiFlowContext *multis;
     int nb_containers, nb_multis, ret;
 
-    /* stream 1 is never mentioned -- should default to its own standalone
-     * mono Flow rather than erroring, same as full -flow_map omission */
+    /* stream 1 is never mentioned -- should default to its own standalone mono Flow */
     ret = tams_parse_flow_map("flow=streams=0,id=4f79cfd1-c057-47f4-8e4d-1b126ca7bf34",
                               2, &containers, &nb_containers, &multis, &nb_multis);
     if (ret < 0)
@@ -190,9 +203,35 @@ static int test_flow_map_id_and_source_id(void)
     return 0;
 }
 
-/* ====================================================================
- * Shared/muxed containers: multi-stream flow= tokens
- * ==================================================================== */
+static int test_flow_map_uppercase_ids(void)
+{
+    TAMSContainerContext *containers;
+    TAMSMultiFlowContext *multis;
+    int nb_containers, nb_multis, ret;
+    const char *str =
+        "flow=streams=0,id=4F79CFD1-C057-47F4-8E4D-1B126CA7BF34,"
+        "source_id=AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE,multi_flow=0 "
+        "flow=streams=1,multi_flow=0 "
+        "multi_flow=0,id=94996F2E-0CB5-43D3-AB6C-DB5A9CF667AA,"
+        "source_id=2AA143AC-0AB7-4D75-BC32-5C00C13D186F";
+
+    /* -flow_map UUIDs are forced to lower case as required by TAMS */
+    ret = tams_parse_flow_map(str, 2, &containers, &nb_containers, &multis, &nb_multis);
+    if (ret < 0)
+        FAIL("flow_map_uppercase_ids: returned %d", ret);
+    if (strcmp(containers[0].flow_ctxs[0].flow_id, "4f79cfd1-c057-47f4-8e4d-1b126ca7bf34"))
+        FAIL("flow_map_uppercase_ids: wrong flow_id: %s", containers[0].flow_ctxs[0].flow_id);
+    if (strcmp(containers[0].flow_ctxs[0].source_id, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"))
+        FAIL("flow_map_uppercase_ids: wrong source_id: %s", containers[0].flow_ctxs[0].source_id);
+    if (strcmp(multis[0].flow_id, "94996f2e-0cb5-43d3-ab6c-db5a9cf667aa"))
+        FAIL("flow_map_uppercase_ids: wrong multi flow_id: %s", multis[0].flow_id);
+    if (strcmp(multis[0].source_id, "2aa143ac-0ab7-4d75-bc32-5c00c13d186f"))
+        FAIL("flow_map_uppercase_ids: wrong multi source_id: %s", multis[0].source_id);
+
+    free_result(containers, nb_containers, multis, nb_multis);
+    printf("OK: flow_map_uppercase_ids\n");
+    return 0;
+}
 
 static int test_flow_map_shared_container_requires_multi(void)
 {
@@ -250,8 +289,7 @@ static int test_flow_map_shared_container_partial_id(void)
     TAMSContainerContext *containers;
     TAMSMultiFlowContext *multis;
     int nb_containers, nb_multis, ret;
-    /* only stream 0 gets an explicit id=; stream 1 is left for implicit
-     * resolution later (in write_header), not a parse-time error */
+    /* only stream 0 gets an explicit id=; stream 1 is left for implicit resolution */
     const char *str =
         "flow=streams=0,1,id=e85efab4-993b-4ad6-9af3-4cd8d0d38860,multi_flow=0";
 
@@ -267,11 +305,6 @@ static int test_flow_map_shared_container_partial_id(void)
     printf("OK: flow_map_shared_container_partial_id\n");
     return 0;
 }
-
-/* ====================================================================
- * multi_flow= linkage: new multi, standalone property tokens, multiple
- * independent multis in one invocation
- * ==================================================================== */
 
 static int test_flow_map_new_multi(void)
 {
@@ -349,8 +382,7 @@ static int test_flow_map_two_independent_multis(void)
     TAMSContainerContext *containers;
     TAMSMultiFlowContext *multis;
     int nb_containers, nb_multis, ret;
-    /* two separate multi-Flow groupings in one invocation: streams 0,1
-     * under multi 0 (existing), streams 2,3 under multi 1 (existing) */
+    /* two separate multi-Flow groupings in one invocation */
     const char *str =
         "flow=streams=0,multi_flow=0 flow=streams=1,multi_flow=0 "
         "flow=streams=2,multi_flow=1 flow=streams=3,multi_flow=1 "
@@ -402,27 +434,7 @@ static int test_flow_map_standalone_and_grouped_mixed(void)
 }
 
 /* ====================================================================
- * Failure cases
- * ==================================================================== */
-
-static int test_flow_map_fails(const char *test_name, const char *str, int nb_streams)
-{
-    TAMSContainerContext *containers;
-    TAMSMultiFlowContext *multis;
-    int nb_containers, nb_multis, ret;
-
-    ret = tams_parse_flow_map(str, nb_streams, &containers, &nb_containers, &multis, &nb_multis);
-    if (ret >= 0) {
-        free_result(containers, nb_containers, multis, nb_multis);
-        FAIL("%s: expected failure but got success", test_name);
-    }
-
-    printf("OK: %s (correctly failed with %d)\n", test_name, ret);
-    return 0;
-}
-
-/* ====================================================================
- * tams_is_valid_uuid
+ * UUID tests
  * ==================================================================== */
 
 static int test_is_valid_uuid(void)
@@ -443,7 +455,65 @@ static int test_is_valid_uuid(void)
 }
 
 /* ====================================================================
- * tams_init integration test
+ * Default muxer tests
+ * ==================================================================== */
+
+/* Every default raw-ES muxer's codec needs a MIME type, which names its container */
+static int test_default_muxers_have_mime(void)
+{
+    for (int i = 0; i < FF_ARRAY_ELEMS(tams_default_muxers); i++)
+        if (!ff_tams_mime_from_codec(tams_default_muxers[i].codec_id))
+            FAIL("default_muxers_have_mime: %s has no MIME type",
+                 avcodec_get_name(tams_default_muxers[i].codec_id));
+
+    printf("OK: default_muxers_have_mime\n");
+    return 0;
+}
+
+/* ====================================================================
+ * Container mapping tests
+ * ==================================================================== */
+
+/*
+ * Setup: A shared container holds video, audio and audio streams.
+ * Expected: format_track_index counts within each media type: 0, 0, 1.
+ */
+static int test_format_track_index(void)
+{
+    static const enum AVMediaType types[] = {
+        AVMEDIA_TYPE_VIDEO, AVMEDIA_TYPE_AUDIO, AVMEDIA_TYPE_AUDIO,
+    };
+    static const int expected[] = { 0, 0, 1 };
+    AVFormatContext *s = avformat_alloc_context();
+    int stream_indices[] = { 0, 1, 2 };
+    TAMSContainerContext cc = { .stream_indices = stream_indices, .nb_streams = 3 };
+
+    if (!s)
+        FAIL("format_track_index: alloc_context failed");
+    for (int i = 0; i < 3; i++) {
+        AVStream *st = avformat_new_stream(s, NULL);
+        if (!st) {
+            avformat_free_context(s);
+            FAIL("format_track_index: new_stream failed");
+        }
+        st->codecpar->codec_type = types[i];
+    }
+
+    for (int k = 0; k < 3; k++) {
+        int index = tams_format_track_index(s, &cc, k);
+        if (index != expected[k]) {
+            avformat_free_context(s);
+            FAIL("format_track_index: stream %d got %d, expected %d", k, index, expected[k]);
+        }
+    }
+
+    avformat_free_context(s);
+    printf("OK: format_track_index\n");
+    return 0;
+}
+
+/* ====================================================================
+ * Init tests
  * ==================================================================== */
 
 static int test_init_missing_multi_flow_fails(void)
@@ -506,6 +576,7 @@ int main(int argc, char *argv[])
     ret |= test_flow_map_unmentioned_stream_gets_default();
     ret |= test_flow_map_id_pin();
     ret |= test_flow_map_id_and_source_id();
+    ret |= test_flow_map_uppercase_ids();
 
     ret |= test_flow_map_shared_container_requires_multi();
     ret |= test_flow_map_shared_container_positional_ids();
@@ -518,6 +589,8 @@ int main(int argc, char *argv[])
     ret |= test_flow_map_standalone_and_grouped_mixed();
 
     ret |= test_is_valid_uuid();
+    ret |= test_default_muxers_have_mime();
+    ret |= test_format_track_index();
     ret |= test_init_missing_multi_flow_fails();
 
     printf("#### The following should fail ####\n");

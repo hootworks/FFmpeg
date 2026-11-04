@@ -4,6 +4,7 @@ OK: flow_map_explicit_split
 OK: flow_map_unmentioned_stream_gets_default
 OK: flow_map_id_pin
 OK: flow_map_id_and_source_id
+OK: flow_map_uppercase_ids
 OK: flow_map_shared_container_requires_multi
 OK: flow_map_shared_container_positional_ids
 OK: flow_map_shared_container_partial_id
@@ -13,6 +14,8 @@ OK: flow_map_multi_source_id
 OK: flow_map_two_independent_multis
 OK: flow_map_standalone_and_grouped_mixed
 OK: is_valid_uuid
+OK: default_muxers_have_mime
+OK: format_track_index
 OK: init_missing_multi_flow_fails (correctly failed with -22)
 #### The following should fail ####
 OK: flow_map_bad_token (correctly failed with -22)

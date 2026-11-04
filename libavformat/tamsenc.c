@@ -19,6 +19,7 @@
  */
 
 /**
+ * @file
  * TAMS (Time-Addressable Media Store) muxer.
  *
  * Muxes one or more TAMS Flows: creates/updates Flows, segments encoded output
@@ -29,8 +30,6 @@
  * https://bbc.github.io/tams/main/index.html
  *
  * @author Nick Ryan
- * @file
- * @ingroup lavu_tams
  */
 
 #include "avformat.h"
@@ -86,7 +85,7 @@ typedef struct TAMSContainerContext {
 
     int reference_stream_index; /* sub_ctx stream index used for boundary decisions */
     int64_t segment_duration_ns;
-    int64_t segment_start_pts;  /* TAMS-ns, relative to c->start_tai_ns */
+    int64_t segment_start_ns;   /* relative to c->start_tai_ns */
     int64_t next_boundary_ns;
     int64_t segment_end_ns;     /* max pts + duration written to this segment */
     int has_segment_data;
@@ -131,8 +130,8 @@ typedef struct TAMSMuxContext {
     char *container_name;
     char *start_timestamp_str;
     char *headers_str;
-    int64_t segment_duration; /* seconds; -1 = auto */
-    int retry_max;
+    int64_t segment_duration_s; /* -1 = auto */
+    int retry_max;              /* attempts */
     int64_t retry_backoff_us;
 
     TAMSContainerContext *container_ctxs;
@@ -345,6 +344,21 @@ static int tams_is_valid_uuid(const char *s)
 }
 
 /**
+ * Validate a UUID given in -flow_map and force it to lower case in place.
+ * TAMS only allows lower-case UUIDs (uuid.json), the IDs a store returns are
+ * compared with strcmp(), but av_uuid_parse() also accepts upper case.
+ * Returns 1 if valid, 0 if not.
+ */
+static int tams_normalize_uuid(char *s)
+{
+    if (!tams_is_valid_uuid(s))
+        return 0;
+    for (; *s; s++)
+        *s = av_tolower(*s);
+    return 1;
+}
+
+/**
  * Parse one 'flow=streams=...' token (the 'flow=' prefix already consumed
  * by the caller; p points at 'streams=...').
  */
@@ -427,7 +441,7 @@ static int tams_parse_flow_token(const char *p, const char *tok_end, int nb_stre
             ids = tmp;
             memcpy(ids[nb_ids], v, v_end - v);
             ids[nb_ids][v_end - v] = '\0';
-            if (!tams_is_valid_uuid(ids[nb_ids])) {
+            if (!tams_normalize_uuid(ids[nb_ids])) { /* forced to lower case */
                 ret = AVERROR(EINVAL);
                 goto fail;
             }
@@ -449,7 +463,7 @@ static int tams_parse_flow_token(const char *p, const char *tok_end, int nb_stre
             }
             memcpy(source_id, v, v_end - v);
             source_id[v_end - v] = '\0';
-            if (!tams_is_valid_uuid(source_id)) {
+            if (!tams_normalize_uuid(source_id)) { /* forced to lower case */
                 ret = AVERROR(EINVAL);
                 goto fail;
             }
@@ -583,7 +597,7 @@ static int tams_parse_multi_flow_token(const char *p, const char *tok_end,
                 return AVERROR(EINVAL);
             memcpy(id, v, v_end - v);
             id[v_end - v] = '\0';
-            if (!tams_is_valid_uuid(id))
+            if (!tams_normalize_uuid(id)) /* forced to lower case */
                 return AVERROR(EINVAL);
             has_id = 1;
             p = v_end;
@@ -597,7 +611,7 @@ static int tams_parse_multi_flow_token(const char *p, const char *tok_end,
                 return AVERROR(EINVAL);
             memcpy(source_id, v, v_end - v);
             source_id[v_end - v] = '\0';
-            if (!tams_is_valid_uuid(source_id))
+            if (!tams_normalize_uuid(source_id)) /* forced to lower case */
                 return AVERROR(EINVAL);
             has_source_id = 1;
             p = v_end;
@@ -1136,22 +1150,6 @@ static void tams_resolve_stream_metadata(const AVStream *st,
  */
 static int tams_raw_video_params(AVFormatContext *s, int pix_fmt, TAMSFlow *flow)
 {
-    static const struct {
-        enum AVPixelFormat pix_fmt;
-        enum TAMSVideoUncType unc_type;
-    } packed[] = {
-        { AV_PIX_FMT_YUYV422, TAMS_VIDEO_UNC_YUYV },
-        { AV_PIX_FMT_UYVY422, TAMS_VIDEO_UNC_UYVY },
-        { AV_PIX_FMT_RGB24,   TAMS_VIDEO_UNC_RGB  },
-        { AV_PIX_FMT_RGB0,    TAMS_VIDEO_UNC_RGBX },
-        { AV_PIX_FMT_0RGB,    TAMS_VIDEO_UNC_XRGB },
-        { AV_PIX_FMT_BGR0,    TAMS_VIDEO_UNC_BGRX },
-        { AV_PIX_FMT_0BGR,    TAMS_VIDEO_UNC_XBGR },
-        { AV_PIX_FMT_RGBA,    TAMS_VIDEO_UNC_RGBA },
-        { AV_PIX_FMT_ARGB,    TAMS_VIDEO_UNC_ARGB },
-        { AV_PIX_FMT_BGRA,    TAMS_VIDEO_UNC_BGRA },
-        { AV_PIX_FMT_ABGR,    TAMS_VIDEO_UNC_ABGR },
-    };
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(pix_fmt);
 
     if (!desc)
@@ -1169,12 +1167,9 @@ static int tams_raw_video_params(AVFormatContext *s, int pix_fmt, TAMSFlow *flow
         flow->video_unc_type = TAMS_VIDEO_UNC_PLANAR;
         return 0;
     }
-    for (int i = 0; i < FF_ARRAY_ELEMS(packed); i++) {
-        if (packed[i].pix_fmt == pix_fmt) {
-            flow->video_unc_type = packed[i].unc_type;
-            return 0;
-        }
-    }
+    flow->video_unc_type = ff_tams_unc_type_from_pix_fmt(pix_fmt);
+    if (flow->video_unc_type != TAMS_VIDEO_UNC_UNKNOWN)
+        return 0;
 
     av_log(s, AV_LOG_ERROR, "TAMS: raw pixel format %s has no TAMS unc_type\n", desc->name);
     return AVERROR(EINVAL);
@@ -1348,8 +1343,8 @@ static void tams_resolve_segment_duration(AVFormatContext *s, TAMSContainerConte
 {
     TAMSMuxContext *c = s->priv_data;
 
-    if (c->segment_duration >= 0) {
-        cc->segment_duration_ns = c->segment_duration * TAMS_TIMEBASE;
+    if (c->segment_duration_s >= 0) {
+        cc->segment_duration_ns = c->segment_duration_s * TAMS_TIMEBASE;
         return;
     }
     for (int i = 0; i < cc->nb_streams; i++) {
@@ -1407,7 +1402,7 @@ static int tams_check_pinned_essence(AVFormatContext *s, const AVStream *ist, co
 
     if (flow->codec[0]) {
         const char *mime = ff_tams_mime_from_codec(par->codec_id);
-        if (mime && strcmp(mime, flow->codec)) {
+        if (mime && av_strcasecmp(mime, flow->codec)) {
             av_log(s, AV_LOG_ERROR, "TAMS: pinned Flow %s codec %s != stream codec %s\n",
                    flow->id, flow->codec, mime);
             return AVERROR(EINVAL);
@@ -1692,6 +1687,21 @@ static int tams_resolve_mono_flows(AVFormatContext *s)
 }
 
 /*
+ * Return the container_mapping format_track_index of stream k of a container:
+ * its zero-based position among the container's streams of the same media type.
+ */
+static int tams_format_track_index(const AVFormatContext *s, const TAMSContainerContext *cc, int k)
+{
+    enum AVMediaType t = s->streams[cc->stream_indices[k]]->codecpar->codec_type;
+    int index = 0;
+
+    for (int j = 0; j < k; j++)
+        if (s->streams[cc->stream_indices[j]]->codecpar->codec_type == t)
+            index++;
+    return index;
+}
+
+/*
  * Resolve every multi-Flow. If -flow_map specified an id= then GET it,
  * otherwise create and PUT a fresh multi-Flow whose
  * flow_collection lists every member container's now-resolved mono Flows.
@@ -1763,7 +1773,9 @@ static int tams_resolve_multi_flows(AVFormatContext *s)
                  */
                 if (shared_container) {
                     item->has_container_mapping = 1;
-                    item->container_mapping.format_track_index = k;
+                    item->container_mapping.track_index = k;
+                    item->container_mapping.has_track_index = 1;
+                    item->container_mapping.format_track_index = tams_format_track_index(s, cc, k);
                     item->container_mapping.has_format_track_index = 1;
                     if (!strcmp(cc->oformat->name, "mp4")) {
                         item->container_mapping.isobmff_track_id = k + 1;
@@ -1824,9 +1836,9 @@ static int tams_alloc_next_storage(AVFormatContext *s, TAMSContainerContext *cc)
 
     av_freep(&cc->next_put_url);
     av_freep(&cc->next_object_id);
-    cc->next_put_url   = av_strdup(objects[0].put_url.url);
+    cc->next_put_url   = av_strdup(objects[0].put_url);
     cc->next_object_id = av_strdup(objects[0].object_id);
-    av_strlcpy(cc->next_put_content_type, objects[0].put_url.content_type,
+    av_strlcpy(cc->next_put_content_type, objects[0].put_content_type,
               sizeof(cc->next_put_content_type));
     av_free(objects);
     if (!cc->next_put_url || !cc->next_object_id)
@@ -1849,22 +1861,22 @@ static int tams_alloc_next_storage(AVFormatContext *s, TAMSContainerContext *cc)
  * negative-ts shift lavf applied and mpegts's fixed mux delay.
  */
 static int64_t tams_segment_ts_offset(const TAMSMuxContext *c, const TAMSContainerContext *cc,
-                                      int64_t seg_start_tai)
+                                      int64_t seg_start_tai_ns)
 {
     const AVFormatContext *oc = cc->sub_ctx;
     const AVStream *st = oc->streams[cc->reference_stream_index];
-    int64_t offset = c->start_tai_ns;
+    int64_t offset_ns = c->start_tai_ns;
 
     /* raw FLAC frames carry their sample number, so stay continuous */
     if ((oc->oformat->flags & AVFMT_NOTIMESTAMPS) && strcmp(oc->oformat->name, "flac"))
-        return seg_start_tai;
+        return seg_start_tai_ns;
 
-    offset -= av_rescale_q(cffstream(st)->mux_ts_offset, st->time_base,
-                           (AVRational){ 1, TAMS_TIMEBASE });
+    offset_ns -= av_rescale_q(cffstream(st)->mux_ts_offset, st->time_base,
+                              (AVRational){ 1, TAMS_TIMEBASE });
     /* mpegtsenc.c shifts every pts/dts by twice max_delay */
     if (!strcmp(oc->oformat->name, "mpegts") && oc->max_delay > 0)
-        offset -= 2 * av_rescale(oc->max_delay, TAMS_TIMEBASE, AV_TIME_BASE);
-    return offset;
+        offset_ns -= 2 * av_rescale(oc->max_delay, TAMS_TIMEBASE, AV_TIME_BASE);
+    return offset_ns;
 }
 
 /*
@@ -1891,7 +1903,7 @@ static int tams_restart_container_mux(AVFormatContext *s, TAMSContainerContext *
 }
 
 /*
- * Upload and register the segment covering [segment_start_pts, end_ns).
+ * Upload and register the segment covering [segment_start_ns, end_ns).
  * The nested muxer's trailer must already have been written.
  */
 static int tams_flush_segment(AVFormatContext *s, TAMSContainerContext *cc,
@@ -1910,10 +1922,10 @@ static int tams_flush_segment(AVFormatContext *s, TAMSContainerContext *cc,
 
     tr.has_start = 1;
     tr.start_inclusive = 1;
-    tr.start = c->start_tai_ns + cc->segment_start_pts;
+    tr.start = c->start_tai_ns + cc->segment_start_ns;
     tr.has_end = 1;
     tr.end_inclusive = 0;
-    tr.end = c->start_tai_ns + FFMAX(end_ns, cc->segment_start_pts + 1);
+    tr.end = c->start_tai_ns + FFMAX(end_ns, cc->segment_start_ns + 1);
 
     if (!cc->next_put_url) {
         av_log(s, AV_LOG_ERROR, "TAMS: no pre-allocated storage for Flow %s\n", cc->owner_flow_id);
@@ -1953,7 +1965,7 @@ static int tams_flush_segment(AVFormatContext *s, TAMSContainerContext *cc,
 
     cc->segment_index++;
     cc->has_segment_data  = 0;
-    cc->segment_start_pts = end_ns;
+    cc->segment_start_ns = end_ns;
 
     if (!is_final) {
         ret = tams_restart_container_mux(s, cc);
@@ -2096,7 +2108,7 @@ static int tams_write_header(AVFormatContext *s)
         }
 
         cc->has_segment_data  = 0;
-        cc->segment_start_pts = 0;
+        cc->segment_start_ns = 0;
         cc->next_boundary_ns  = cc->segment_duration_ns;
 
         ret = tams_alloc_next_storage(s, cc);
@@ -2141,7 +2153,7 @@ static int tams_write_packet(AVFormatContext *s, AVPacket *pkt)
         cc->has_segment_data = 1;
         cc->segment_end_ns   = INT64_MIN;
         if (sub_idx == cc->reference_stream_index && ts_ns != AV_NOPTS_VALUE) {
-            cc->segment_start_pts = ts_ns;
+            cc->segment_start_ns = ts_ns;
             cc->next_boundary_ns  = ts_ns + cc->segment_duration_ns;
         }
     }
@@ -2219,7 +2231,7 @@ static const AVOption tams_options[] = {
         "with every TAMS request",
         OFFSET(headers_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS },
     { "segment_duration", "target segment duration in seconds (-1=auto: existing flow's segment_duration, else 2)",
-        OFFSET(segment_duration), AV_OPT_TYPE_INT64, {.i64 = -1}, -1, INT64_MAX, FLAGS },
+        OFFSET(segment_duration_s), AV_OPT_TYPE_INT64, {.i64 = -1}, -1, INT64_MAX, FLAGS },
     { "retry_max", "maximum retry attempts for transient HTTP errors",
         OFFSET(retry_max), AV_OPT_TYPE_INT, {.i64 = 3}, 0, INT_MAX, FLAGS },
     { "retry_backoff", "initial retry backoff in microseconds, doubling on each attempt",

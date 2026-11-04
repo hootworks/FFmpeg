@@ -362,17 +362,6 @@ but not emitted as a stream. For a good high-level understanding, refer to:
 
 @subsection Options
 
-A Flow is read live, following new segments as they are registered, while
-its @code{status} is @code{ingesting} or @code{awaiting_content}, or, for
-Flows without a @code{status}, while @code{segments_updated} is recent (see
-@option{live_threshold}). A live Flow ends once its @code{status} becomes
-@code{closed_complete} or no new segments arrive within @option{live_timeout}.
-
-Flows whose segments use separate initialisation objects
-(@code{init_object}) are not supported. Where a segment has no
-@code{ts_offset} but its media timestamps lie outside its timerange, the
-offset is inferred from its first packet.
-
 This demuxer accepts the following options:
 
 @table @option
@@ -1198,6 +1187,23 @@ Time-Addressable Media Store demuxer.
 
 This demuxer presents audio and video streams found in TAMS Flows, as specified in
 @url{https://bbc.github.io/tams/main/index.html, Time-addressable Media Store}.
+
+A Flow is read live, following new segments as they are registered, while
+its @code{status} is @code{ingesting} or @code{awaiting_content}, or, for
+Flows without a @code{status}, while @code{segments_updated} is recent (see
+@option{live_threshold}). A live Flow ends once its @code{status} becomes
+@code{closed_complete} or no new segments arrive within @option{live_timeout}.
+
+Flows whose segments use separate initialisation objects
+(@code{init_object}) are not supported. Where a segment has no
+@code{ts_offset} but its media timestamps lie outside its timerange, the
+offset is inferred from its first packet.
+
+A @code{timerange} in the URL limits what is read: each Flow's timerange is
+narrowed to its intersection with it, and a Flow which does not overlap it is
+not read. A live Flow which has not yet reached it is followed until it does,
+and reading stops at its end. Packets before its start which are needed to
+decode the first frames are returned with @code{AV_PKT_FLAG_DISCARD} set.
 
 This demuxer accepts the following options:
 
