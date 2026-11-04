@@ -19,6 +19,7 @@
  */
 
 /**
+ * @file
  * TAMS (Time-Addressable Media Store) demuxer.
  *
  * Demuxes one or more TAMS Flows
@@ -27,8 +28,6 @@
  * https://bbc.github.io/tams/main/index.html
  *
  * @author Nick Ryan
- * @file
- * @ingroup lavu_tams
  */
 
 #include "tams.h"
@@ -37,6 +36,7 @@
 #include "demux.h"
 #include "avio_internal.h"
 #include "internal.h"
+
 #include "libavutil/avstring.h"
 #include "libavutil/bprint.h"
 #include "libavutil/channel_layout.h"
@@ -47,14 +47,16 @@
 #include "libavutil/pixfmt.h"
 #include "libavutil/samplefmt.h"
 #include "libavutil/time.h"
+
 #include "libavcodec/codec_par.h"
 #include "libavcodec/defs.h"
 #include "libavcodec/codec.h"
+
 #include "url.h"
 
 /*
- * Return codes from tams_restamp_packet(), used by tams_read_packet() to
- * decide what to do with each packet after timestamp conversion.
+ * Return codes from tams_classify_packet(), used by tams_read_packet() to
+ * decide what to do with each packet after timestamp mapping.
  */
 #define TAMS_PKT_OK      0  /* packet PTS is within the required segment timerange    */
 #define TAMS_PKT_DISCARD 1  /* packet PTS is outside the required segment timerange,
@@ -67,46 +69,57 @@
 
 typedef struct TAMSSegmentContext {
     int flow_index;
+
     TAMSFlowSegment *flow_segments;
     int nb_flow_segments;
     int cur_flow_segment_index;
+
     AVFormatContext *sub_ctx;
     int is_live;
-    int was_live;            /* live when opened: its timerange end keeps moving */
-    int64_t poll_interval;
+    int was_live;            /* the state of is_live when flow was opened;
+                              * unlike is_live it stays set once the Flow closes */
+    int64_t poll_interval_us;
     int64_t last_new_seg_us; /* wall clock when new segments last arrived */
     int64_t last_seg_len_us; /* length of the newest segment seen */
-    int refcount;
+
+    int refcount;            /* number of output streams reading from this context (more than 1
+                              * for a shared container) */
+
     /*
      * Pagination cursor: exclusive lower bound (nanoseconds) for the next
-     * segments fetch.  Stored separately from the segments array so it
+     * segments fetch. Stored separately from the segments array so it
      * survives tams_compact_segments() without keeping old entries alive.
      */
     int     has_fetch_cursor;
     int64_t fetch_cursor_ns;
+
     /*
      * Per-segment timestamp offset, computed once from the first packet of
-     * each segment: cur_pts_offset = seg->ts_offset - flow_start.
+     * each segment: cur_pts_offset_ns = seg->ts_offset - flow_start.
      */
-    int64_t cur_pts_offset;
+    int64_t cur_pts_offset_ns;
     int     cur_pts_offset_set;
 } TAMSSegmentContext;
 
 typedef struct TAMSStreamContext {
     int flow_index;
-    /* -1 unless flow is part of a multi-flow container */
-    int parent_flow_index;
+    int parent_flow_index; /* -1 unless flow is part of a multi-flow container */
+
     TAMSContainerMapping container_mapping;
     int has_container_mapping;
 
-    int seg_ctx_index;
-    int sub_stream_index;
+    int seg_ctx_index;     /* index into c->seg_ctxs: the segments this stream reads from */
+    int sub_stream_index;  /* this stream's index in the open segment's sub_ctx, re-resolved
+                            * using container_mapping for each segment which is opened */
+
     enum AVMediaType media_type;
-    int64_t current_ts;
-    int64_t next_pts;
-    int64_t prev_seg_end; /* next_pts when the current segment was opened */
     int eof;
     int extradata_copied;
+
+    /* All in nanoseconds on the Flow timeline (TAMS timestamps) */
+    int64_t current_ts_ns;   /* pts (else dts) of the last packet read, for picking the next stream */
+    int64_t next_pts_ns;     /* end (pts + duration) of the latest packet delivered, AV_NOPTS_VALUE if none */
+    int64_t prev_seg_end_ns; /* next_pts_ns when the current segment was opened, AV_NOPTS_VALUE if none */
 } TAMSStreamContext;
 
 typedef struct TAMSDemuxContext {
@@ -119,29 +132,28 @@ typedef struct TAMSDemuxContext {
     int nb_seg_ctxs;
 
     AVDictionary *avio_opts;
-
-    int64_t live_threshold;
-    int64_t live_timeout;
-    int64_t seg_poll_init;
-    int64_t seg_poll_max;
-    int64_t min_segment_buffer;
-    int retry_max;
-    int64_t retry_backoff_us;
     int ts_offset_inferred_warned;
-} TAMSDemuxContext;
 
-/*
- * Convert a flow's segment duration from rational to microseconds.
- * Returns 1 second as default if no valid segment duration is specified.
- * Used for live stream polling intervals and timeout calculations.
- */
-static int64_t tams_segment_duration_us(const TAMSFlow *flow)
-{
-    if (flow->segment_duration.num > 0 && flow->segment_duration.den > 0)
-        return av_rescale(flow->segment_duration.num, 1000000,
-                          flow->segment_duration.den);
-    return 1000000;
-}
+    int64_t live_threshold_s;     /* -1 = auto */
+    int64_t live_timeout_s;       /* -1 = auto */
+
+    int64_t seg_poll_init_us;     /* -1 = auto */
+    int64_t seg_poll_max_us;
+    int64_t min_segment_buffer_s; /* -1 = auto */
+
+    int retry_max;                /* attempts */
+    int64_t retry_backoff_us;
+
+    TAMSTimeRange url_tr;         /* the opened URL's timerange=, if has_url_tr */
+    int has_url_tr;
+
+    /*
+     * Not opened over HTTP. Each JSON file is a complete
+     * response, so no query strings are added, segments are not paged and
+     * Flows are not refreshed.
+     */
+    int is_local;
+} TAMSDemuxContext;
 
 static int tams_find_flow_by_id(const TAMSDemuxContext *c, const char *id)
 {
@@ -152,112 +164,40 @@ static int tams_find_flow_by_id(const TAMSDemuxContext *c, const char *id)
     return -1;
 }
 
-static int tams_check_live(TAMSDemuxContext *c, const TAMSFlow *flow)
-{
-    int64_t seg_updated, age, threshold;
-
-    /* an explicit Flow status (API 8.2) wins over the timing heuristic */
-    if (!strcmp(flow->status, "closed_complete"))
-        return 0;
-    if (!strcmp(flow->status, "ingesting") || !strcmp(flow->status, "awaiting_content"))
-        return 1;
-
-    seg_updated = ff_tams_iso8601_from_str(flow->segments_updated);
-    if (!seg_updated)
-        return 0;
-
-    age = av_gettime() - seg_updated;
-    if (age < 0)
-        age = 0;
-
-    if (c->live_threshold >= 0)
-        threshold = c->live_threshold * 1000000LL;
-    else
-        threshold = 2 * tams_segment_duration_us(flow);
-
-    return age < threshold;
-}
-
 /*
- * A live Flow is treated as complete once nothing new has arrived for
- * live_timeout. "Nothing new" is measured from the later of the Flow's
- * segments_updated and the last time this reader saw new segments, and the
- * default timeout scales with the longer of segment_duration and the
- * observed segment length (segments are cut on keyframes, so can be much
- * longer than segment_duration).
+ * Find the TAMS stream index that matches a packet from a segment's sub-demuxer.
+ * This resolves packets from segment containers back to the original TAMS stream
+ * by matching both the segment context and sub-stream index.
  */
-static int tams_check_live_expired(TAMSDemuxContext *c, const TAMSSegmentContext *segc,
-                                   const TAMSFlow *flow)
+static int tams_find_stream_for_sub_packet(AVFormatContext *s, int seg_ctx_index,
+                                            int sub_stream_index)
 {
-    int64_t last = ff_tams_iso8601_from_str(flow->segments_updated);
-    int64_t base = tams_segment_duration_us(flow);
-    int64_t timeout;
-
-    last = FFMAX(last, segc->last_new_seg_us);
-    if (!last)
-        return 1;
-
-    base = FFMAX(base, segc->last_seg_len_us);
-
-    if (c->live_timeout >= 0)
-        timeout = c->live_timeout * 1000000LL;
-    else
-        timeout = 4 * base;
-
-    return av_gettime() - last > timeout;
-}
-
-static int64_t tams_get_poll_init(TAMSDemuxContext *c, const TAMSFlow *flow)
-{
-    if (c->seg_poll_init >= 0)
-        return c->seg_poll_init;
-    return tams_segment_duration_us(flow);
-}
-
-/*
- * Target nanoseconds of segments to pre-buffer ahead of the current position.
- * Defaults to 3 x segment_duration when min_segment_buffer is not set.
- */
-static int64_t tams_get_min_buffer_ns(TAMSDemuxContext *c, const TAMSFlow *flow)
-{
-    if (c->min_segment_buffer >= 0)
-        return c->min_segment_buffer * 1000000000LL;
-    return 3LL * tams_segment_duration_us(flow) * 1000LL;
-}
-
-/*
- * Compute total nanoseconds of segment time buffered ahead of
- * cur_flow_segment_index.
- */
-static int64_t tams_buffered_ns(TAMSDemuxContext *c, const TAMSSegmentContext *segc)
-{
-    int64_t total = 0;
-
-    for (int i = segc->cur_flow_segment_index; i < segc->nb_flow_segments; i++) {
-        const TAMSFlowSegment *seg = &segc->flow_segments[i];
-        total += seg->timerange.end - seg->timerange.start;
+    for (int i = 0; i < s->nb_streams; i++) {
+        TAMSStreamContext *sc = s->streams[i]->priv_data;
+        if (sc->seg_ctx_index == seg_ctx_index &&
+            sc->sub_stream_index == sub_stream_index && !sc->eof)
+            return i;
     }
-    return total;
+    return -1;
 }
 
-/*
- * Debug logging function to display the complete mapping of TAMS flows, streams,
- * and segment contexts. Shows how flows are mapped to AVStreams and segment contexts.
- */
+static int tams_is_http(const char *url)
+{
+    return av_strstart(url, "http://", NULL) || av_strstart(url, "https://", NULL);
+}
+
 static void tams_log_mapping_summary(AVFormatContext *s)
 {
     TAMSDemuxContext *c = s->priv_data;
 
     av_log(s, AV_LOG_INFO, "TAMS mapping summary:\n");
 
-    /* Log all flows with their details */
     av_log(s, AV_LOG_INFO, "  Flows: %d\n", c->nb_flows);
     for (int i = 0; i < c->nb_flows; i++) {
         av_log(s, AV_LOG_INFO, "    Flow[%d]: ", i);
         ff_tams_log_flow_summary(s, AV_LOG_INFO, &c->flows[i]);
     }
 
-    /* Log all streams with their mappings */
     av_log(s, AV_LOG_INFO, "  Stream contexts: %d\n", s->nb_streams);
     for (int i = 0; i < s->nb_streams; i++) {
         const TAMSStreamContext *sc = s->streams[i]->priv_data;
@@ -302,7 +242,6 @@ static void tams_log_mapping_summary(AVFormatContext *s)
         av_log(s, AV_LOG_INFO, "\n");
     }
 
-    /* Log segment contexts */
     av_log(s, AV_LOG_INFO, "  Segment contexts: %d\n", c->nb_seg_ctxs);
     for (int i = 0; i < c->nb_seg_ctxs; i++) {
         const TAMSSegmentContext *segc = &c->seg_ctxs[i];
@@ -312,13 +251,12 @@ static void tams_log_mapping_summary(AVFormatContext *s)
                i, segc->flow_index, flow->id, segc->refcount);
 
         if (segc->is_live) {
-            av_log(s, AV_LOG_INFO, ", live=yes, poll=%"PRId64"us", segc->poll_interval);
+            av_log(s, AV_LOG_INFO, ", live=yes, poll=%"PRId64"us", segc->poll_interval_us);
         }
 
         av_log(s, AV_LOG_INFO, "\n");
     }
 
-    /* Show stream to TAMSSegmentContext relationships */
     av_log(s, AV_LOG_INFO, "  Stream->TAMSSegmentContext relationships:\n");
     for (int i = 0; i < c->nb_seg_ctxs; i++) {
         av_log(s, AV_LOG_INFO, "    TAMSSegmentContext[%d] serves streams: ", i);
@@ -337,100 +275,136 @@ static void tams_log_mapping_summary(AVFormatContext *s)
 }
 
 /*
- * Validate the codec parameters discovered by avformat_find_stream_info()
- * against the authoritative values declared in the flow JSON.
- *
- * The TAMS spec treats flow metadata as ground truth: if the segment disagrees
- * on dimensions, sample rate, or channel count the data is considered corrupt.
- * Frame rate is only checked when both sides report a non-zero value, because
- * some container formats do not carry it reliably.
- *
- * Must be called after tams_resolve_sub_stream() so that sub_stream_index is set.
+ * Convert a flow's segment duration from rational to microseconds.
+ * Returns 1 second as default if no valid segment duration is specified.
+ * Used for live stream polling intervals and timeout calculations.
  */
-static int tams_validate_segment_stream(AVFormatContext *s,
-                                        const TAMSStreamContext *sc,
-                                        int tams_index)
+static int64_t tams_segment_duration_us(const TAMSFlow *flow)
 {
-    TAMSDemuxContext *c = s->priv_data;
-    TAMSSegmentContext *segc = &c->seg_ctxs[sc->seg_ctx_index];
-    const TAMSFlow *flow = &c->flows[sc->flow_index];
-    AVCodecParameters *par;
+    if (flow->segment_duration.num > 0 && flow->segment_duration.den > 0)
+        return av_rescale(flow->segment_duration.num, 1000000,
+                          flow->segment_duration.den);
+    return 1000000;
+}
 
-    if (sc->sub_stream_index < 0)
+static int64_t tams_get_poll_init_us(TAMSDemuxContext *c, const TAMSFlow *flow)
+{
+    if (c->seg_poll_init_us >= 0)
+        return c->seg_poll_init_us;
+    return tams_segment_duration_us(flow);
+}
+
+/*
+ * Target nanoseconds of segments to pre-buffer ahead of the current position.
+ * Defaults to 3 x segment_duration when min_segment_buffer is not set.
+ */
+static int64_t tams_get_min_buffer_ns(TAMSDemuxContext *c, const TAMSFlow *flow)
+{
+    if (c->min_segment_buffer_s >= 0)
+        return c->min_segment_buffer_s * 1000000000LL;
+    return 3LL * tams_segment_duration_us(flow) * 1000LL;
+}
+
+/*
+ * Compute total nanoseconds of segment time buffered ahead of
+ * cur_flow_segment_index.
+ */
+static int64_t tams_buffered_ns(TAMSDemuxContext *c, const TAMSSegmentContext *segc)
+{
+    int64_t total = 0;
+
+    for (int i = segc->cur_flow_segment_index; i < segc->nb_flow_segments; i++) {
+        const TAMSFlowSegment *seg = &segc->flow_segments[i];
+        total += seg->timerange.end - seg->timerange.start;
+    }
+    return total;
+}
+
+static int tams_check_live(TAMSDemuxContext *c, const TAMSFlow *flow)
+{
+    int64_t seg_updated, age, threshold;
+
+    /* an explicit Flow status wins over the timing heuristic */
+    if (!strcmp(flow->status, "closed_complete"))
+        return 0;
+    if (!strcmp(flow->status, "ingesting") || !strcmp(flow->status, "awaiting_content"))
+        return 1;
+
+    /*
+     * Live if segments were added recently. A Flow without
+     * segments_updated (no segments yet, or not given by the store) is not live.
+     */
+    seg_updated = ff_tams_iso8601_from_str(flow->segments_updated);
+    if (!seg_updated)
         return 0;
 
-    par = segc->sub_ctx->streams[sc->sub_stream_index]->codecpar;
+    age = av_gettime() - seg_updated;
+    if (age < 0)
+        age = 0;
 
-    if (flow->codec[0]) {
-        enum AVCodecID expected = ff_tams_codec_from_mime(flow->codec);
-        if (expected == AV_CODEC_ID_PCM_S24LE)
-            expected = s->streams[tams_index]->codecpar->codec_id;
-        if (expected != AV_CODEC_ID_NONE && par->codec_id != AV_CODEC_ID_NONE &&
-            par->codec_id != expected) {
-            av_log(s, AV_LOG_ERROR,
-                   "TAMS flow %.8s: segment codec %s does not match flow codec %s\n",
-                   flow->id, avcodec_get_name(par->codec_id), flow->codec);
-            return AVERROR_INVALIDDATA;
-        }
-    }
+    if (c->live_threshold_s >= 0)
+        threshold = c->live_threshold_s * 1000000LL;
+    else
+        threshold = 2 * tams_segment_duration_us(flow);
 
-    if (flow->format == TAMS_FORMAT_VIDEO || flow->format == TAMS_FORMAT_IMAGE) {
-        if (flow->frame_width > 0 && par->width != flow->frame_width) {
-            av_log(s, AV_LOG_ERROR,
-                   "TAMS flow %.8s: segment width %d != flow width %d\n",
-                   flow->id, par->width, flow->frame_width);
-            return AVERROR_INVALIDDATA;
-        }
-        if (flow->frame_height > 0 && par->height != flow->frame_height) {
-            av_log(s, AV_LOG_ERROR,
-                   "TAMS flow %.8s: segment height %d != flow height %d\n",
-                   flow->id, par->height, flow->frame_height);
-            return AVERROR_INVALIDDATA;
-        }
-        /*
-         * Only validate frame rate when the flow declares one and the segment
-         * container reports a usable value; some formats omit it entirely.
-         */
-        if (flow->frame_rate.num > 0 && flow->frame_rate.den > 0) {
-            AVStream *sub_st = segc->sub_ctx->streams[sc->sub_stream_index];
-            AVRational seg_rate = sub_st->avg_frame_rate.num > 0
-                                  ? sub_st->avg_frame_rate
-                                  : sub_st->r_frame_rate;
-            if (seg_rate.num > 0 && seg_rate.den > 0) {
-                /* Cross-multiply to compare rationals without floating point. */
-                if ((int64_t)flow->frame_rate.num * seg_rate.den !=
-                    (int64_t)seg_rate.num * flow->frame_rate.den) {
-                    av_log(s, AV_LOG_ERROR,
-                           "TAMS flow %.8s: segment frame rate %d/%d != "
-                           "flow frame rate %d/%d\n",
-                           flow->id,
-                           seg_rate.num, seg_rate.den,
-                           flow->frame_rate.num, flow->frame_rate.den);
-                    return AVERROR_INVALIDDATA;
-                }
-            }
-        }
+    return age < threshold;
+}
 
+/*
+ * A live Flow is treated as complete once no new segments have been seen
+ * for live_timeout.
+ *
+ * The default live_timeout is 4 x the longer of segment_duration and the
+ * observed segment length (segments are cut on keyframes, so can be longer
+ * than segment_duration).
+ *
+ * The time of last segment arrival is measured from the later of the Flow's
+ * segments_updated and the last time this reader saw new segments.
+ * This is because the Flow is only re-fetched when this reader is at
+ * the live edge (when a segment poll returned nothing new and every segment held
+ * has been played). While not at the live edge, the Flow is not re-fetched, so
+ * the segments_updated can be outdated. Hence the usage of last_new_seg_us
+ * which records the timestamp of the last new segment seen by this reader.
+ */
+static int tams_check_live_expired(TAMSDemuxContext *c, const TAMSSegmentContext *segc,
+                                   const TAMSFlow *flow)
+{
+    int64_t last = ff_tams_iso8601_from_str(flow->segments_updated);
+    int64_t base = tams_segment_duration_us(flow);
+    int64_t timeout;
+
+    last = FFMAX(last, segc->last_new_seg_us);
+    if (!last)
+        return 1;
+
+    base = FFMAX(base, segc->last_seg_len_us);
+
+    if (c->live_timeout_s >= 0)
+        timeout = c->live_timeout_s * 1000000LL;
+    else
+        timeout = 4 * base;
+
+    return av_gettime() - last > timeout;
+}
+
+/*
+ * Get where reading should stop. For a non-live Flow this is the earlier of the
+ * Flow's timerange end and the URL timerange's end (flow->timerange is
+ * already their intersection, see tams_apply_url_timerange()). A live Flow's
+ * end is only how far it has been written, so only the URL timerange's end
+ * is used if specified. Returns 0 if there is no known end.
+ */
+static int tams_get_final_end(const TAMSDemuxContext *c, const TAMSSegmentContext *segc,
+                              const TAMSFlow *flow, int64_t *end_ns, int *end_inclusive)
+{
+    const TAMSTimeRange *tr = segc->was_live ? (c->has_url_tr ? &c->url_tr : NULL)
+                                             : &flow->timerange;
+
+    if (!tr || !tr->has_end)
         return 0;
-    }
-
-    if (flow->format == TAMS_FORMAT_AUDIO) {
-        if (flow->sample_rate > 0 && par->sample_rate != flow->sample_rate) {
-            av_log(s, AV_LOG_ERROR,
-                   "TAMS flow %.8s: segment sample rate %d != flow sample rate %d\n",
-                   flow->id, par->sample_rate, flow->sample_rate);
-            return AVERROR_INVALIDDATA;
-        }
-        if (flow->channels > 0 &&
-            par->ch_layout.nb_channels != flow->channels) {
-            av_log(s, AV_LOG_ERROR,
-                   "TAMS flow %.8s: segment channel count %d != flow channel count %d\n",
-                   flow->id, par->ch_layout.nb_channels, flow->channels);
-            return AVERROR_INVALIDDATA;
-        }
-    }
-
-    return 0;
+    *end_ns        = tr->end;
+    *end_inclusive = tr->end_inclusive;
+    return 1;
 }
 
 static void tams_setup_common_stream_tags(AVStream *st, const TAMSFlow *flow)
@@ -550,24 +524,10 @@ static int tams_setup_video_stream(AVStream *st, const TAMSFlow *flow)
         break;
     }
 
-    switch (flow->video_unc_type) {
-    case TAMS_VIDEO_UNC_YUYV:  st->codecpar->format = AV_PIX_FMT_YUYV422;      break;
-    case TAMS_VIDEO_UNC_UYVY:  st->codecpar->format = AV_PIX_FMT_UYVY422;      break;
-    case TAMS_VIDEO_UNC_AYUV:  st->codecpar->format = AV_PIX_FMT_YUVA444P;     break;
-    case TAMS_VIDEO_UNC_V210:  st->codecpar->format = AV_PIX_FMT_YUV422P10;    break;
-    case TAMS_VIDEO_UNC_V216:  st->codecpar->format = AV_PIX_FMT_Y216;         break;
-    case TAMS_VIDEO_UNC_RGB:   st->codecpar->format = AV_PIX_FMT_RGB24;        break;
-    case TAMS_VIDEO_UNC_RGBX:  st->codecpar->format = AV_PIX_FMT_RGB0;         break;
-    case TAMS_VIDEO_UNC_XRGB:  st->codecpar->format = AV_PIX_FMT_0RGB;         break;
-    case TAMS_VIDEO_UNC_BGRX:  st->codecpar->format = AV_PIX_FMT_BGR0;         break;
-    case TAMS_VIDEO_UNC_XBGR:  st->codecpar->format = AV_PIX_FMT_0BGR;         break;
-    case TAMS_VIDEO_UNC_RGBA:  st->codecpar->format = AV_PIX_FMT_RGBA;         break;
-    case TAMS_VIDEO_UNC_ARGB:  st->codecpar->format = AV_PIX_FMT_ARGB;         break;
-    case TAMS_VIDEO_UNC_BGRA:  st->codecpar->format = AV_PIX_FMT_BGRA;         break;
-    case TAMS_VIDEO_UNC_ABGR:  st->codecpar->format = AV_PIX_FMT_ABGR;         break;
-    case TAMS_VIDEO_UNC_ALPHA: st->codecpar->format = AV_PIX_FMT_GRAY8;        break;
-    default:
-        /* TAMS_VIDEO_UNC_UNKNOWN or TAMS_VIDEO_UNC_PLANAR: use chroma-subs logic */
+    st->codecpar->format = ff_tams_pix_fmt_from_unc_type(flow->video_unc_type);
+
+    /* TAMS_VIDEO_UNC_UNKNOWN or TAMS_VIDEO_UNC_PLANAR: use chroma-subs logic */
+    if (st->codecpar->format == AV_PIX_FMT_NONE) {
         if (flow->component_type == TAMS_COMPONENT_RGB) {
             st->codecpar->format = flow->bit_depth > 8 ? AV_PIX_FMT_GBRP10 : AV_PIX_FMT_GBRP;
         } else if (flow->horiz_chroma_subs > 0 && flow->vert_chroma_subs > 0) {
@@ -578,7 +538,6 @@ static int tams_setup_video_stream(AVStream *st, const TAMSFlow *flow)
             else if (flow->horiz_chroma_subs == 1 && flow->vert_chroma_subs == 1)
                 st->codecpar->format = flow->bit_depth > 8 ? AV_PIX_FMT_YUV444P10 : AV_PIX_FMT_YUV444P;
         }
-        break;
     }
 
     if (flow->has_avc_parameters &&
@@ -633,7 +592,6 @@ static int tams_create_stream(AVFormatContext *s, const TAMSFlow *flow,
 {
     TAMSStreamContext *sc;
     AVStream *st;
-    int has_cm;
     int ret;
 
     st = avformat_new_stream(s, NULL);
@@ -645,11 +603,10 @@ static int tams_create_stream(AVFormatContext *s, const TAMSFlow *flow,
         return AVERROR(ENOMEM);
     st->priv_data = sc;
 
-    has_cm = collection_item && collection_item->has_container_mapping;
-    sc->flow_index          = flow_index;
-    sc->parent_flow_index   = parent_flow_index;
-    sc->has_container_mapping = has_cm;
-    if (has_cm)
+    sc->flow_index            = flow_index;
+    sc->parent_flow_index     = parent_flow_index;
+    sc->has_container_mapping = collection_item && collection_item->has_container_mapping;
+    if (sc->has_container_mapping)
         sc->container_mapping = collection_item->container_mapping;
 
     st->id = s->nb_streams - 1;
@@ -729,8 +686,8 @@ static int tams_create_stream(AVFormatContext *s, const TAMSFlow *flow,
 }
 
 /*
- * Strip timerange= and source_id= from the original URL query string; these
- * are not forwarded to the segments endpoint (timerange is rebuilt below).
+ * Strip timerange= and source_id= from the original URL query string as these
+ * are not forwarded to the segments endpoint.
  */
 static void tams_build_clean_query(const char *query, char *out, size_t out_size)
 {
@@ -768,15 +725,10 @@ static void tams_build_clean_query(const char *query, char *out, size_t out_size
  *
  * The TAMS segments endpoint (GET /flows/{flowId}/segments) supports server-
  * driven pagination via the Link, X-Paging-Limit, and X-Paging-NextKey
- * response headers.  However, FFmpeg's AVIOContext API does not expose HTTP
+ * response headers. However, FFmpeg's AVIOContext API does not expose HTTP
  * response headers to the demuxer layer, so those headers are unavailable here.
- *
  * Instead, pagination is driven by an explicit fetch cursor stored in
- * segc->fetch_cursor_ns (the exclusive lower bound for the next page).  The
- * cursor is set by tams_fetch_segments() after each successful fetch and
- * survives tams_compact_segments() without keeping old segment entries alive.
- * Full nanosecond precision is preserved to avoid placing the lower bound
- * inside the final segment of the previous page.
+ * segc->fetch_cursor_ns.
  *
  * For the very first request (no cursor yet), if the flow declares a bounded
  * timerange that window is forwarded so the server can skip segments outside
@@ -787,6 +739,7 @@ static int tams_build_segments_url(AVFormatContext *s, const TAMSFlow *flow,
                                    char *url, size_t url_size)
 {
     char base_url[2048];
+    const TAMSDemuxContext *c = s->priv_data;
     char tr_buf[128] = "";
     char clean_query[2048] = "";
     const char *query = strchr(s->url, '?');
@@ -796,6 +749,15 @@ static int tams_build_segments_url(AVFormatContext *s, const TAMSFlow *flow,
     if (ret < 0)
         return ret;
 
+    /* a local file takes no query string */
+    if (c->is_local) {
+        if (base_url[0])
+            snprintf(url, url_size, "%s/%s/segments", base_url, flow->id);
+        else
+            snprintf(url, url_size, "%s/segments", flow->id);
+        return 0;
+    }
+
     if (query)
         tams_build_clean_query(query, clean_query, sizeof(clean_query));
 
@@ -803,18 +765,19 @@ static int tams_build_segments_url(AVFormatContext *s, const TAMSFlow *flow,
      * Use the explicit fetch cursor (set after each successful fetch) as the
      * pagination start point, so the cursor survives segment array compaction.
      * Fall back to the flow's declared timerange for the very first request.
+     * Later pages keep its end if reading stops there.
      */
     if (segc->has_fetch_cursor) {
-        int64_t cur_sec = segc->fetch_cursor_ns / TAMS_TIMEBASE;
-        int64_t cur_ns  = segc->fetch_cursor_ns % TAMS_TIMEBASE;
-        snprintf(tr_buf, sizeof(tr_buf), "[%"PRId64":%"PRId64"_)", cur_sec, cur_ns);
-    } else if (flow->timerange.has_start && flow->timerange.has_end) {
-        int64_t start_sec = flow->timerange.start / TAMS_TIMEBASE;
-        int64_t start_ns  = flow->timerange.start % TAMS_TIMEBASE;
-        int64_t end_sec   = flow->timerange.end   / TAMS_TIMEBASE;
-        int64_t end_ns    = flow->timerange.end   % TAMS_TIMEBASE;
-        snprintf(tr_buf, sizeof(tr_buf), "[%"PRId64":%"PRId64"_%"PRId64":%"PRId64")",
-                 start_sec, start_ns, end_sec, end_ns);
+        TAMSTimeRange tr = { .has_start = 1, .start_inclusive = 1,
+                             .start = segc->fetch_cursor_ns };
+        tr.has_end = tams_get_final_end(c, segc, flow, &tr.end, &tr.end_inclusive);
+        ret = ff_tams_timerange_to_str(&tr, tr_buf, sizeof(tr_buf));
+        if (ret < 0)
+            return ret;
+    } else if (flow->timerange.has_start || flow->timerange.has_end) {
+        ret = ff_tams_timerange_to_str(&flow->timerange, tr_buf, sizeof(tr_buf));
+        if (ret < 0)
+            return ret;
     }
 
     /*
@@ -845,35 +808,71 @@ static int tams_build_segments_url(AVFormatContext *s, const TAMSFlow *flow,
 }
 
 /*
- * Fetch and parse a single TAMS Flow object by its UUID from the server.
- * Used when a multi-flow's flow_collection references a sub-flow that was
- * not included in the initial /flows response.  Appends the parsed flow to
- * c->flows and returns its index, or a negative AVERROR on failure.
+ * Intersect a Flow's timerange, as given by the store, with a URL timerange
+ * if specified. If they do not overlap the result is never, and nothing is read.
+ *
+ * The URL timerange is used without intersection when:
+ *
+ *   - the Flow is live and it has no segments yet
+ *   - the Flow is live and its segments currently end before the URL timerange starts
  */
-static int tams_is_http(const char *url)
+static void tams_apply_url_timerange(AVFormatContext *s, TAMSFlow *flow)
 {
-    return av_strstart(url, "http://", NULL) || av_strstart(url, "https://", NULL);
+    TAMSDemuxContext *c = s->priv_data;
+    TAMSTimeRange *flow_tr = &flow->timerange;
+    const TAMSTimeRange *url_tr = &c->url_tr;
+    int url_start_after_flow_end;
+
+    if (!c->has_url_tr)
+        return;
+
+    /* no segments, only a live Flow has anything to wait for */
+    if (flow_tr->never) {
+        if (tams_check_live(c, flow))
+            *flow_tr = *url_tr;
+        return;
+    }
+
+    url_start_after_flow_end = url_tr->has_start && flow_tr->has_end && url_tr->start >= flow_tr->end;
+    ff_tams_timerange_intersect(flow_tr, url_tr, flow_tr);
+    if (!flow_tr->never)
+        return;
+
+    if (url_start_after_flow_end && tams_check_live(c, flow)) {
+        av_log(s, AV_LOG_VERBOSE, "TAMS live flow %s has not reached the URL timerange\n",
+               flow->id);
+        *flow_tr = *url_tr;
+    } else {
+        av_log(s, AV_LOG_VERBOSE, "TAMS flow %s is outside the URL timerange\n", flow->id);
+    }
 }
 
+/*
+ * Fetch and parse a single TAMS Flow object by its UUID from the server.
+ * Used when a multi-flow's flow_collection references a sub-flow that was
+ * not included in the initial /flows response. Appends the parsed flow to
+ * c->flows and returns its index, or a negative AVERROR on failure.
+ */
 static int tams_fetch_sub_flow(AVFormatContext *s, const char *flow_id)
 {
     TAMSDemuxContext *c = s->priv_data;
     AVBPrint buf;
     char url[4096];
     char base_url[2048];
+    const char *query;
     int ret;
 
     ret = ff_tams_get_base_url(s->url, base_url, sizeof(base_url), NULL);
     if (ret < 0)
         return ret;
 
-    /* query strings only make sense against a live store, not local files */
+    /* a local file takes no query string */
+    query = c->is_local ? "" : "?include_timerange=true";
+
     if (base_url[0])
-        snprintf(url, sizeof(url), "%s/%s%s", base_url, flow_id,
-                 tams_is_http(s->url) ? "?include_timerange=true" : "");
+        snprintf(url, sizeof(url), "%s/%s%s", base_url, flow_id, query);
     else
-        snprintf(url, sizeof(url), "%s%s", flow_id,
-                 tams_is_http(s->url) ? "?include_timerange=true" : "");
+        snprintf(url, sizeof(url), "%s%s", flow_id, query);
 
     av_log(s, AV_LOG_VERBOSE, "TAMS fetching sub-flow: %s\n", url);
 
@@ -893,13 +892,22 @@ static int tams_fetch_sub_flow(AVFormatContext *s, const char *flow_id)
     if (ret < 0)
         return ret;
 
+    {
+        TAMSFlow *flow = &c->flows[c->nb_flows - 1];
+        if (flow->timerange.has_start || flow->timerange.has_end || flow->timerange.never)
+            tams_apply_url_timerange(s, flow);
+    }
+
     return c->nb_flows - 1;
 }
 
 /*
- * Re-GET a Flow to refresh its timerange (only returned when
- * include_timerange=true is given, which the URL the user opened usually
- * lacks), status and segments_updated.
+ * Re-GET a Flow with include_timerange=true to refresh its timerange,
+ * status and segments_updated.
+ *
+ * A store returns the timerange only when asked, which the originally
+ * opened URL cannot do for /flows and, for /flows/{id}, may not have
+ * been specified by the user.
  */
 static int tams_refresh_flow(AVFormatContext *s, int flow_index)
 {
@@ -911,7 +919,7 @@ static int tams_refresh_flow(AVFormatContext *s, int flow_index)
     char base_url[2048];
     int ret;
 
-    if (!tams_is_http(s->url))
+    if (c->is_local)
         return 0;
 
     ret = ff_tams_get_base_url(s->url, base_url, sizeof(base_url), NULL);
@@ -931,8 +939,11 @@ static int tams_refresh_flow(AVFormatContext *s, int flow_index)
     ret = ff_tams_flows_from_json(buf.str, &flows, &nb_flows);
     av_bprint_finalize(&buf, NULL);
     if (ret >= 0 && nb_flows == 1) {
+
+        /* Update the flow with the refreshed details from the store */
         TAMSFlow *flow = &c->flows[flow_index];
         flow->timerange = flows[0].timerange;
+        tams_apply_url_timerange(s, flow);
         av_strlcpy(flow->status, flows[0].status, sizeof(flow->status));
         av_strlcpy(flow->segments_updated, flows[0].segments_updated,
                    sizeof(flow->segments_updated));
@@ -964,11 +975,21 @@ static int tams_process_flow(AVFormatContext *s, int flow_index)
     const TAMSFlow *flow = &c->flows[flow_index];
     int seg_flow_index;
 
-    if (!flow->timerange.has_start && !flow->timerange.has_end) {
+    /*
+     * If no start and no end the response had no timerange (a store only
+     * includes it when asked), so fetch it via tams_refresh_flow().
+     * A never "()" timerange also has no start or end, but it is a real value
+     * from the store, or there was no overlap with the URL timerange. In this
+     * case there is no need to refresh.
+     */
+    if (!flow->timerange.has_start && !flow->timerange.has_end && !flow->timerange.never) {
         int ret = tams_refresh_flow(s, flow_index);
         if (ret < 0)
             av_log(s, AV_LOG_WARNING, "TAMS failed to refresh flow %s: %s\n",
                    flow->id, av_err2str(ret));
+        /* still unknown: the URL timerange is all there is */
+        if (!flow->timerange.has_start && !flow->timerange.has_end && !flow->timerange.never)
+            tams_apply_url_timerange(s, &c->flows[flow_index]);
     }
 
     if (flow->format != TAMS_FORMAT_MULTI)
@@ -1009,12 +1030,21 @@ static int tams_process_flow(AVFormatContext *s, int flow_index)
             return AVERROR_INVALIDDATA;
         }
 
+        /*
+        * If no start and no end the response had no timerange (a store only
+        * includes it when asked), so fetch it via tams_refresh_flow().
+        * A never "()" timerange also has no start or end, but it is a real value
+        * from the store, or there was no overlap with the URL timerange. In this
+        * case there is no need to refresh.
+        */
         if (!c->flows[sub_index].timerange.has_start &&
-            !c->flows[sub_index].timerange.has_end)
+            !c->flows[sub_index].timerange.has_end &&
+            !c->flows[sub_index].timerange.never)
             tams_refresh_flow(s, sub_index);
 
         if (!c->flows[sub_index].timerange.has_start &&
             !c->flows[sub_index].timerange.has_end &&
+            !c->flows[sub_index].timerange.never &&
             flow->timerange.has_start) {
             c->flows[sub_index].timerange = flow->timerange;
         }
@@ -1035,129 +1065,103 @@ static int tams_process_flow(AVFormatContext *s, int flow_index)
 }
 
 /*
- * Fetch one page of segments for a segment context.  The timerange parameter
- * embedded in the URL by tams_build_segments_url() acts as the pagination
- * cursor (see that function's comment for why server-side pagination headers
- * cannot be used).  Each call appends the newly received segments to
- * segc->segments and updates segc->fetch_cursor_ns; the caller compares
- * nb_segments before and after to detect whether another page exists.
+ * Validate the segment codec parameters discovered by avformat_find_stream_info()
+ * against the authoritative values declared in the flow JSON.
+ *
+ * The TAMS spec treats flow metadata as ground truth. If the segment data
+ * differs it is considered corrupt.
  */
-static int tams_fetch_segments(AVFormatContext *s, TAMSSegmentContext *segc)
+static int tams_validate_segment_stream(AVFormatContext *s,
+                                        const TAMSStreamContext *sc,
+                                        int tams_index)
 {
     TAMSDemuxContext *c = s->priv_data;
-    const TAMSFlow *flow = &c->flows[segc->flow_index];
-    AVBPrint buf;
-    char url[4096];
-    int ret, old_nb = segc->nb_flow_segments;
+    TAMSSegmentContext *segc = &c->seg_ctxs[sc->seg_ctx_index];
+    const TAMSFlow *flow = &c->flows[sc->flow_index];
+    AVCodecParameters *par;
 
-    tams_build_segments_url(s, flow, segc, url, sizeof(url));
-    av_log(s, AV_LOG_VERBOSE, "TAMS fetching segments: %s\n", url);
+    if (sc->sub_stream_index < 0)
+        return 0;
 
-    ret = ff_tams_request(s, &c->avio_opts, url, NULL, NULL, 0, NULL,
-                          c->retry_max, c->retry_backoff_us, &buf);
-    if (ret < 0) {
-        av_log(s, AV_LOG_ERROR, "TAMS failed to fetch segments: %s\n",
-               av_err2str(ret));
-        return ret;
-    }
+    par = segc->sub_ctx->streams[sc->sub_stream_index]->codecpar;
 
-    av_log(s, AV_LOG_DEBUG, "TAMS segments JSON:\n%s\n", buf.str);
-
-    ret = ff_tams_flow_segments_from_json(buf.str,
-                                           &segc->flow_segments, &segc->nb_flow_segments);
-    av_bprint_finalize(&buf, NULL);
-    if (ret < 0)
-        return ret;
-
-    /*
-     * Update the pagination cursor from the last received segment so it
-     * survives tams_compact_segments() without keeping old entries alive.
-     */
-    if (segc->nb_flow_segments > 0) {
-        const TAMSFlowSegment *last = &segc->flow_segments[segc->nb_flow_segments - 1];
-        segc->fetch_cursor_ns = last->timerange.end;
-        segc->has_fetch_cursor = 1;
-    }
-
-    /* remembered for live expiry, which must survive compaction */
-    if (segc->nb_flow_segments > old_nb) {
-        const TAMSTimeRange *tr = &segc->flow_segments[segc->nb_flow_segments - 1].timerange;
-        segc->last_new_seg_us = av_gettime();
-        segc->last_seg_len_us = (tr->end - tr->start) / 1000;
-    }
-
-    av_log(s, AV_LOG_VERBOSE, "TAMS fetched %d new segments (total %d)\n",
-           segc->nb_flow_segments - old_nb, segc->nb_flow_segments);
-
-    return 0;
-}
-
-/*
- * Resolve a relative URL (starting with ./ or ../) against a base URL.
- * Resolves . and .. path components against the directory portion of base_url.
- * Does not ascend above the scheme://host/ root.
- */
-static int tams_resolve_relative_url(const char *base_url, const char *rel,
-                                      char *out, size_t out_size)
-{
-    const char *query = strchr(base_url, '?');
-    int url_path_len = query ? (int)(query - base_url) : (int)strlen(base_url);
-    char work[4096];
-    int wlen = 0, min_wlen = 0, dir_len = 0;
-    const char *p;
-
-    for (int i = url_path_len - 1; i >= 0; i--) {
-        if (base_url[i] == '/') {
-            dir_len = i + 1;
-            break;
+    if (flow->codec[0]) {
+        enum AVCodecID expected = ff_tams_codec_from_mime(flow->codec);
+        if (expected == AV_CODEC_ID_PCM_S24LE)
+            expected = s->streams[tams_index]->codecpar->codec_id;
+        if (expected != AV_CODEC_ID_NONE && par->codec_id != AV_CODEC_ID_NONE &&
+            par->codec_id != expected) {
+            av_log(s, AV_LOG_ERROR,
+                   "TAMS flow %.8s: segment codec %s does not match flow codec %s\n",
+                   flow->id, avcodec_get_name(par->codec_id), flow->codec);
+            return AVERROR_INVALIDDATA;
         }
     }
 
-    if (dir_len >= (int)sizeof(work))
-        return AVERROR(ENAMETOOLONG);
-    memcpy(work, base_url, dir_len);
-    wlen = dir_len;
-
-    {
-        const char *scheme_end = strstr(work, "://");
-        if (scheme_end) {
-            const char *host_slash = strchr(scheme_end + 3, '/');
-            if (host_slash)
-                min_wlen = (int)(host_slash - work) + 1;
+    if (flow->format == TAMS_FORMAT_VIDEO || flow->format == TAMS_FORMAT_IMAGE) {
+        if (flow->frame_width > 0 && par->width != flow->frame_width) {
+            av_log(s, AV_LOG_ERROR,
+                   "TAMS flow %.8s: segment width %d != flow width %d\n",
+                   flow->id, par->width, flow->frame_width);
+            return AVERROR_INVALIDDATA;
         }
-    }
-
-    p = rel;
-    while (*p) {
-        if (strncmp(p, "../", 3) == 0 || strcmp(p, "..") == 0) {
-            if (wlen > min_wlen && work[wlen - 1] == '/')
-                wlen--;
-            while (wlen > min_wlen && work[wlen - 1] != '/')
-                wlen--;
-            p += (p[2] == '/') ? 3 : 2;
-        } else if (strncmp(p, "./", 2) == 0) {
-            p += 2;
-        } else {
-            while (*p) {
-                if (wlen >= (int)sizeof(work) - 1)
-                    return AVERROR(ENAMETOOLONG);
-                work[wlen++] = *p;
-                if (*p++ == '/')
-                    break;
+        if (flow->frame_height > 0 && par->height != flow->frame_height) {
+            av_log(s, AV_LOG_ERROR,
+                   "TAMS flow %.8s: segment height %d != flow height %d\n",
+                   flow->id, par->height, flow->frame_height);
+            return AVERROR_INVALIDDATA;
+        }
+        /*
+         * Only validate frame rate when the flow declares one and the segment
+         * container reports a usable value.
+         */
+        if (flow->frame_rate.num > 0 && flow->frame_rate.den > 0) {
+            AVStream *sub_st = segc->sub_ctx->streams[sc->sub_stream_index];
+            AVRational seg_rate = sub_st->avg_frame_rate.num > 0
+                                  ? sub_st->avg_frame_rate
+                                  : sub_st->r_frame_rate;
+            if (seg_rate.num > 0 && seg_rate.den > 0) {
+                /* Cross-multiply to compare rationals without floating point. */
+                if ((int64_t)flow->frame_rate.num * seg_rate.den !=
+                    (int64_t)seg_rate.num * flow->frame_rate.den) {
+                    av_log(s, AV_LOG_ERROR,
+                           "TAMS flow %.8s: segment frame rate %d/%d != "
+                           "flow frame rate %d/%d\n",
+                           flow->id,
+                           seg_rate.num, seg_rate.den,
+                           flow->frame_rate.num, flow->frame_rate.den);
+                    return AVERROR_INVALIDDATA;
+                }
             }
         }
-    }
-    work[wlen] = '\0';
 
-    if (wlen >= (int)out_size)
-        return AVERROR(ENAMETOOLONG);
-    memcpy(out, work, wlen + 1);
+        return 0;
+    }
+
+    if (flow->format == TAMS_FORMAT_AUDIO) {
+        if (flow->sample_rate > 0 && par->sample_rate != flow->sample_rate) {
+            av_log(s, AV_LOG_ERROR,
+                   "TAMS flow %.8s: segment sample rate %d != flow sample rate %d\n",
+                   flow->id, par->sample_rate, flow->sample_rate);
+            return AVERROR_INVALIDDATA;
+        }
+        if (flow->channels > 0 &&
+            par->ch_layout.nb_channels != flow->channels) {
+            av_log(s, AV_LOG_ERROR,
+                   "TAMS flow %.8s: segment channel count %d != flow channel count %d\n",
+                   flow->id, par->ch_layout.nb_channels, flow->channels);
+            return AVERROR_INVALIDDATA;
+        }
+    }
+
     return 0;
 }
 
 /*
  * Resolve which stream within a segment's container corresponds to a TAMS stream.
- * Called once when a segment is first opened. Priority order per TAMS spec:
+ * Called each time a segment is opened, as stream order can differ between
+ * objects. Priority order per TAMS spec:
+ *
  *   1. Container-specific (mp2ts_pid, isobmff_track_id, mxf_track_id)
  *   2. format_track_index (nth stream of the same media type)
  *   3. track_index (absolute position)
@@ -1294,7 +1298,8 @@ static int tams_open_segment(AVFormatContext *s, TAMSSegmentContext *segc)
     }
 
     if (strncmp(seg_url, "./", 2) == 0 || strncmp(seg_url, "../", 3) == 0) {
-        ret = tams_resolve_relative_url(s->url, seg_url, resolved_url, sizeof(resolved_url));
+        /* RFC 3986 resolution against the URL that was opened */
+        ret = ff_make_absolute_url(resolved_url, sizeof(resolved_url), s->url, seg_url);
         if (ret < 0) {
             av_log(s, AV_LOG_ERROR, "TAMS failed to resolve relative segment URL %s: %s\n",
                    seg_url, av_err2str(ret));
@@ -1414,19 +1419,80 @@ static void tams_compact_segments(TAMSSegmentContext *segc)
 }
 
 /*
+ * Fetch one page of segments for a segment context. The timerange parameter
+ * embedded in the URL by tams_build_segments_url() acts as the pagination
+ * cursor. Each call appends the newly received segments to
+ * segc->segments and updates segc->fetch_cursor_ns; the caller compares
+ * nb_segments before and after to detect whether new segments exist.
+ */
+static int tams_fetch_segments(AVFormatContext *s, TAMSSegmentContext *segc)
+{
+    TAMSDemuxContext *c = s->priv_data;
+    const TAMSFlow *flow = &c->flows[segc->flow_index];
+    AVBPrint buf;
+    char url[4096];
+    int ret, old_nb = segc->nb_flow_segments;
+
+    /* a local file holds all the segments: there is no next page */
+    if (c->is_local && segc->has_fetch_cursor)
+        return 0;
+
+    tams_build_segments_url(s, flow, segc, url, sizeof(url));
+    av_log(s, AV_LOG_VERBOSE, "TAMS fetching segments: %s\n", url);
+
+    ret = ff_tams_request(s, &c->avio_opts, url, NULL, NULL, 0, NULL,
+                          c->retry_max, c->retry_backoff_us, &buf);
+    if (ret < 0) {
+        av_log(s, AV_LOG_ERROR, "TAMS failed to fetch segments: %s\n",
+               av_err2str(ret));
+        return ret;
+    }
+
+    av_log(s, AV_LOG_DEBUG, "TAMS segments JSON:\n%s\n", buf.str);
+
+    ret = ff_tams_flow_segments_from_json(buf.str,
+                                           &segc->flow_segments, &segc->nb_flow_segments);
+    av_bprint_finalize(&buf, NULL);
+    if (ret < 0)
+        return ret;
+
+    /*
+     * Update the pagination cursor from the last received segment so it
+     * survives tams_compact_segments() without keeping old entries alive.
+     */
+    if (segc->nb_flow_segments > 0) {
+        const TAMSFlowSegment *last = &segc->flow_segments[segc->nb_flow_segments - 1];
+        segc->fetch_cursor_ns = last->timerange.end;
+        segc->has_fetch_cursor = 1;
+    }
+
+    /* remembered for live expiry, which must survive compaction */
+    if (segc->nb_flow_segments > old_nb) {
+        const TAMSTimeRange *tr = &segc->flow_segments[segc->nb_flow_segments - 1].timerange;
+        segc->last_new_seg_us = av_gettime();
+        segc->last_seg_len_us = (tr->end - tr->start) / 1000;
+    }
+
+    av_log(s, AV_LOG_VERBOSE, "TAMS fetched %d new segments (total %d)\n",
+           segc->nb_flow_segments - old_nb, segc->nb_flow_segments);
+
+    return 0;
+}
+
+/*
  * Ensure the segment context has at least min_segment_buffer seconds of
  * unconsumed segments ahead of cur_flow_segment_index.
  *
- * Returns immediately if the pre-buffer target is already met.  Otherwise
+ * Returns immediately if the pre-buffer target is already met. Otherwise
  * compacts already-processed entries and fetches new pages in a loop:
  *
  * - Non-live: keeps fetching until the buffer is full, no new segments arrive,
- *   or the last segment's end covers the flow's declared end.  Returns
+ *   or the last segment's end covers the flow's timerange end. Returns
  *   AVERROR_EOF only when all fetched segments have been consumed AND no new
- *   ones arrived.  Issues a warning when the buffer falls short of the target.
+ *   ones arrived. Issues a warning when the buffer falls short of the target.
  *
  * - Live: same fetch loop, but when no new segments arrive it waits with
- *   exponential backoff (capped at seg_poll_max) and retries.  Returns
+ *   exponential backoff (capped at seg_poll_max) and retries. Returns
  *   AVERROR_EOF when the live flow is detected as expired, or AVERROR_EXIT on
  *   interrupt.
  */
@@ -1435,8 +1501,15 @@ static int tams_ensure_segments(AVFormatContext *s, TAMSSegmentContext *segc)
     TAMSDemuxContext *c = s->priv_data;
     const TAMSFlow *flow = &c->flows[segc->flow_index];
     int64_t needed_ns = tams_get_min_buffer_ns(c, flow);
-    int64_t buffered;
-    int ret;
+    int64_t buffered, end_ns;
+    int end_inclusive, ret;
+
+    /*
+     * With a URL timerange, "never" means the Flow does not overlap it and
+     * never will (see tams_apply_url_timerange()).
+     */
+    if (c->has_url_tr && flow->timerange.never)
+        return AVERROR_EOF;
 
     buffered = tams_buffered_ns(c, segc);
     if (buffered >= needed_ns)
@@ -1456,54 +1529,57 @@ static int tams_ensure_segments(AVFormatContext *s, TAMSSegmentContext *segc)
 
         if (buffered >= needed_ns) {
             if (segc->is_live)
-                segc->poll_interval = tams_get_poll_init(c, flow);
+                segc->poll_interval_us = tams_get_poll_init_us(c, flow);
             return 0;
         }
 
+        /* non-live */
         if (!segc->is_live) {
             if (segc->nb_flow_segments == old_nb)
                 break;  /* no new pages available */
-            if (flow->timerange.has_end && !segc->was_live && segc->nb_flow_segments > 0) {
+            if (tams_get_final_end(c, segc, flow, &end_ns, &end_inclusive) &&
+                segc->nb_flow_segments > 0) {
                 const TAMSFlowSegment *last = &segc->flow_segments[segc->nb_flow_segments - 1];
-                if (last->timerange.end >= flow->timerange.end)
+                if (last->timerange.end >= end_ns)
                     break;  /* reached declared end of flow */
             }
-            /* Got some segments but buffer not yet full; fetch the next page. */
-        } else {
-            if (segc->nb_flow_segments > old_nb) {
-                segc->poll_interval = tams_get_poll_init(c, flow);
-                /* Got new segments but buffer not yet full; fetch immediately. */
-                continue;
-            }
-
-            /* at the live edge: play what is there rather than wait */
-            if (segc->cur_flow_segment_index < segc->nb_flow_segments)
-                return 0;
-
-            tams_refresh_flow(s, segc->flow_index);
-            if (!strcmp(flow->status, "closed_complete")) {
-                av_log(s, AV_LOG_VERBOSE, "TAMS live flow closed, reading remaining segments\n");
-                segc->is_live = 0;
-                continue;
-            }
-
-            if (tams_check_live_expired(c, segc, flow)) {
-                av_log(s, AV_LOG_VERBOSE, "TAMS live flow expired, ending\n");
-                segc->is_live = 0;
-                break;
-            }
-
-            /* No new segments yet; wait with exponential backoff. */
-            {
-                int64_t wait_end = av_gettime_relative() + segc->poll_interval;
-                while (av_gettime_relative() < wait_end) {
-                    if (ff_check_interrupt(&s->interrupt_callback))
-                        return AVERROR_EXIT;
-                    av_usleep(FFMIN(100000, wait_end - av_gettime_relative()));
-                }
-            }
-            segc->poll_interval = FFMIN(segc->poll_interval * 2, c->seg_poll_max);
+            continue;  /* buffer not yet full: fetch the next page */
         }
+
+        /* live */
+        if (segc->nb_flow_segments > old_nb) {
+            segc->poll_interval_us = tams_get_poll_init_us(c, flow);
+            /* Got new segments but buffer not yet full: fetch the next page */
+            continue;
+        }
+
+        /* at the live edge: process what we have rather than wait */
+        if (segc->cur_flow_segment_index < segc->nb_flow_segments)
+            return 0;
+
+        tams_refresh_flow(s, segc->flow_index);
+        if (!strcmp(flow->status, "closed_complete")) {
+            av_log(s, AV_LOG_VERBOSE, "TAMS live flow closed, reading remaining segments\n");
+            segc->is_live = 0;
+            continue;
+        }
+
+        if (tams_check_live_expired(c, segc, flow)) {
+            av_log(s, AV_LOG_VERBOSE, "TAMS live flow expired, ending\n");
+            segc->is_live = 0;
+            break;
+        }
+
+        /* No new segments yet: wait with exponential backoff. */
+        {
+            int64_t wait_end = av_gettime_relative() + segc->poll_interval_us;
+            while (av_gettime_relative() < wait_end) {
+                if (ff_check_interrupt(&s->interrupt_callback))
+                    return AVERROR_EXIT;
+                av_usleep(FFMIN(100000, wait_end - av_gettime_relative()));
+            }
+        }
+        segc->poll_interval_us = FFMIN(segc->poll_interval_us * 2, c->seg_poll_max_us);
     }
 
     if (ff_check_interrupt(&s->interrupt_callback))
@@ -1512,7 +1588,6 @@ static int tams_ensure_segments(AVFormatContext *s, TAMSSegmentContext *segc)
     if (segc->cur_flow_segment_index >= segc->nb_flow_segments)
         return AVERROR_EOF;
 
-    /* falling short at the end of a complete flow is expected */
     buffered = tams_buffered_ns(c, segc);
     if (buffered < needed_ns)
         av_log(s, segc->is_live ? AV_LOG_WARNING : AV_LOG_VERBOSE,
@@ -1526,10 +1601,9 @@ static int tams_ensure_segments(AVFormatContext *s, TAMSSegmentContext *segc)
  * Copy codec extradata from the first segment into the parent TAMS stream.
  *
  * The flow JSON is the authority for all declared codec parameters (dimensions,
- * sample rate, etc.) and those are already set from it.  Extradata (e.g. H.264
+ * sample rate, etc.) and those are already set from it. Extradata (e.g. H.264
  * SPS/PPS, AAC AudioSpecificConfig) is not expressed in the flow JSON and must
- * be obtained from the segment container.  Only the raw extradata bytes are
- * copied; no other codecpar fields are touched.
+ * be obtained from the segment container.
  */
 static int tams_copy_extradata(AVFormatContext *s, TAMSStreamContext *sc, int tams_index)
 {
@@ -1562,20 +1636,320 @@ static int tams_copy_extradata(AVFormatContext *s, TAMSStreamContext *sc, int ta
 }
 
 /*
- * Find the TAMS stream index that matches a packet from a segment's sub-demuxer.
- * This resolves packets from segment containers back to the original TAMS stream
- * by matching both the segment context and sub-stream index.
+ * Map the timestamps of a single packet from a segment sub-demuxer onto
+ * the Flow timeline, and its stream index onto the TAMS output stream,
+ * writing the results back into the packet.
+ *
+ * TAMS stores media in discrete segment objects whose timestamps are
+ * container-relative (e.g. a fresh MP4 whose first frame is at PTS 0).
+ * To turn those into the continuous, 0-based presentation times that
+ * callers expect this function performs two operations in order:
+ *
+ * Step 1 - timebase conversion
+ *
+ *   Raw container PTS/DTS/duration are in the segment container's timebase.
+ *   These are rescaled to the TAMS nanosecond timebase that is set
+ *   on every output stream.
+ *
+ * Step 2 - per-segment timestamp offset
+ *
+ *   The TAMS spec defines a segment's ts_offset as the value added to each
+ *   container timestamp to obtain a TAI timestamp. Subtracting the flow's
+ *   timerange start produces a 0-based presentation time:
+ *   presentation_pts = container_pts + ts_offset - flow_start.
+ *   This offset is computed once from the first packet of each segment
+ *   and cached in segc->cur_pts_offset_ns for the rest of the segment.
  */
-static int tams_find_stream_for_sub_packet(AVFormatContext *s, int seg_ctx_index,
-                                            int sub_stream_index)
+static void tams_map_packet_timestamps(AVFormatContext *s,
+                                       TAMSSegmentContext *segc,
+                                       const TAMSFlowSegment *seg,
+                                       TAMSStreamContext *sc,
+                                       int tams_index,
+                                       AVPacket *pkt)
 {
-    for (int i = 0; i < s->nb_streams; i++) {
-        TAMSStreamContext *sc = s->streams[i]->priv_data;
-        if (sc->seg_ctx_index == seg_ctx_index &&
-            sc->sub_stream_index == sub_stream_index && !sc->eof)
-            return i;
+    TAMSDemuxContext *c       = s->priv_data;
+    const TAMSFlow *flow = &c->flows[sc->flow_index];
+    AVStream *st         = s->streams[tams_index];
+    AVStream *sub_st     = segc->sub_ctx->streams[pkt->stream_index];
+    int64_t pts_ns, dts_ns, dur_ns;
+
+    /* Step 1: timebase conversion */
+    pts_ns = (pkt->pts != AV_NOPTS_VALUE)
+           ? av_rescale_q(pkt->pts, sub_st->time_base, st->time_base)
+           : AV_NOPTS_VALUE;
+    dts_ns = (pkt->dts != AV_NOPTS_VALUE)
+           ? av_rescale_q(pkt->dts, sub_st->time_base, st->time_base)
+           : AV_NOPTS_VALUE;
+    dur_ns = av_rescale_q(pkt->duration, sub_st->time_base, st->time_base);
+
+    /*
+     * Step 2: per-segment timestamp offset
+     * presentation_pts = container_pts + cur_pts_offset_ns
+     * where cur_pts_offset_ns = seg->ts_offset - flow_start.
+     * Computed once from the first packet of each segment.
+     */
+    if (!segc->cur_pts_offset_set) {
+        int64_t flow_start = flow->timerange.has_start ? flow->timerange.start : 0;
+        int64_t first_ts   = pts_ns != AV_NOPTS_VALUE ? pts_ns : dts_ns;
+        int64_t ts_offset  = seg->ts_offset;
+
+        /*
+         * In case a segment's ts_offset is not available but the container
+         * timestamps do not match the segment timerange (e.g. objects with
+         * timestamps starting near 0 registered against a TAI timerange),
+         * infer the offset from the first packet. Taken as 0:0 instead, every
+         * packet would map outside the segment.
+         */
+        if (!seg->has_ts_offset && first_ts != AV_NOPTS_VALUE &&
+            seg->timerange.has_start && seg->timerange.has_end) {
+            int64_t seg_len = seg->timerange.end - seg->timerange.start;
+            if (first_ts < seg->timerange.start - seg_len ||
+                first_ts > seg->timerange.end) {
+                ts_offset = seg->timerange.start - first_ts;
+                if (!c->ts_offset_inferred_warned) {
+                    av_log(s, AV_LOG_WARNING,
+                           "TAMS segment %s has no ts_offset and its media timestamps "
+                           "lie outside its timerange; inferring ts_offset from the "
+                           "first packet\n", seg->object_id);
+                    c->ts_offset_inferred_warned = 1;
+                }
+            }
+        }
+        segc->cur_pts_offset_ns  = ts_offset - flow_start;
+        segc->cur_pts_offset_set = 1;
     }
-    return -1;
+
+    if (pts_ns != AV_NOPTS_VALUE)
+        pts_ns += segc->cur_pts_offset_ns;
+    if (dts_ns != AV_NOPTS_VALUE)
+        dts_ns += segc->cur_pts_offset_ns;
+
+    /*
+     * Write results back into the packet.
+     */
+    pkt->pts          = pts_ns;
+    pkt->dts          = dts_ns;
+    pkt->duration     = dur_ns;
+    pkt->stream_index = tams_index;
+
+    /*
+     * Update current_ts_ns which drives the scheduler in tams_read_packet()
+     * that picks which stream to service next.
+     */
+    if (pts_ns != AV_NOPTS_VALUE)
+        sc->current_ts_ns = pts_ns;
+    else if (dts_ns != AV_NOPTS_VALUE)
+        sc->current_ts_ns = dts_ns;
+}
+
+/*
+ * Decide what to do with a packet by its position relative to the Flow
+ * and segment boundaries:
+ *
+ *   - PTS before flow start                              -> TAMS_PKT_DISCARD (may be a decode reference)
+ *   - PTS before segment start, before where this stream
+ *     ended in the previous segment (prev_seg_end_ns)    -> TAMS_PKT_DISCARD (already delivered)
+ *   - PTS before segment start, at/after prev_seg_end_ns -> TAMS_PKT_OK (new: see below)
+ *   - PTS at/past flow end, DTS before flow end          -> TAMS_PKT_DISCARD (may be a decode reference)
+ *   - PTS at/past flow end, DTS at/past flow end         -> TAMS_PKT_EOF
+ *   - PTS at/past segment end, DTS at/before segment end -> TAMS_PKT_DISCARD (may be a decode reference)
+ *   - PTS at/past segment end, DTS past segment end      -> TAMS_PKT_EOSEG
+ *   - otherwise                                          -> TAMS_PKT_OK
+ */
+static int tams_classify_packet(AVFormatContext *s,
+                                const TAMSSegmentContext *segc,
+                                const TAMSFlowSegment *seg,
+                                TAMSStreamContext *sc,
+                                const AVPacket *pkt)
+{
+    const TAMSDemuxContext *c = s->priv_data;
+    const TAMSFlow *flow = &c->flows[sc->flow_index];
+    int64_t pts_ns = pkt->pts, dts_ns = pkt->dts, dur_ns = pkt->duration;
+
+    if (pts_ns != AV_NOPTS_VALUE) {
+        int64_t flow_start = flow->timerange.has_start ? flow->timerange.start : 0;
+
+        /* Handle Flow and Segment start boundaries */
+        if (pts_ns < 0)
+            return TAMS_PKT_DISCARD;
+
+        /*
+         * A packet before the segment start is kept if it continues from where
+         * this stream ended in the previous segment (prev_seg_end_ns). The container
+         * holds it although it shows before the segment start. Audio after a
+         * video keyframe cut in a shared container is one cause: it lies between
+         * that keyframe's dts and pts. Open-GOP leading pictures are another.
+         * However if there is no previous segment (first segment, or after a seek) it is
+         * discarded.
+         */
+        if (seg->timerange.has_start) {
+            int64_t seg_start_ns = seg->timerange.start - flow_start;
+            if (pts_ns <= (seg_start_ns - seg->timerange.start_inclusive) &&
+                (sc->prev_seg_end_ns == AV_NOPTS_VALUE || pts_ns < sc->prev_seg_end_ns))
+                return TAMS_PKT_DISCARD;
+        }
+
+        /*
+         * Handle Flow end boundary, but discard if this packet may be needed
+         * by another one. A live Flow's end is wherever its segments stop,
+         * unless the URL timerange ends first.
+         */
+        int64_t end_ns;
+        int end_inclusive;
+        if (tams_get_final_end(c, segc, flow, &end_ns, &end_inclusive)) {
+            int64_t flow_dur = end_ns - flow_start;
+
+            int past_flow_end = end_inclusive ? (pts_ns > flow_dur) : (pts_ns >= flow_dur);
+            if (past_flow_end) {
+                if (dts_ns != AV_NOPTS_VALUE && dts_ns < flow_dur)
+                    return TAMS_PKT_DISCARD;
+
+                return TAMS_PKT_EOF;
+            }
+        }
+
+        /* Handle segment end boundary */
+        if (seg->timerange.has_end) {
+            int64_t seg_end_ns = seg->timerange.end - flow_start;
+
+            int past_seg_end = seg->timerange.end_inclusive ? (pts_ns > seg_end_ns)
+                                                              : (pts_ns >= seg_end_ns);
+            if (past_seg_end) {
+                if (dts_ns != AV_NOPTS_VALUE && dts_ns <= seg_end_ns)
+                    return TAMS_PKT_DISCARD;
+
+                return TAMS_PKT_EOSEG;
+            }
+        }
+    }
+
+    /* furthest point delivered so far (packets arrive in decode order) */
+    if (pts_ns != AV_NOPTS_VALUE && dur_ns > 0 &&
+        (sc->next_pts_ns == AV_NOPTS_VALUE || pts_ns + dur_ns > sc->next_pts_ns))
+        sc->next_pts_ns = pts_ns + dur_ns;
+
+    return TAMS_PKT_OK;
+}
+
+static int tams_read_packet(AVFormatContext *s, AVPacket *pkt)
+{
+    TAMSDemuxContext *c = s->priv_data;
+
+retry:
+    {
+        TAMSStreamContext *best = NULL;
+
+        for (int i = 0; i < s->nb_streams; i++) {
+            TAMSStreamContext *sc = s->streams[i]->priv_data;
+            if (sc->eof)
+                continue;
+            if (!best || sc->current_ts_ns < best->current_ts_ns)
+                best = sc;
+        }
+
+        if (!best)
+            return AVERROR_EOF;
+
+        while (1) {
+            TAMSSegmentContext *segc = &c->seg_ctxs[best->seg_ctx_index];
+            TAMSFlowSegment *seg;
+            int ret, tams_index;
+
+            if (!segc->sub_ctx) {
+                ret = tams_ensure_segments(s, segc);
+                if (ret < 0) {
+                    if (ret == AVERROR_EOF) {
+                        for (int i = 0; i < s->nb_streams; i++) {
+                            TAMSStreamContext *sc_i = s->streams[i]->priv_data;
+                            if (sc_i->seg_ctx_index == best->seg_ctx_index) {
+                                sc_i->eof = 1;
+                                av_log(s, AV_LOG_DEBUG, "End of file reached for segment context %d, stream: %d\n", best->seg_ctx_index, i);
+                            }
+                        }
+                        goto retry;
+                    }
+                    return ret;
+                }
+                ret = tams_open_segment(s, segc);
+                if (ret < 0)
+                    return ret;
+                for (int i = 0; i < s->nb_streams; i++) {
+                    TAMSStreamContext *sc_i = s->streams[i]->priv_data;
+                    if (sc_i->seg_ctx_index == best->seg_ctx_index) {
+                        sc_i->prev_seg_end_ns = sc_i->next_pts_ns;
+                        ret = tams_validate_segment_stream(s, sc_i, i);
+                        if (ret < 0)
+                            return ret;
+                        ret = tams_copy_extradata(s, sc_i, i);
+                        if (ret < 0)
+                            return ret;
+                    }
+                }
+            }
+
+            seg = &segc->flow_segments[segc->cur_flow_segment_index];
+
+            ret = av_read_frame(segc->sub_ctx, pkt);
+            if (ret == AVERROR_EOF) {
+                tams_close_segment(segc);
+                segc->cur_flow_segment_index++;
+                continue;
+            }
+            if (ret < 0)
+                return ret;
+
+            av_log(s, AV_LOG_TRACE, "Sub-stream segment packet: ");
+            av_pkt_dump_log2(s, AV_LOG_TRACE, pkt, 0, s->streams[pkt->stream_index]);
+
+            /*
+             * best only picks the segment context: a shared container's next
+             * packet may be for any of its streams
+             */
+            tams_index = tams_find_stream_for_sub_packet(s, best->seg_ctx_index,
+                                                         pkt->stream_index);
+            if (tams_index < 0) {
+                av_packet_unref(pkt);
+                continue;
+            }
+
+            {
+                TAMSStreamContext *sc = s->streams[tams_index]->priv_data;
+                int action;
+
+                /*
+                 * Clear any AV_PKT_FLAG_DISCARD set by the nested demuxer. An object's
+                 * edit list (e.g. mp4) trims the open-GOP leading pictures
+                 * before its first keyframe, but within a TAMS Flow these
+                 * continue the previous segment. tams_classify_packet() decides
+                 * which packets to discard, from the segment and Flow timeranges.
+                 */
+                pkt->flags &= ~AV_PKT_FLAG_DISCARD;
+
+                tams_map_packet_timestamps(s, segc, seg, sc, tams_index, pkt);
+                action = tams_classify_packet(s, segc, seg, sc, pkt);
+                if (action == TAMS_PKT_DISCARD) {
+                    pkt->flags |= AV_PKT_FLAG_DISCARD;
+                    return 0;
+                }
+                if (action == TAMS_PKT_EOF) {
+                    av_packet_unref(pkt);
+                    sc->eof = 1;
+                    goto retry;
+                }
+                if (action == TAMS_PKT_EOSEG) {
+                    av_packet_unref(pkt);
+                    tams_close_segment(segc);
+                    segc->cur_flow_segment_index++;
+                    continue;
+                }
+
+                av_log(s, AV_LOG_TRACE, "Mapped TAMS packet: ");
+                av_pkt_dump_log2(s, AV_LOG_TRACE, pkt, 0, s->streams[pkt->stream_index]);
+
+                return 0;
+            }
+        }
+    }
 }
 
 static int tams_read_header(AVFormatContext *s)
@@ -1583,6 +1957,8 @@ static int tams_read_header(AVFormatContext *s)
     TAMSDemuxContext *c = s->priv_data;
     AVBPrint buf;
     int ret;
+
+    c->is_local = !tams_is_http(s->url);
 
     /* Read full JSON response from the IO context */
     av_bprint_init(&buf, 0, INT_MAX);
@@ -1636,31 +2012,40 @@ static int tams_read_header(AVFormatContext *s)
         return AVERROR_INVALIDDATA;
     }
 
+    /*
+     * A timerange= in the opened URL's query limits what is read: each Flow's
+     * timerange is narrowed to its intersection with it. This bounds their
+     * segment fetches and gives their streams a duration. A /flows?timerange=
+     * query only filters which Flows are returned, so without this they would
+     * be read in full.
+     */
     {
         const char *query = strchr(s->url, '?');
         const char *tr_str = query ? strstr(query, "timerange=") : NULL;
-        TAMSTimeRange url_tr = {0};
-        int has_url_tr = 0;
 
         if (tr_str) {
-            tr_str += 10;
+            tr_str += 10; /* strlen("timerange=") */
             char tr_val[128];
+            /* the value runs to the next parameter or the end of the URL */
             const char *end = strchr(tr_str, '&');
             int tlen = end ? (int)(end - tr_str) : (int)strlen(tr_str);
             if (tlen > 0 && tlen < (int)sizeof(tr_val)) {
                 memcpy(tr_val, tr_str, tlen);
                 tr_val[tlen] = '\0';
-                if (ff_tams_timerange_from_str(tr_val, &url_tr) >= 0)
-                    has_url_tr = 1;
+                /* not URL-decoded: a percent-encoded value may not parse */
+                if (ff_tams_timerange_from_str(tr_val, &c->url_tr) >= 0)
+                    c->has_url_tr = 1;
             }
         }
 
-        if (has_url_tr) {
-            for (int i = 0; i < c->nb_flows; i++) {
-                if (!c->flows[i].timerange.has_start &&
-                    !c->flows[i].timerange.has_end)
-                    c->flows[i].timerange = url_tr;
-            }
+        for (int i = 0; c->has_url_tr && i < c->nb_flows; i++) {
+            const TAMSTimeRange *tr = &c->flows[i].timerange;
+            /*
+             * No timerange in the response (a store omits it unless asked):
+             * tams_process_flow() fetches it and tams_refresh_flow() limits it.
+             */
+            if (tr->has_start || tr->has_end || tr->never)
+                tams_apply_url_timerange(s, &c->flows[i]);
         }
     }
 
@@ -1708,9 +2093,9 @@ static int tams_read_header(AVFormatContext *s)
                          ? sc->parent_flow_index
                          : sc->flow_index;
 
-        sc->current_ts = INT64_MIN;
-        sc->next_pts   = AV_NOPTS_VALUE;
-        sc->prev_seg_end = AV_NOPTS_VALUE;
+        sc->current_ts_ns = INT64_MIN;
+        sc->next_pts_ns   = AV_NOPTS_VALUE;
+        sc->prev_seg_end_ns = AV_NOPTS_VALUE;
         sc->sub_stream_index = -1;
 
         switch (c->flows[sc->flow_index].format) {
@@ -1751,11 +2136,11 @@ static int tams_read_header(AVFormatContext *s)
             segc->was_live = segc->is_live;
             segc->last_new_seg_us = av_gettime();
             if (segc->is_live) {
-                segc->poll_interval = tams_get_poll_init(c, seg_flow);
+                segc->poll_interval_us = tams_get_poll_init_us(c, seg_flow);
                 av_log(s, AV_LOG_VERBOSE,
                        "TAMS segment context %d (flow %s) detected as live "
                        "(poll=%"PRId64"us)\n",
-                       c->nb_seg_ctxs, seg_flow->id, segc->poll_interval);
+                       c->nb_seg_ctxs, seg_flow->id, segc->poll_interval_us);
             }
             sc->seg_ctx_index = c->nb_seg_ctxs;
             c->nb_seg_ctxs++;
@@ -1767,294 +2152,6 @@ static int tams_read_header(AVFormatContext *s)
     tams_log_mapping_summary(s);
 
     return 0;
-}
-
-/*
- * Convert and validate the timestamps of a single packet read from a segment
- * sub-demuxer, writing the results back into the packet.
- *
- * TAMS stores media in discrete segment objects whose timestamps are
- * container-relative (e.g. a fresh MP4 whose first frame is at PTS 0).
- * To turn those into the continuous, 0-based presentation times that
- * callers expect this function performs three operations in order:
- *
- *   Step 1 - timebase conversion
- *     Raw container PTS/DTS/duration are in the segment container's timebase
- *     (e.g. 1/90000 for H.264 in MP4).  These are rescaled to the TAMS
- *     nanosecond timebase (1/1000000000) that is set on every output stream.
- *
- *   Step 2 - per-segment timestamp offset
- *     The TAMS spec defines ts_offset as the value added to each container
- *     timestamp to obtain a TAI timestamp (defaults to 0:0 when absent).
- *     Subtracting the flow's timerange start produces a 0-based presentation
- *     time:  presentation_pts = container_pts + ts_offset - flow_start.
- *     This offset is computed once from the first packet of each segment
- *     and cached in segc->cur_pts_offset for the rest of the segment.
- *
- *   Step 3 - flow/segment boundary filtering
- *     - PTS before flow/segment start                      -> TAMS_PKT_DISCARD (may be a decode reference)
- *     - PTS at/past flow end, DTS before flow end          -> TAMS_PKT_DISCARD (may be a decode reference)
- *     - PTS at/past flow end, DTS at/past flow end         -> TAMS_PKT_EOF
- *     - PTS at/past segment end, DTS at/before segment end -> TAMS_PKT_DISCARD (may be a decode reference)
- *     - PTS at/past segment end, DTS past segment end      -> TAMS_PKT_EOSEG
- */
-static int tams_restamp_packet(AVFormatContext *s,
-                               TAMSSegmentContext *segc,
-                               const TAMSFlowSegment *seg,
-                               TAMSStreamContext *sc,
-                               int tams_index,
-                               AVPacket *pkt)
-{
-    TAMSDemuxContext *c       = s->priv_data;
-    const TAMSFlow *flow = &c->flows[sc->flow_index];
-    AVStream *st         = s->streams[tams_index];
-    AVStream *sub_st     = segc->sub_ctx->streams[pkt->stream_index];
-    int64_t pts_ns, dts_ns, dur_ns;
-
-    /* Step 1: timebase conversion */
-
-    pts_ns = (pkt->pts != AV_NOPTS_VALUE)
-           ? av_rescale_q(pkt->pts, sub_st->time_base, st->time_base)
-           : AV_NOPTS_VALUE;
-    dts_ns = (pkt->dts != AV_NOPTS_VALUE)
-           ? av_rescale_q(pkt->dts, sub_st->time_base, st->time_base)
-           : AV_NOPTS_VALUE;
-    dur_ns = av_rescale_q(pkt->duration, sub_st->time_base, st->time_base);
-
-    /*
-     * Step 2: per-segment timestamp offset
-     * presentation_pts = container_pts + cur_pts_offset
-     * where cur_pts_offset = seg->ts_offset - flow_start.
-     * Computed once from the first packet of each segment.
-     */
-
-    if (!segc->cur_pts_offset_set) {
-        int64_t flow_start        = flow->timerange.has_start ? flow->timerange.start : 0;
-        int64_t first_ts          = pts_ns != AV_NOPTS_VALUE ? pts_ns : dts_ns;
-        int64_t ts_offset         = seg->ts_offset;
-
-        /*
-         * Some writers omit ts_offset although the container timestamps do
-         * not match the segment timerange (e.g. MPEG-TS starting at 3600s).
-         * Taken literally that maps every packet outside the segment, so
-         * infer the offset from the first packet instead.
-         */
-        if (!seg->has_ts_offset && first_ts != AV_NOPTS_VALUE &&
-            seg->timerange.has_start && seg->timerange.has_end) {
-            int64_t seg_len = seg->timerange.end - seg->timerange.start;
-            if (first_ts < seg->timerange.start - seg_len ||
-                first_ts > seg->timerange.end) {
-                ts_offset = seg->timerange.start - first_ts;
-                if (!c->ts_offset_inferred_warned) {
-                    av_log(s, AV_LOG_WARNING,
-                           "TAMS segment %s has no ts_offset and its media timestamps "
-                           "lie outside its timerange; inferring ts_offset from the "
-                           "first packet\n", seg->object_id);
-                    c->ts_offset_inferred_warned = 1;
-                }
-            }
-        }
-        segc->cur_pts_offset      = ts_offset - flow_start;
-        segc->cur_pts_offset_set  = 1;
-    }
-
-    if (pts_ns != AV_NOPTS_VALUE)
-        pts_ns += segc->cur_pts_offset;
-    if (dts_ns != AV_NOPTS_VALUE)
-        dts_ns += segc->cur_pts_offset;
-
-    /*
-     * Write results back into the packet unconditionally so that
-     * TAMS_PKT_DISCARD callers receive a fully populated packet.
-     */
-
-    pkt->pts          = pts_ns;
-    pkt->dts          = dts_ns;
-    pkt->duration     = dur_ns;
-    pkt->stream_index = tams_index;
-
-    /*
-     * current_ts drives the scheduler in tams_read_packet() that picks which
-     * stream to service next; keep it up to date.
-     */
-    if (pts_ns != AV_NOPTS_VALUE)
-        sc->current_ts = pts_ns;
-    else if (dts_ns != AV_NOPTS_VALUE)
-        sc->current_ts = dts_ns;
-
-    /* Step 3: flow boundary filtering */
-    if (pts_ns != AV_NOPTS_VALUE) {
-        int64_t flow_start = flow->timerange.has_start ? flow->timerange.start : 0;
-
-        /* Handle Flow and Segment start boundaries */
-        if (pts_ns < 0)
-            return TAMS_PKT_DISCARD;
-
-        /*
-         * A packet just before the segment start is kept if it follows on
-         * from what this stream already delivered: in a shared container cut
-         * on a video keyframe, audio between that keyframe's dts and pts
-         * lands in the next segment.
-         */
-        if (seg->timerange.has_start) {
-            int64_t seg_start_ns = seg->timerange.start - flow_start;
-            if (pts_ns <= (seg_start_ns - seg->timerange.start_inclusive) &&
-                (sc->prev_seg_end == AV_NOPTS_VALUE || pts_ns < sc->prev_seg_end))
-                return TAMS_PKT_DISCARD;
-        }
-
-        /*
-         * Handle Flow end boundary, but discard if this packet may be needed
-         * by another one. A live Flow's end is wherever its segments stop.
-         */
-        if (flow->timerange.has_end && !segc->was_live) {
-            int64_t flow_dur = flow->timerange.end - flow_start;
-
-            int past_flow_end = flow->timerange.end_inclusive ? (pts_ns > flow_dur)
-                                                                : (pts_ns >= flow_dur);
-            if (past_flow_end) {
-                if (dts_ns != AV_NOPTS_VALUE && dts_ns < flow_dur)
-                    return TAMS_PKT_DISCARD;
-
-                return TAMS_PKT_EOF;
-            }
-        }
-
-        /* Handle segment end boundary */
-        if (seg->timerange.has_end) {
-            int64_t seg_end_ns = seg->timerange.end - flow_start;
-
-            int past_seg_end = seg->timerange.end_inclusive ? (pts_ns > seg_end_ns)
-                                                              : (pts_ns >= seg_end_ns);
-            if (past_seg_end) {
-                if (dts_ns != AV_NOPTS_VALUE && dts_ns <= seg_end_ns)
-                    return TAMS_PKT_DISCARD;
-
-                return TAMS_PKT_EOSEG;
-            }
-        }
-    }
-
-    /* furthest point delivered so far (packets arrive in decode order) */
-    if (pts_ns != AV_NOPTS_VALUE && dur_ns > 0 &&
-        (sc->next_pts == AV_NOPTS_VALUE || pts_ns + dur_ns > sc->next_pts))
-        sc->next_pts = pts_ns + dur_ns;
-
-    return TAMS_PKT_OK;
-}
-
-static int tams_read_packet(AVFormatContext *s, AVPacket *pkt)
-{
-    TAMSDemuxContext *c = s->priv_data;
-
-retry:
-    {
-        TAMSStreamContext *best = NULL;
-
-        for (int i = 0; i < s->nb_streams; i++) {
-            TAMSStreamContext *sc = s->streams[i]->priv_data;
-            if (sc->eof)
-                continue;
-            if (!best || sc->current_ts < best->current_ts)
-                best = sc;
-        }
-
-        if (!best)
-            return AVERROR_EOF;
-
-        while (1) {
-            TAMSSegmentContext *segc = &c->seg_ctxs[best->seg_ctx_index];
-            TAMSFlowSegment *seg;
-            int ret, tams_index;
-
-            if (!segc->sub_ctx) {
-                ret = tams_ensure_segments(s, segc);
-                if (ret < 0) {
-                    if (ret == AVERROR_EOF) {
-                        for (int i = 0; i < s->nb_streams; i++) {
-                            TAMSStreamContext *sc_i = s->streams[i]->priv_data;
-                            if (sc_i->seg_ctx_index == best->seg_ctx_index) {
-                                sc_i->eof = 1;
-                                av_log(s, AV_LOG_DEBUG, "End of file reached for segment context %d, stream: %d\n", best->seg_ctx_index, i);
-                            }
-                        }
-                        goto retry;
-                    }
-                    return ret;
-                }
-                ret = tams_open_segment(s, segc);
-                if (ret < 0)
-                    return ret;
-                for (int i = 0; i < s->nb_streams; i++) {
-                    TAMSStreamContext *sc_i = s->streams[i]->priv_data;
-                    if (sc_i->seg_ctx_index == best->seg_ctx_index) {
-                        sc_i->prev_seg_end = sc_i->next_pts;
-                        ret = tams_validate_segment_stream(s, sc_i, i);
-                        if (ret < 0)
-                            return ret;
-                        ret = tams_copy_extradata(s, sc_i, i);
-                        if (ret < 0)
-                            return ret;
-                    }
-                }
-            }
-
-            seg = &segc->flow_segments[segc->cur_flow_segment_index];
-
-            ret = av_read_frame(segc->sub_ctx, pkt);
-            if (ret == AVERROR_EOF) {
-                tams_close_segment(segc);
-                segc->cur_flow_segment_index++;
-                continue;
-            }
-            if (ret < 0)
-                return ret;
-
-            av_log(s, AV_LOG_TRACE, "Sub-stream segment packet: ");
-            av_pkt_dump_log2(s, AV_LOG_TRACE, pkt, 0, s->streams[pkt->stream_index]);
-
-            tams_index = tams_find_stream_for_sub_packet(s, best->seg_ctx_index,
-                                                         pkt->stream_index);
-            if (tams_index < 0) {
-                av_packet_unref(pkt);
-                continue;
-            }
-
-            {
-                int restamp;
-
-                /*
-                 * Per-object edit lists (e.g. mp4) trim open-GOP leading
-                 * pictures of every segment; segment boundaries are
-                 * handled by tams_restamp_packet() instead.
-                 */
-                pkt->flags &= ~AV_PKT_FLAG_DISCARD;
-
-                restamp = tams_restamp_packet(s, segc, seg,
-                                              s->streams[tams_index]->priv_data,
-                                              tams_index, pkt);
-                if (restamp == TAMS_PKT_DISCARD) {
-                    pkt->flags |= AV_PKT_FLAG_DISCARD;
-                    return 0;
-                }
-                if (restamp == TAMS_PKT_EOF) {
-                    av_packet_unref(pkt);
-                    ((TAMSStreamContext *)s->streams[tams_index]->priv_data)->eof = 1;
-                    goto retry;
-                }
-                if (restamp == TAMS_PKT_EOSEG) {
-                    tams_close_segment(segc);
-                    segc->cur_flow_segment_index++;
-                    continue;
-                }
-
-                av_log(s, AV_LOG_TRACE, "Mapped TAMS packet: ");
-                av_pkt_dump_log2(s, AV_LOG_TRACE, pkt, 0, s->streams[pkt->stream_index]);
-
-                return 0;
-            }
-        }
-    }
 }
 
 static int tams_close(AVFormatContext *s)
@@ -2146,9 +2243,8 @@ static int tams_seek(AVFormatContext *s, int stream_index,
 
         /*
          * Reset the segment window to fetch a fresh page starting at the seek
-         * target.  The fetch cursor is set to the seek position so the next
-         * tams_fetch_segments() call requests segments at or after tai_ns,
-         * avoiding a full re-scan of the entire flow's segment history.
+         * target. The fetch cursor is set to the seek position so the next
+         * tams_fetch_segments() call requests segments at or after tai_ns.
          */
         tams_close_segment(segc);
         segc->nb_flow_segments       = 0;
@@ -2179,9 +2275,9 @@ static int tams_seek(AVFormatContext *s, int stream_index,
     for (int i = 0; i < s->nb_streams; i++) {
         TAMSStreamContext *sc = s->streams[i]->priv_data;
         sc->eof        = 0;
-        sc->current_ts = seek_ns;
-        sc->next_pts   = AV_NOPTS_VALUE;
-        sc->prev_seg_end = AV_NOPTS_VALUE;
+        sc->current_ts_ns = seek_ns;
+        sc->next_pts_ns   = AV_NOPTS_VALUE;
+        sc->prev_seg_end_ns = AV_NOPTS_VALUE;
     }
 
     ff_read_frame_flush(s);
@@ -2193,15 +2289,15 @@ static int tams_seek(AVFormatContext *s, int stream_index,
 
 static const AVOption tams_options[] = {
     { "live_threshold", "if segments_updated - now() < live_threshold (in seconds) then flow is treated as live (-1=auto: 2 x segment_duration)",
-        OFFSET(live_threshold), AV_OPT_TYPE_INT64, {.i64 = -1}, -1, INT_MAX, FLAGS },
+        OFFSET(live_threshold_s), AV_OPT_TYPE_INT64, {.i64 = -1}, -1, INT_MAX, FLAGS },
     { "live_timeout", "treat a live flow as complete once no new segments arrive for live_timeout seconds (-1=auto: 4 x max(segment_duration, last segment length))",
-        OFFSET(live_timeout), AV_OPT_TYPE_INT64, {.i64 = -1}, -1, INT_MAX, FLAGS },
+        OFFSET(live_timeout_s), AV_OPT_TYPE_INT64, {.i64 = -1}, -1, INT_MAX, FLAGS },
     { "seg_poll_init", "Initial segment poll interval (in microseconds) for live streams (-1=auto: segment_duration)",
-        OFFSET(seg_poll_init), AV_OPT_TYPE_INT64, {.i64 = -1}, -1, INT_MAX, FLAGS },
+        OFFSET(seg_poll_init_us), AV_OPT_TYPE_INT64, {.i64 = -1}, -1, INT_MAX, FLAGS },
     { "seg_poll_max", "Max segment poll interval (in microseconds) when backoff is applied to seg_poll_init for live streams",
-        OFFSET(seg_poll_max), AV_OPT_TYPE_INT64, {.i64 = 30000000}, 0, INT_MAX, FLAGS },
+        OFFSET(seg_poll_max_us), AV_OPT_TYPE_INT64, {.i64 = 30000000}, 0, INT_MAX, FLAGS },
     { "min_segment_buffer", "target seconds of segments to buffer ahead of current position (-1=auto: 3 x segment_duration)",
-        OFFSET(min_segment_buffer), AV_OPT_TYPE_INT64, {.i64 = -1}, -1, INT_MAX, FLAGS },
+        OFFSET(min_segment_buffer_s), AV_OPT_TYPE_INT64, {.i64 = -1}, -1, INT_MAX, FLAGS },
     { "retry_max", "maximum retry attempts for transient HTTP errors",
         OFFSET(retry_max), AV_OPT_TYPE_INT, {.i64 = 3}, 0, INT_MAX, FLAGS },
     { "retry_backoff", "initial retry backoff in microseconds, doubling on each attempt",
