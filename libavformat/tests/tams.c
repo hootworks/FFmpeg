@@ -19,11 +19,10 @@
  */
 
 /**
- * Tests for TAMS Flow processing
+ * @file
+ * Tests for common TAMS muxer/demuxer processing.
  *
  * @author Nick Ryan
- * @file
- * @ingroup lavu_tams
  */
 
 #include "libavformat/tams.c"
@@ -42,7 +41,7 @@
 } while (0)
 
 /* ====================================================================
- * Flow JSON test data
+ * JSON test data
  * ==================================================================== */
 
 const char *flow_json_video_raw =
@@ -384,6 +383,56 @@ const char *flow_json_array =
     "    }"
     "]";
 
+const char *flow_json_tag_arrays =
+    "{"
+    "    \"id\": \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\","
+    "    \"source_id\": \"11111111-2222-3333-4444-555555555555\","
+    "    \"format\": \"urn:x-nmos:format:video\","
+    "    \"codec\": \"video/h264\","
+    "    \"tags\": {"
+    "        \"lang\": [\"en\", \"fr\"],"
+    "        \"auth_classes\": [\"public\"],"
+    "        \"label\": \"simple\""
+    "    },"
+    "    \"essence_parameters\": {"
+    "        \"frame_width\": 1920,"
+    "        \"frame_height\": 1080"
+    "    }"
+    "}";
+
+/*
+ * Storage allocation JSON test data (POST /flows/{id}/storage responses).
+ * The first put_url has a content-type the PUT must use, the second has none
+ * and an unknown key that is skipped.
+ */
+const char *storage_json =
+    "{"
+    "    \"media_objects\": ["
+    "        {"
+    "            \"object_id\": \"obj-1\","
+    "            \"put_url\": {"
+    "                \"url\": \"https://s3.example.com/obj-1?Signature=abc\","
+    "                \"content-type\": \"video/mp2t\""
+    "            }"
+    "        },"
+    "        {"
+    "            \"object_id\": \"obj-2\","
+    "            \"put_url\": {"
+    "                \"url\": \"https://s3.example.com/obj-2?Signature=def\","
+    "                \"headers\": {\"x-extra\": \"1\"}"
+    "            }"
+    "        }"
+    "    ]"
+    "}";
+
+/* An object with no put_url cannot be uploaded to */
+const char *storage_json_missing_put_url =
+    "{"
+    "    \"media_objects\": ["
+    "        {\"object_id\": \"obj-1\"}"
+    "    ]"
+    "}";
+
 /* ====================================================================
  * Test helpers
  * ==================================================================== */
@@ -428,7 +477,188 @@ static int test_flow_parsing_fails(const char *test_name, const char *flow_json)
 }
 
 /* ====================================================================
- * Individual test functions
+ * Timestamp and timerange tests
+ * ==================================================================== */
+
+static int test_timestamps(void)
+{
+    int64_t ts;
+    int ret;
+
+    ret = ff_tams_timestamp_from_str("0:0", &ts);
+    if (ret < 0 || ts != 0)
+        FAIL("timestamp 0:0 -> %"PRId64, ts);
+
+    ret = ff_tams_timestamp_from_str("1:40000000", &ts);
+    if (ret < 0 || ts != INT64_C(1040000000))
+        FAIL("timestamp 1:40000000 -> %"PRId64, ts);
+
+    ret = ff_tams_timestamp_from_str("100:0", &ts);
+    if (ret < 0 || ts != INT64_C(100000000000))
+        FAIL("timestamp 100:0 -> %"PRId64, ts);
+
+    ret = ff_tams_timestamp_from_str("-1:500000000", &ts);
+    if (ret < 0 || ts != INT64_C(-1500000000))
+        FAIL("timestamp -1:500000000 -> %"PRId64, ts);
+
+    /* Invalid: no colon */
+    ret = ff_tams_timestamp_from_str("12345", &ts);
+    if (ret >= 0)
+        FAIL("timestamp '12345' should fail");
+
+    /* Invalid: empty */
+    ret = ff_tams_timestamp_from_str("", &ts);
+    if (ret >= 0)
+        FAIL("timestamp '' should fail");
+
+    printf("OK: timestamps\n");
+    return 0;
+}
+
+static int test_timeranges(void)
+{
+    TAMSTimeRange tr;
+    int ret;
+
+    /* Standard inclusive-exclusive range */
+    ret = ff_tams_timerange_from_str("[0:0_10:0)", &tr);
+    if (ret < 0)
+        FAIL("timerange [0:0_10:0)");
+    if (!tr.has_start || !tr.has_end)
+        FAIL("timerange [0:0_10:0): missing start/end");
+    if (tr.start != 0 || tr.end != INT64_C(10000000000))
+        FAIL("timerange [0:0_10:0): wrong values");
+    if (!tr.start_inclusive || tr.end_inclusive)
+        FAIL("timerange [0:0_10:0): wrong inclusivity");
+
+    /* Eternity: _ */
+    ret = ff_tams_timerange_from_str("_", &tr);
+    if (ret < 0)
+        FAIL("timerange _");
+    if (tr.has_start || tr.has_end)
+        FAIL("timerange _: should have no start/end");
+    if (tr.never)
+        FAIL("timerange _: should not be never");
+
+    /* Never: () */
+    ret = ff_tams_timerange_from_str("()", &tr);
+    if (ret < 0)
+        FAIL("timerange ()");
+    if (tr.has_start || tr.has_end)
+        FAIL("timerange (): should have no start/end");
+    if (tr.start_inclusive || tr.end_inclusive)
+        FAIL("timerange (): should not be inclusive");
+    if (!tr.never)
+        FAIL("timerange (): should be never");
+
+    /* Instantaneous: [1:0] */
+    ret = ff_tams_timerange_from_str("[1:0]", &tr);
+    if (ret < 0)
+        FAIL("timerange [1:0]");
+    if (!tr.has_start || !tr.has_end)
+        FAIL("timerange [1:0]: missing start/end");
+    if (tr.start != INT64_C(1000000000) || tr.end != INT64_C(1000000000))
+        FAIL("timerange [1:0]: wrong values");
+    if (!tr.start_inclusive || !tr.end_inclusive)
+        FAIL("timerange [1:0]: should be inclusive");
+
+    /* Fully inclusive range */
+    ret = ff_tams_timerange_from_str("[5:500000000_20:0]", &tr);
+    if (ret < 0)
+        FAIL("timerange [5:500000000_20:0]");
+    if (tr.start != INT64_C(5500000000) || tr.end != INT64_C(20000000000))
+        FAIL("timerange [5:500000000_20:0]: wrong values");
+    if (!tr.start_inclusive || !tr.end_inclusive)
+        FAIL("timerange [5:500000000_20:0]: wrong inclusivity");
+
+    /* Negative timestamp */
+    ret = ff_tams_timerange_from_str("[-1:0_0:0)", &tr);
+    if (ret < 0)
+        FAIL("timerange [-1:0_0:0)");
+    if (tr.start != INT64_C(-1000000000) || tr.end != 0)
+        FAIL("timerange [-1:0_0:0): wrong values: %"PRId64"_%"PRId64, tr.start, tr.end);
+
+    printf("OK: timeranges\n");
+    return 0;
+}
+
+static int test_timerange_intersect(void)
+{
+    static const struct {
+        const char *a, *b, *out;
+    } cases[] = {
+        { "[0:0_10:0)", "[2:0_4:0)",  "[2:0_4:0)"  }, /* b inside a */
+        { "[0:0_10:0)", "(5:0_)",     "(5:0_10:0)" }, /* b unbounded end */
+        { "_",          "[1:0_2:0)",  "[1:0_2:0)"  }, /* eternity */
+        { "[1:0_)",     "(1:0_)",     "(1:0_)"     }, /* equal starts: exclusive wins */
+        { "[0:0_5:0]",  "[5:0_10:0)", "[5:0_5:0]"  }, /* touch at an included point */
+        { "[0:0_5:0)",  "[5:0_10:0)", "()"         }, /* touch, not overlapping */
+        { "[0:0_1:0)",  "[2:0_3:0)",  "()"         }, /* disjoint */
+        { "()",         "_",          "()"         }, /* never */
+    };
+
+    for (size_t i = 0; i < FF_ARRAY_ELEMS(cases); i++) {
+        TAMSTimeRange a, b, r;
+        char buf[64];
+        if (ff_tams_timerange_from_str(cases[i].a, &a) < 0 ||
+            ff_tams_timerange_from_str(cases[i].b, &b) < 0)
+            FAIL("timerange_intersect: parse '%s' or '%s' failed", cases[i].a, cases[i].b);
+        ff_tams_timerange_intersect(&a, &b, &r);
+        if (ff_tams_timerange_to_str(&r, buf, sizeof(buf)) < 0 || strcmp(buf, cases[i].out))
+            FAIL("timerange_intersect: '%s' x '%s' -> '%s', expected '%s'",
+                 cases[i].a, cases[i].b, buf, cases[i].out);
+        /* the intersection does not depend on the order */
+        ff_tams_timerange_intersect(&b, &a, &r);
+        if (ff_tams_timerange_to_str(&r, buf, sizeof(buf)) < 0 || strcmp(buf, cases[i].out))
+            FAIL("timerange_intersect: '%s' x '%s' -> '%s', expected '%s'",
+                 cases[i].b, cases[i].a, buf, cases[i].out);
+    }
+
+    printf("OK: timerange_intersect\n");
+    return 0;
+}
+
+/* ====================================================================
+ * ISO 8601 tests
+ * ==================================================================== */
+
+static int test_parse_iso8601(void)
+{
+    int64_t t;
+
+    /* NULL and empty inputs must return 0 */
+    t = ff_tams_iso8601_from_str(NULL);
+    if (t != 0)
+        FAIL("iso8601 NULL: expected 0, got %"PRId64, t);
+
+    t = ff_tams_iso8601_from_str("");
+    if (t != 0)
+        FAIL("iso8601 empty: expected 0, got %"PRId64, t);
+
+    /* Invalid string must return 0 */
+    t = ff_tams_iso8601_from_str("not-a-date");
+    if (t != 0)
+        FAIL("iso8601 invalid: expected 0, got %"PRId64, t);
+
+    /* Valid UTC datetime must return a non-zero epoch microsecond value */
+    t = ff_tams_iso8601_from_str("2018-03-06T09:10:22Z");
+    if (t == 0)
+        FAIL("iso8601 2018-03-06T09:10:22Z: expected non-zero");
+    /* Sanity-check: must be after 2010-01-01 (1262304000s) and before 2030-01-01 */
+    if (t < INT64_C(1262304000) * 1000000 || t > INT64_C(1893456000) * 1000000)
+        FAIL("iso8601 2018-03-06T09:10:22Z: value out of plausible range: %"PRId64, t);
+
+    /* Second valid sample */
+    t = ff_tams_iso8601_from_str("2023-09-14T09:45:26Z");
+    if (t == 0)
+        FAIL("iso8601 2023-09-14T09:45:26Z: expected non-zero");
+
+    printf("OK: parse_iso8601\n");
+    return 0;
+}
+
+/* ====================================================================
+ * Flow tests
  * ==================================================================== */
 
 static int test_video_raw(void)
@@ -755,125 +985,113 @@ static int test_multi_container_map(void)
     return 0;
 }
 
-static int test_bad_json(void)
-{
-    /* Truncate flow_json_video_h264_vfr halfway */
-    size_t len = strlen(flow_json_video_h264_vfr);
-    char *bad = av_malloc(len / 2 + 1);
-    if (!bad)
-        FAIL("bad_json: malloc failed");
-    memcpy(bad, flow_json_video_h264_vfr, len / 2);
-    bad[len / 2] = '\0';
-
-    int result = test_flow_parsing_fails("bad_json_truncated", bad);
-    av_free(bad);
-    return result;
-}
-
 /* ====================================================================
- * Timestamp and timerange tests
+ * Flow array tests
  * ==================================================================== */
 
-static int test_timestamps(void)
+static int test_parse_flows_json_single(void)
 {
-    int64_t ts;
+    TAMSFlow *flows = NULL;
+    int nb_flows = 0;
     int ret;
 
-    ret = ff_tams_timestamp_from_str("0:0", &ts);
-    if (ret < 0 || ts != 0)
-        FAIL("timestamp 0:0 -> %"PRId64, ts);
+    ret = ff_tams_flows_from_json(flow_json_video_raw, &flows, &nb_flows);
+    if (ret < 0)
+        FAIL("parse_flows_json_single: returned %d", ret);
+    if (nb_flows != 1)
+        FAIL("parse_flows_json_single: expected 1 flow, got %d", nb_flows);
+    if (!flows)
+        FAIL("parse_flows_json_single: flows is NULL");
+    if (flows[0].format != TAMS_FORMAT_VIDEO)
+        FAIL("parse_flows_json_single: wrong format %d", flows[0].format);
+    if (strcmp(flows[0].id, "0fde9c11-da9d-434a-a113-d3b20a2cf251"))
+        FAIL("parse_flows_json_single: wrong id: %s", flows[0].id);
+    av_free(flows);
 
-    ret = ff_tams_timestamp_from_str("1:40000000", &ts);
-    if (ret < 0 || ts != INT64_C(1040000000))
-        FAIL("timestamp 1:40000000 -> %"PRId64, ts);
-
-    ret = ff_tams_timestamp_from_str("100:0", &ts);
-    if (ret < 0 || ts != INT64_C(100000000000))
-        FAIL("timestamp 100:0 -> %"PRId64, ts);
-
-    ret = ff_tams_timestamp_from_str("-1:500000000", &ts);
-    if (ret < 0 || ts != INT64_C(-1500000000))
-        FAIL("timestamp -1:500000000 -> %"PRId64, ts);
-
-    /* Invalid: no colon */
-    ret = ff_tams_timestamp_from_str("12345", &ts);
-    if (ret >= 0)
-        FAIL("timestamp '12345' should fail");
-
-    /* Invalid: empty */
-    ret = ff_tams_timestamp_from_str("", &ts);
-    if (ret >= 0)
-        FAIL("timestamp '' should fail");
-
-    printf("OK: timestamps\n");
+    printf("OK: parse_flows_json_single\n");
     return 0;
 }
 
-static int test_timeranges(void)
+static int test_parse_flows_json_array(void)
 {
-    TAMSTimeRange tr;
+    TAMSFlow *flows = NULL;
+    int nb_flows = 0;
     int ret;
 
-    /* Standard inclusive-exclusive range */
-    ret = ff_tams_timerange_from_str("[0:0_10:0)", &tr);
+    ret = ff_tams_flows_from_json(flow_json_array, &flows, &nb_flows);
     if (ret < 0)
-        FAIL("timerange [0:0_10:0)");
-    if (!tr.has_start || !tr.has_end)
-        FAIL("timerange [0:0_10:0): missing start/end");
-    if (tr.start != 0 || tr.end != INT64_C(10000000000))
-        FAIL("timerange [0:0_10:0): wrong values");
-    if (!tr.start_inclusive || tr.end_inclusive)
-        FAIL("timerange [0:0_10:0): wrong inclusivity");
+        FAIL("parse_flows_json_array: returned %d", ret);
+    if (nb_flows != 3)
+        FAIL("parse_flows_json_array: expected 3 flows, got %d", nb_flows);
+    if (!flows)
+        FAIL("parse_flows_json_array: flows is NULL");
+    if (flows[0].format != TAMS_FORMAT_VIDEO)
+        FAIL("parse_flows_json_array: flow 0 should be video");
+    if (flows[1].format != TAMS_FORMAT_AUDIO)
+        FAIL("parse_flows_json_array: flow 1 should be audio");
+    if (flows[2].format != TAMS_FORMAT_DATA)
+        FAIL("parse_flows_json_array: flow 2 should be data");
+    if (flows[0].frame_width != 1280 || flows[0].frame_height != 720)
+        FAIL("parse_flows_json_array: flow 0 wrong dimensions");
+    if (flows[1].sample_rate != 48000 || flows[1].channels != 2)
+        FAIL("parse_flows_json_array: flow 1 wrong audio params");
+    av_free(flows);
 
-    /* Eternity: _ */
-    ret = ff_tams_timerange_from_str("_", &tr);
+    printf("OK: parse_flows_json_array\n");
+    return 0;
+}
+
+static int test_parse_flows_json_empty_array(void)
+{
+    TAMSFlow *flows = NULL;
+    int nb_flows = 0;
+    int ret;
+
+    ret = ff_tams_flows_from_json("[]", &flows, &nb_flows);
     if (ret < 0)
-        FAIL("timerange _");
-    if (tr.has_start || tr.has_end)
-        FAIL("timerange _: should have no start/end");
+        FAIL("parse_flows_json_empty: returned %d", ret);
+    if (nb_flows != 0)
+        FAIL("parse_flows_json_empty: expected 0 flows, got %d", nb_flows);
+    av_free(flows);
 
-    /* Never: () */
-    ret = ff_tams_timerange_from_str("()", &tr);
-    if (ret < 0)
-        FAIL("timerange ()");
-    if (tr.has_start || tr.has_end)
-        FAIL("timerange (): should have no start/end");
-    if (tr.start_inclusive || tr.end_inclusive)
-        FAIL("timerange (): should not be inclusive");
-
-    /* Instantaneous: [1:0] */
-    ret = ff_tams_timerange_from_str("[1:0]", &tr);
-    if (ret < 0)
-        FAIL("timerange [1:0]");
-    if (!tr.has_start || !tr.has_end)
-        FAIL("timerange [1:0]: missing start/end");
-    if (tr.start != INT64_C(1000000000) || tr.end != INT64_C(1000000000))
-        FAIL("timerange [1:0]: wrong values");
-    if (!tr.start_inclusive || !tr.end_inclusive)
-        FAIL("timerange [1:0]: should be inclusive");
-
-    /* Fully inclusive range */
-    ret = ff_tams_timerange_from_str("[5:500000000_20:0]", &tr);
-    if (ret < 0)
-        FAIL("timerange [5:500000000_20:0]");
-    if (tr.start != INT64_C(5500000000) || tr.end != INT64_C(20000000000))
-        FAIL("timerange [5:500000000_20:0]: wrong values");
-    if (!tr.start_inclusive || !tr.end_inclusive)
-        FAIL("timerange [5:500000000_20:0]: wrong inclusivity");
-
-    /* Negative timestamp */
-    ret = ff_tams_timerange_from_str("[-1:0_0:0)", &tr);
-    if (ret < 0)
-        FAIL("timerange [-1:0_0:0)");
-    if (tr.start != INT64_C(-1000000000) || tr.end != 0)
-        FAIL("timerange [-1:0_0:0): wrong values: %"PRId64"_%"PRId64, tr.start, tr.end);
-
-    printf("OK: timeranges\n");
+    printf("OK: parse_flows_json_empty_array\n");
     return 0;
 }
 
 /* ====================================================================
- * Segment parsing tests
+ * Tag array tests
+ * ==================================================================== */
+
+static int test_tag_array_values(void)
+{
+    const char *cursor = flow_json_tag_arrays;
+    TAMSFlow flow;
+    int ret;
+
+    ret = tams_flow_from_json(&cursor, &flow);
+    if (ret < 0)
+        FAIL("tag_array: parse failed: %d", ret);
+    if (flow.nb_tags != 3)
+        FAIL("tag_array: expected 3 tags, got %d", flow.nb_tags);
+    if (strcmp(flow.tags[0].key, "lang"))
+        FAIL("tag_array: wrong tag[0].key: %s", flow.tags[0].key);
+    if (strcmp(flow.tags[0].value, "en,fr"))
+        FAIL("tag_array: wrong tag[0].value: '%s' (expected 'en,fr')", flow.tags[0].value);
+    if (strcmp(flow.tags[1].key, "auth_classes"))
+        FAIL("tag_array: wrong tag[1].key: %s", flow.tags[1].key);
+    if (strcmp(flow.tags[1].value, "public"))
+        FAIL("tag_array: wrong tag[1].value: '%s' (expected 'public')", flow.tags[1].value);
+    if (strcmp(flow.tags[2].key, "label"))
+        FAIL("tag_array: wrong tag[2].key: %s", flow.tags[2].key);
+    if (strcmp(flow.tags[2].value, "simple"))
+        FAIL("tag_array: wrong tag[2].value: '%s' (expected 'simple')", flow.tags[2].value);
+
+    printf("OK: tag_array_values\n");
+    return 0;
+}
+
+/* ====================================================================
+ * Segment tests
  * ==================================================================== */
 
 static int test_segment_full(void)
@@ -965,158 +1183,124 @@ static int test_segment_presigned(void)
 }
 
 /* ====================================================================
- * ff_tams_iso8601_from_str tests
+ * Storage allocation tests
  * ==================================================================== */
 
-static int test_parse_iso8601(void)
+static int test_storage_allocation(void)
 {
-    int64_t t;
+    TAMSMediaObject *objects = NULL;
+    int nb_objects = 0, ret;
 
-    /* NULL and empty inputs must return 0 */
-    t = ff_tams_iso8601_from_str(NULL);
-    if (t != 0)
-        FAIL("iso8601 NULL: expected 0, got %"PRId64, t);
+    ret = ff_tams_storage_allocation_from_json(storage_json, &objects, &nb_objects);
+    if (ret < 0 || nb_objects != 2) {
+        av_free(objects);
+        FAIL("storage_allocation: ret=%d nb_objects=%d", ret, nb_objects);
+    }
+    if (strcmp(objects[0].object_id, "obj-1") ||
+        strcmp(objects[0].put_url, "https://s3.example.com/obj-1?Signature=abc") ||
+        strcmp(objects[0].put_content_type, "video/mp2t")) {
+        av_free(objects);
+        FAIL("storage_allocation: first object wrong");
+    }
+    if (strcmp(objects[1].object_id, "obj-2") ||
+        strcmp(objects[1].put_url, "https://s3.example.com/obj-2?Signature=def") ||
+        objects[1].put_content_type[0]) {
+        av_free(objects);
+        FAIL("storage_allocation: second object wrong");
+    }
 
-    t = ff_tams_iso8601_from_str("");
-    if (t != 0)
-        FAIL("iso8601 empty: expected 0, got %"PRId64, t);
+    av_free(objects);
+    printf("OK: storage_allocation\n");
+    return 0;
+}
 
-    /* Invalid string must return 0 */
-    t = ff_tams_iso8601_from_str("not-a-date");
-    if (t != 0)
-        FAIL("iso8601 invalid: expected 0, got %"PRId64, t);
+static int test_storage_allocation_missing_put_url(void)
+{
+    TAMSMediaObject *objects = NULL;
+    int nb_objects = 0, ret;
 
-    /* Valid UTC datetime must return a non-zero epoch microsecond value */
-    t = ff_tams_iso8601_from_str("2018-03-06T09:10:22Z");
-    if (t == 0)
-        FAIL("iso8601 2018-03-06T09:10:22Z: expected non-zero");
-    /* Sanity-check: must be after 2010-01-01 (1262304000s) and before 2030-01-01 */
-    if (t < INT64_C(1262304000) * 1000000 || t > INT64_C(1893456000) * 1000000)
-        FAIL("iso8601 2018-03-06T09:10:22Z: value out of plausible range: %"PRId64, t);
+    ret = ff_tams_storage_allocation_from_json(storage_json_missing_put_url, &objects, &nb_objects);
+    av_free(objects);
+    if (ret >= 0)
+        FAIL("storage_allocation_missing_put_url: expected failure but got success");
 
-    /* Second valid sample */
-    t = ff_tams_iso8601_from_str("2023-09-14T09:45:26Z");
-    if (t == 0)
-        FAIL("iso8601 2023-09-14T09:45:26Z: expected non-zero");
-
-    printf("OK: parse_iso8601\n");
+    printf("OK: storage_allocation_missing_put_url (correctly failed with %d)\n", ret);
     return 0;
 }
 
 /* ====================================================================
- * ff_tams_flows_from_json tests
+ * Codec MIME type tests
  * ==================================================================== */
 
-static int test_parse_flows_json_single(void)
+static int test_codec_mime(void)
 {
-    TAMSFlow *flows = NULL;
-    int nb_flows = 0;
-    int ret;
+    if (ff_tams_codec_from_mime("video/h264") != AV_CODEC_ID_H264)
+        FAIL("codec_mime: video/h264 wrong");
+    if (ff_tams_codec_from_mime("audio/aac") != AV_CODEC_ID_AAC)
+        FAIL("codec_mime: audio/aac wrong");
+    if (ff_tams_codec_from_mime("audio/mp2") != AV_CODEC_ID_MP2)
+        FAIL("codec_mime: audio/mp2 wrong");
+    if (ff_tams_codec_from_mime("video/h265") != AV_CODEC_ID_HEVC)
+        FAIL("codec_mime: video/h265 alias wrong");
+    /* MIME types are case-insensitive (RFC 6838) */
+    if (ff_tams_codec_from_mime("video/H264") != AV_CODEC_ID_H264)
+        FAIL("codec_mime: video/H264 wrong");
+    if (ff_tams_codec_from_mime("Audio/AAC") != AV_CODEC_ID_AAC)
+        FAIL("codec_mime: Audio/AAC wrong");
+    if (ff_tams_codec_from_mime("video/mp2t") != AV_CODEC_ID_NONE)
+        FAIL("codec_mime: unknown mime should return AV_CODEC_ID_NONE");
 
-    ret = ff_tams_flows_from_json(flow_json_video_raw, &flows, &nb_flows);
-    if (ret < 0)
-        FAIL("parse_flows_json_single: returned %d", ret);
-    if (nb_flows != 1)
-        FAIL("parse_flows_json_single: expected 1 flow, got %d", nb_flows);
-    if (!flows)
-        FAIL("parse_flows_json_single: flows is NULL");
-    if (flows[0].format != TAMS_FORMAT_VIDEO)
-        FAIL("parse_flows_json_single: wrong format %d", flows[0].format);
-    if (strcmp(flows[0].id, "0fde9c11-da9d-434a-a113-d3b20a2cf251"))
-        FAIL("parse_flows_json_single: wrong id: %s", flows[0].id);
-    av_free(flows);
+    if (strcmp(ff_tams_mime_from_codec(AV_CODEC_ID_HEVC), "video/hevc"))
+        FAIL("codec_mime: HEVC should map to preferred video/hevc");
+    if (ff_tams_mime_from_codec(AV_CODEC_ID_NONE))
+        FAIL("codec_mime: AV_CODEC_ID_NONE should have no mime");
 
-    printf("OK: parse_flows_json_single\n");
+    printf("OK: codec_mime\n");
     return 0;
 }
 
-static int test_parse_flows_json_array(void)
+/* ====================================================================
+ * Pixel format tests
+ * ==================================================================== */
+
+static int test_pixel_format_conversion(void)
 {
-    TAMSFlow *flows = NULL;
-    int nb_flows = 0;
-    int ret;
+    /* exact pairs map both ways */
+    if (ff_tams_pix_fmt_from_unc_type(TAMS_VIDEO_UNC_UYVY) != AV_PIX_FMT_UYVY422 ||
+        ff_tams_unc_type_from_pix_fmt(AV_PIX_FMT_UYVY422) != TAMS_VIDEO_UNC_UYVY)
+        FAIL("pixel_format_conversion: UYVY wrong");
+    if (ff_tams_pix_fmt_from_unc_type(TAMS_VIDEO_UNC_BGRA) != AV_PIX_FMT_BGRA ||
+        ff_tams_unc_type_from_pix_fmt(AV_PIX_FMT_BGRA) != TAMS_VIDEO_UNC_BGRA)
+        FAIL("pixel_format_conversion: BGRA wrong");
+    /* closest pixel formats map one way only: YUV422P10 is planar, not v210 */
+    if (ff_tams_pix_fmt_from_unc_type(TAMS_VIDEO_UNC_V210) != AV_PIX_FMT_YUV422P10)
+        FAIL("pixel_format_conversion: v210 wrong");
+    if (ff_tams_unc_type_from_pix_fmt(AV_PIX_FMT_YUV422P10) != TAMS_VIDEO_UNC_UNKNOWN)
+        FAIL("pixel_format_conversion: YUV422P10 should have no packed unc_type");
+    /* planar and unknown have no fixed pixel format */
+    if (ff_tams_pix_fmt_from_unc_type(TAMS_VIDEO_UNC_PLANAR) != AV_PIX_FMT_NONE ||
+        ff_tams_pix_fmt_from_unc_type(TAMS_VIDEO_UNC_UNKNOWN) != AV_PIX_FMT_NONE)
+        FAIL("pixel_format_conversion: planar/unknown should have no pixel format");
 
-    ret = ff_tams_flows_from_json(flow_json_array, &flows, &nb_flows);
-    if (ret < 0)
-        FAIL("parse_flows_json_array: returned %d", ret);
-    if (nb_flows != 3)
-        FAIL("parse_flows_json_array: expected 3 flows, got %d", nb_flows);
-    if (!flows)
-        FAIL("parse_flows_json_array: flows is NULL");
-    if (flows[0].format != TAMS_FORMAT_VIDEO)
-        FAIL("parse_flows_json_array: flow 0 should be video");
-    if (flows[1].format != TAMS_FORMAT_AUDIO)
-        FAIL("parse_flows_json_array: flow 1 should be audio");
-    if (flows[2].format != TAMS_FORMAT_DATA)
-        FAIL("parse_flows_json_array: flow 2 should be data");
-    if (flows[0].frame_width != 1280 || flows[0].frame_height != 720)
-        FAIL("parse_flows_json_array: flow 0 wrong dimensions");
-    if (flows[1].sample_rate != 48000 || flows[1].channels != 2)
-        FAIL("parse_flows_json_array: flow 1 wrong audio params");
-    av_free(flows);
-
-    printf("OK: parse_flows_json_array\n");
+    printf("OK: pixel_format_conversion\n");
     return 0;
 }
 
-static int test_parse_flows_json_empty_array(void)
+/* ====================================================================
+ * Utility tests
+ * ==================================================================== */
+
+static int test_same_host(void)
 {
-    TAMSFlow *flows = NULL;
-    int nb_flows = 0;
-    int ret;
+    if (!ff_tams_same_host("http://example.com/flows/1",
+                           "http://example.com/flows/1/segments"))
+        FAIL("same_host: identical hosts should match");
+    if (!ff_tams_same_host("http://EXAMPLE.com/a", "http://example.com/b"))
+        FAIL("same_host: host comparison should be case-insensitive");
+    if (ff_tams_same_host("http://example.com/a", "http://other.com/b"))
+        FAIL("same_host: different hosts should not match");
 
-    ret = ff_tams_flows_from_json("[]", &flows, &nb_flows);
-    if (ret < 0)
-        FAIL("parse_flows_json_empty: returned %d", ret);
-    if (nb_flows != 0)
-        FAIL("parse_flows_json_empty: expected 0 flows, got %d", nb_flows);
-    av_free(flows);
-
-    printf("OK: parse_flows_json_empty_array\n");
-    return 0;
-}
-
-static int test_tag_array_values(void)
-{
-    const char *json =
-        "{"
-        "    \"id\": \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\","
-        "    \"source_id\": \"11111111-2222-3333-4444-555555555555\","
-        "    \"format\": \"urn:x-nmos:format:video\","
-        "    \"codec\": \"video/h264\","
-        "    \"tags\": {"
-        "        \"lang\": [\"en\", \"fr\"],"
-        "        \"auth_classes\": [\"public\"],"
-        "        \"label\": \"simple\""
-        "    },"
-        "    \"essence_parameters\": {"
-        "        \"frame_width\": 1920,"
-        "        \"frame_height\": 1080"
-        "    }"
-        "}";
-    const char *cursor = json;
-    TAMSFlow flow;
-    int ret;
-
-    ret = tams_flow_from_json(&cursor, &flow);
-    if (ret < 0)
-        FAIL("tag_array: parse failed: %d", ret);
-    if (flow.nb_tags != 3)
-        FAIL("tag_array: expected 3 tags, got %d", flow.nb_tags);
-    if (strcmp(flow.tags[0].key, "lang"))
-        FAIL("tag_array: wrong tag[0].key: %s", flow.tags[0].key);
-    if (strcmp(flow.tags[0].value, "en,fr"))
-        FAIL("tag_array: wrong tag[0].value: '%s' (expected 'en,fr')", flow.tags[0].value);
-    if (strcmp(flow.tags[1].key, "auth_classes"))
-        FAIL("tag_array: wrong tag[1].key: %s", flow.tags[1].key);
-    if (strcmp(flow.tags[1].value, "public"))
-        FAIL("tag_array: wrong tag[1].value: '%s' (expected 'public')", flow.tags[1].value);
-    if (strcmp(flow.tags[2].key, "label"))
-        FAIL("tag_array: wrong tag[2].key: %s", flow.tags[2].key);
-    if (strcmp(flow.tags[2].value, "simple"))
-        FAIL("tag_array: wrong tag[2].value: '%s' (expected 'simple')", flow.tags[2].value);
-
-    printf("OK: tag_array_values\n");
+    printf("OK: same_host\n");
     return 0;
 }
 
@@ -1171,11 +1355,41 @@ static int test_timerange_roundtrip(void)
         if (tr.start != tr2.start || tr.end != tr2.end ||
             tr.has_start != tr2.has_start || tr.has_end != tr2.has_end ||
             tr.start_inclusive != tr2.start_inclusive ||
-            tr.end_inclusive != tr2.end_inclusive)
+            tr.end_inclusive != tr2.end_inclusive || tr.never != tr2.never)
             FAIL("timerange_roundtrip: '%s' -> '%s' did not round-trip", strs[i], buf);
     }
 
     printf("OK: timerange_roundtrip\n");
+    return 0;
+}
+
+static int test_timerange_roundtrip_for_shorthand_forms(void)
+{
+    static const struct {
+        const char *in, *out;
+    } cases[] = {
+        { "[0:0_10:0)", "[0:0_10:0)" },
+        { "(5:0_)",     "(5:0_)"     },
+        { "[_20:0]",    "[_20:0]"    },
+        { "[1:0]",      "[1:0_1:0]"  }, /* instantaneous */
+        { "_",          "(_)"        }, /* eternity */
+        { "()",         "()"         }, /* never */
+    };
+
+    for (size_t i = 0; i < FF_ARRAY_ELEMS(cases); i++) {
+        TAMSTimeRange tr;
+        char buf[64];
+        int ret = ff_tams_timerange_from_str(cases[i].in, &tr);
+        if (ret < 0)
+            FAIL("timerange_to_str: parse '%s' failed: %d", cases[i].in, ret);
+        ret = ff_tams_timerange_to_str(&tr, buf, sizeof(buf));
+        if (ret < 0)
+            FAIL("timerange_to_str: serialize '%s' failed: %d", cases[i].in, ret);
+        if (strcmp(buf, cases[i].out))
+            FAIL("timerange_to_str: '%s' -> '%s', expected '%s'", cases[i].in, buf, cases[i].out);
+    }
+
+    printf("OK: timerange_to_str\n");
     return 0;
 }
 
@@ -1408,6 +1622,25 @@ static int test_flow_escaping_roundtrip(void)
 }
 
 /* ====================================================================
+ * Bad JSON test
+ * ==================================================================== */
+
+static int test_bad_json(void)
+{
+    /* Truncate flow_json_video_h264_vfr halfway */
+    size_t len = strlen(flow_json_video_h264_vfr);
+    char *bad = av_malloc(len / 2 + 1);
+    if (!bad)
+        FAIL("bad_json: malloc failed");
+    memcpy(bad, flow_json_video_h264_vfr, len / 2);
+    bad[len / 2] = '\0';
+
+    int result = test_flow_parsing_fails("bad_json_truncated", bad);
+    av_free(bad);
+    return result;
+}
+
+/* ====================================================================
  * Main
  * ==================================================================== */
 
@@ -1418,35 +1651,22 @@ int main(int argc, char *argv[])
     /* Timestamp and timerange parsing */
     ret |= test_timestamps();
     ret |= test_timeranges();
+    ret |= test_timerange_intersect();
 
     /* ISO 8601 datetime parsing */
     ret |= test_parse_iso8601();
 
-    /* Single flow parsing */
+    /* Flow parsing */
     ret |= test_video_raw();
     ret |= test_video_h264_vfr();
     ret |= test_audio_aac();
     ret |= test_data_ttml();
-
-    /* Partial/minimal essence_parameters */
     ret |= test_video_minimal();
-
-    /* Additional core fields: timerange, read_only, max_bit_rate, segment_duration, etc. */
     ret |= test_flow_with_timerange();
-
-    /* Uncompressed audio parameters */
     ret |= test_audio_unc();
-
-    /* Tag array values (TAMS 8.0+ schema) */
     ret |= test_tag_array_values();
-
-    /* Multi-flow: separate flows */
     ret |= test_multi_separate();
-
-    /* Multi-flow: container mapping */
     ret |= test_multi_container_map();
-
-    /* ff_tams_flows_from_json (high-level API) */
     ret |= test_parse_flows_json_single();
     ret |= test_parse_flows_json_array();
     ret |= test_parse_flows_json_empty_array();
@@ -1457,9 +1677,22 @@ int main(int argc, char *argv[])
     ret |= test_segment_null_fields();
     ret |= test_segment_presigned();
 
-    /* Serialization round-trips (muxer support) */
+    /* Storage allocation parsing */
+    ret |= test_storage_allocation();
+
+    /* Codec MIME types */
+    ret |= test_codec_mime();
+
+    /* Pixel formats */
+    ret |= test_pixel_format_conversion();
+
+    /* Utilities */
+    ret |= test_same_host();
+
+    /* Serialization round-trips */
     ret |= test_timestamp_roundtrip();
     ret |= test_timerange_roundtrip();
+    ret |= test_timerange_roundtrip_for_shorthand_forms();
     ret |= test_flow_video_roundtrip();
     ret |= test_flow_audio_roundtrip();
     ret |= test_flow_multi_container_map_roundtrip();
@@ -1473,6 +1706,7 @@ int main(int argc, char *argv[])
     ret |= test_flow_parsing_fails("invalid_json", "{\"id\": }");
     ret |= test_flow_parsing_fails("unterminated_string", "{\"id\": \"abc}");
     ret |= test_flow_parsing_fails("missing_brace", "{\"id\": \"abc\"");
+    ret |= test_storage_allocation_missing_put_url();
     printf("#### End failing tests ####\n");
 
     if (ret)

@@ -19,12 +19,10 @@
  */
 
 /**
- * Implements TAMS Flow processing: JSON parsing, timestamp/timerange
- * manipulation, and Flow/Segment deserialization.
+ * @file
+ * Implements common TAMS muxer/demuxer processing.
  *
  * @author Nick Ryan
- * @file
- * @ingroup lavu_tams
  */
 
 #include "tams.h"
@@ -32,6 +30,7 @@
 #include "avio.h"
 #include "internal.h"
 #include "url.h"
+
 #include "libavutil/avstring.h"
 #include "libavutil/bprint.h"
 #include "libavutil/error.h"
@@ -45,11 +44,7 @@
 #include <string.h>
 
 /* ====================================================================
- * Enum <-> JSON string tables, used by both the parsers above and the
- * serializers below so the supported values are listed exactly once.
- * Internal to this file: nothing outside tams.c needs enum<->string
- * conversion directly, callers just use ff_tams_flows_from_json()/
- * ff_tams_flow_to_json() and the enum values in TAMSFlow.
+ * String <-> Enum mapping
  * ==================================================================== */
 
 static const char *const tams_interlace_mode_strs[] = {
@@ -124,6 +119,103 @@ static int tams_str_to_enum(const char *const *table, int nb, const char *str)
 #define TAMS_STR_TO_ENUM(table, str) tams_str_to_enum(table, FF_ARRAY_ELEMS(table), str)
 
 /* ====================================================================
+ * Codec MIME type <-> AVCodecID: TAMS Flow.codec strings, one entry per
+ * accepted MIME alias. is_preferred marks the MIME type used
+ * when several aliases exist for one codec.
+ * ==================================================================== */
+
+static const struct {
+    const char *mime;
+    enum AVCodecID id;
+    int is_preferred;
+} tams_codec_mime_map[] = {
+    { "video/h264",      AV_CODEC_ID_H264,       1 },
+    { "video/hevc",      AV_CODEC_ID_HEVC,       1 },
+    { "video/h265",      AV_CODEC_ID_HEVC,       0 },
+    { "video/vp8",       AV_CODEC_ID_VP8,        1 },
+    { "video/vp9",       AV_CODEC_ID_VP9,        1 },
+    { "video/av1",       AV_CODEC_ID_AV1,        1 },
+    { "video/mpeg2",     AV_CODEC_ID_MPEG2VIDEO, 1 },
+    { "video/raw",       AV_CODEC_ID_RAWVIDEO,   1 },
+    { "audio/aac",       AV_CODEC_ID_AAC,        1 },
+    { "audio/mp4a-latm", AV_CODEC_ID_AAC,        0 },
+    { "audio/opus",      AV_CODEC_ID_OPUS,       1 },
+    { "audio/mp2",       AV_CODEC_ID_MP2,        1 },
+    { "audio/mp3",       AV_CODEC_ID_MP3,        1 },
+    { "audio/mpeg",      AV_CODEC_ID_MP3,        0 },
+    { "audio/flac",      AV_CODEC_ID_FLAC,       1 },
+    { "audio/vorbis",    AV_CODEC_ID_VORBIS,     1 },
+    { "audio/ac3",       AV_CODEC_ID_AC3,        1 },
+    { "audio/eac3",      AV_CODEC_ID_EAC3,       1 },
+    /* one MIME for all PCM; bit_depth selects the sample size */
+    { "audio/pcm",       AV_CODEC_ID_PCM_S24LE,  1 },
+    { "audio/pcm",       AV_CODEC_ID_PCM_S16LE,  1 },
+    { "audio/pcm",       AV_CODEC_ID_PCM_S32LE,  1 },
+    { "text/vtt",        AV_CODEC_ID_WEBVTT,     1 },
+    { "text/srt",        AV_CODEC_ID_SUBRIP,     1 },
+};
+
+enum AVCodecID ff_tams_codec_from_mime(const char *mime)
+{
+    for (int i = 0; i < FF_ARRAY_ELEMS(tams_codec_mime_map); i++)
+        if (!av_strcasecmp(mime, tams_codec_mime_map[i].mime))
+            return tams_codec_mime_map[i].id;
+    return AV_CODEC_ID_NONE;
+}
+
+const char *ff_tams_mime_from_codec(enum AVCodecID codec_id)
+{
+    for (int i = 0; i < FF_ARRAY_ELEMS(tams_codec_mime_map); i++)
+        if (tams_codec_mime_map[i].id == codec_id && tams_codec_mime_map[i].is_preferred)
+            return tams_codec_mime_map[i].mime;
+    return NULL;
+}
+
+/* ====================================================================
+ * Packed video/raw unc_type <-> AVPixelFormat. is_exact marks the pairs
+ * that match exactly and also map back. Other entries are the closest
+ * FFmpeg pixel format to a layout FFmpeg does not have.
+ * ==================================================================== */
+
+static const struct {
+    enum TAMSVideoUncType unc_type;
+    enum AVPixelFormat pix_fmt;
+    int is_exact;
+} tams_video_unc_map[] = {
+    { TAMS_VIDEO_UNC_YUYV,  AV_PIX_FMT_YUYV422,   1 },
+    { TAMS_VIDEO_UNC_UYVY,  AV_PIX_FMT_UYVY422,   1 },
+    { TAMS_VIDEO_UNC_AYUV,  AV_PIX_FMT_YUVA444P,  0 },
+    { TAMS_VIDEO_UNC_V210,  AV_PIX_FMT_YUV422P10, 0 },
+    { TAMS_VIDEO_UNC_V216,  AV_PIX_FMT_Y216,      0 },
+    { TAMS_VIDEO_UNC_RGB,   AV_PIX_FMT_RGB24,     1 },
+    { TAMS_VIDEO_UNC_RGBX,  AV_PIX_FMT_RGB0,      1 },
+    { TAMS_VIDEO_UNC_XRGB,  AV_PIX_FMT_0RGB,      1 },
+    { TAMS_VIDEO_UNC_BGRX,  AV_PIX_FMT_BGR0,      1 },
+    { TAMS_VIDEO_UNC_XBGR,  AV_PIX_FMT_0BGR,      1 },
+    { TAMS_VIDEO_UNC_RGBA,  AV_PIX_FMT_RGBA,      1 },
+    { TAMS_VIDEO_UNC_ARGB,  AV_PIX_FMT_ARGB,      1 },
+    { TAMS_VIDEO_UNC_BGRA,  AV_PIX_FMT_BGRA,      1 },
+    { TAMS_VIDEO_UNC_ABGR,  AV_PIX_FMT_ABGR,      1 },
+    { TAMS_VIDEO_UNC_ALPHA, AV_PIX_FMT_GRAY8,     0 },
+};
+
+enum AVPixelFormat ff_tams_pix_fmt_from_unc_type(enum TAMSVideoUncType unc_type)
+{
+    for (int i = 0; i < FF_ARRAY_ELEMS(tams_video_unc_map); i++)
+        if (tams_video_unc_map[i].unc_type == unc_type)
+            return tams_video_unc_map[i].pix_fmt;
+    return AV_PIX_FMT_NONE;
+}
+
+enum TAMSVideoUncType ff_tams_unc_type_from_pix_fmt(enum AVPixelFormat pix_fmt)
+{
+    for (int i = 0; i < FF_ARRAY_ELEMS(tams_video_unc_map); i++)
+        if (tams_video_unc_map[i].pix_fmt == pix_fmt && tams_video_unc_map[i].is_exact)
+            return tams_video_unc_map[i].unc_type;
+    return TAMS_VIDEO_UNC_UNKNOWN;
+}
+
+/* ====================================================================
  * Timestamp and TimeRange parsing
  * ==================================================================== */
 
@@ -133,7 +225,7 @@ static int tams_str_to_enum(const char *const *table, int nb, const char *str)
  * Format: {sign?}{seconds}:{nanoseconds}
  */
 static int parse_timestamp_internal(const char *str, const char **end,
-                                    int64_t *ts)
+                                    int64_t *ts_ns)
 {
     const char *p = str;
     int negative = 0;
@@ -164,9 +256,9 @@ static int parse_timestamp_internal(const char *str, const char **end,
         p++;
     }
 
-    *ts = seconds * TAMS_TIMEBASE + nanoseconds;
+    *ts_ns = seconds * TAMS_TIMEBASE + nanoseconds;
     if (negative)
-        *ts = -(*ts);
+        *ts_ns = -(*ts_ns);
 
     if (end)
         *end = p;
@@ -178,18 +270,18 @@ static int parse_timestamp_internal(const char *str, const char **end,
  * Format: "{sign?}{seconds}:{nanoseconds}"
  * Examples: "0:0", "10:500000000", "-5:0"
  */
-int ff_tams_timestamp_from_str(const char *str, int64_t *ts)
+int ff_tams_timestamp_from_str(const char *str, int64_t *ts_ns)
 {
-    return parse_timestamp_internal(str, NULL, ts);
+    return parse_timestamp_internal(str, NULL, ts_ns);
 }
 
-int ff_tams_timestamp_to_str(int64_t ts, char *out, size_t out_size)
+int ff_tams_timestamp_to_str(int64_t ts_ns, char *out, size_t out_size)
 {
-    int64_t abs_ts = ts < 0 ? -ts : ts;
-    int64_t seconds = abs_ts / TAMS_TIMEBASE;
-    int64_t nanoseconds = abs_ts % TAMS_TIMEBASE;
+    int64_t abs_ns = ts_ns < 0 ? -ts_ns : ts_ns;
+    int64_t seconds = abs_ns / TAMS_TIMEBASE;
+    int64_t nanoseconds = abs_ns % TAMS_TIMEBASE;
     int len = snprintf(out, out_size, "%s%"PRId64":%"PRId64,
-                        ts < 0 ? "-" : "", seconds, nanoseconds);
+                        ts_ns < 0 ? "-" : "", seconds, nanoseconds);
 
     if (len < 0 || (size_t)len >= out_size)
         return AVERROR(EINVAL);
@@ -203,8 +295,9 @@ int ff_tams_timestamp_to_str(int64_t ts, char *out, size_t out_size)
  *   - '[' or '(' for inclusive/exclusive start
  *   - ']' or ')' for inclusive/exclusive end
  *   - Either timestamp may be omitted for an unbounded range
+ *   - "[ts]" is the instantaneous range [ts_ts], "()" the never (empty) range
  *
- * Examples: "[0:0_10:0)", "(5:0_)", "[_20:0]"
+ * Examples: "[0:0_10:0)", "(5:0_)", "[_20:0]", "[1:0]", "_", "()"
  */
 int ff_tams_timerange_from_str(const char *str, TAMSTimeRange *tr)
 {
@@ -242,6 +335,9 @@ int ff_tams_timerange_from_str(const char *str, TAMSTimeRange *tr)
         /* Instantaneous short form: [ts] means [ts_ts] */
         tr->end = tr->start;
         tr->has_end = 1;
+    } else {
+        /* No timestamp and no '_': the never form "()" */
+        tr->never = 1;
     }
 
     /* Parse end bracket */
@@ -260,6 +356,13 @@ int ff_tams_timerange_to_str(const TAMSTimeRange *tr, char *out, size_t out_size
     char start_buf[32] = "";
     char end_buf[32] = "";
     int len, ret;
+
+    if (tr->never) {
+        len = snprintf(out, out_size, "()");
+        if (len < 0 || (size_t)len >= out_size)
+            return AVERROR(EINVAL);
+        return 0;
+    }
 
     if (tr->has_start) {
         ret = ff_tams_timestamp_to_str(tr->start, start_buf, sizeof(start_buf));
@@ -282,26 +385,62 @@ int ff_tams_timerange_to_str(const TAMSTimeRange *tr, char *out, size_t out_size
     return 0;
 }
 
+void ff_tams_timerange_intersect(const TAMSTimeRange *a, const TAMSTimeRange *b,
+                                 TAMSTimeRange *out)
+{
+    TAMSTimeRange r = { 0 };
+
+    if (a->never || b->never) {
+        r.never = 1;
+        *out = r;
+        return;
+    }
+
+    /* determine latest start - set to inclusive only if both are inclusive */
+    if (a->has_start || b->has_start) {
+        const TAMSTimeRange *s = !b->has_start || (a->has_start && a->start > b->start) ? a : b;
+        r.has_start       = 1;
+        r.start           = s->start;
+        r.start_inclusive = s->start_inclusive;
+        if (a->has_start && b->has_start && a->start == b->start)
+            r.start_inclusive = a->start_inclusive && b->start_inclusive;
+    }
+
+    /* determine earliest end - set to inclusive only if both are inclusive */
+    if (a->has_end || b->has_end) {
+        const TAMSTimeRange *e = !b->has_end || (a->has_end && a->end < b->end) ? a : b;
+        r.has_end       = 1;
+        r.end           = e->end;
+        r.end_inclusive = e->end_inclusive;
+        if (a->has_end && b->has_end && a->end == b->end)
+            r.end_inclusive = a->end_inclusive && b->end_inclusive;
+    }
+
+    if (r.has_start && r.has_end &&
+        (r.start > r.end || (r.start == r.end && !(r.start_inclusive && r.end_inclusive)))) {
+        memset(&r, 0, sizeof(r));
+        r.never = 1;
+    }
+
+    *out = r;
+}
+
 int64_t ff_tams_iso8601_from_str(const char *str)
 {
-    int64_t t;
+    int64_t t_us;
     if (!str || !str[0])
         return 0;
-    if (av_parse_time(&t, str, 0) < 0)
+    if (av_parse_time(&t_us, str, 0) < 0)
         return 0;
-    return t;
+    return t_us;
 }
 
 /* ====================================================================
- * Generic JSON utilities (read + write). Cursor-based on read,
- * AVBPrint-based on write. Not TAMS-specific -- these are shared
- * value-type primitives (string, int, bool, null, key, rational) used
- * throughout the TAMS-specific parsing/serialization further down.
+ * Generic JSON utilities. Cursor-based on read, AVBPrint-based on write.
  * ==================================================================== */
 
 void ff_tams_json_skip_ws(const char **p)
 {
-
     while (**p == ' ' || **p == '\t' || **p == '\r' || **p == '\n')
         (*p)++;
 }
@@ -319,9 +458,23 @@ static int json_expect(const char **p, char c)
     return 0;
 }
 
+static int json_is_null(const char **p)
+{
+    const char *save = *p;
+    ff_tams_json_skip_ws(p);
+    if (!strncmp(*p, "null", 4)) {
+        *p += 4;
+        return 1;
+    }
+    *p = save;
+    return 0;
+}
+
 /**
- * Read a JSON string value. Handles escape sequences.
- * If out is NULL, the string is skipped without storing.
+ * Read a JSON string value. Handles the RFC 8259 escape sequences, except
+ * that \uXXXX is not decoded: the 4 hex digits are skipped and the character
+ * is replaced with '?'. A store that escapes non-ASCII text (e.g. "Caf\u00e9")
+ * is read as "Caf?". If out is NULL, the string is skipped without storing.
  */
 static int json_read_string(const char **p, char *out, size_t out_size)
 {
@@ -348,7 +501,7 @@ static int json_read_string(const char **p, char *out, size_t out_size)
             case 'r': c = '\r'; break;
             case 't': c = '\t'; break;
             case 'u':
-                /* Skip 4 hex digits, replace with '?' */
+                /* \uXXXX is replaced with '?' */
                 for (int i = 0; i < 4; i++) {
                     (*p)++;
                     if (!**p)
@@ -377,6 +530,21 @@ static int json_read_string(const char **p, char *out, size_t out_size)
     }
 
     return 0;
+}
+
+/**
+ * Read a JSON key: "key" followed by ':'.
+ */
+static int json_read_key(const char **p, char *out, size_t out_size)
+{
+    int ret;
+
+    ff_tams_json_skip_ws(p);
+    ret = json_read_string(p, out, out_size);
+    if (ret < 0)
+        return ret;
+
+    return json_expect(p, ':');
 }
 
 static int json_read_int(const char **p, int64_t *out)
@@ -442,8 +610,7 @@ static int json_read_bool(const char **p, int *out)
 }
 
 /*
- * Skip over a complete JSON value (string, number, boolean, null,
- * object, or array) advancing the cursor past it.
+ * Skip over a complete JSON value advancing the cursor past it.
  */
 static int json_skip_value(const char **p)
 {
@@ -481,33 +648,6 @@ static int json_skip_value(const char **p)
            **p != ' ' && **p != '\t' && **p != '\r' && **p != '\n')
         (*p)++;
     return 0;
-}
-
-static int json_is_null(const char **p)
-{
-    const char *save = *p;
-    ff_tams_json_skip_ws(p);
-    if (!strncmp(*p, "null", 4)) {
-        *p += 4;
-        return 1;
-    }
-    *p = save;
-    return 0;
-}
-
-/**
- * Read a JSON key: "key" followed by ':'.
- */
-static int json_read_key(const char **p, char *out, size_t out_size)
-{
-    int ret;
-
-    ff_tams_json_skip_ws(p);
-    ret = json_read_string(p, out, out_size);
-    if (ret < 0)
-        return ret;
-
-    return json_expect(p, ':');
 }
 
 /**
@@ -563,9 +703,9 @@ static int json_read_rational(const char **p, AVRational *out)
 }
 
 /**
- * Write a JSON string literal, escaping quotes/backslash/control characters.
- * Bytes >= 0x20 are copied through unescaped (including multi-byte UTF-8
- * sequences), matching what json_read_string() accepts unescaped on read.
+ * Write a JSON string literal. Only what RFC 8259 requires is escaped:
+ * quote, backslash and control characters (< 0x20). Every other byte,
+ * including multi-byte UTF-8 sequences, is copied through unchanged.
  */
 static void json_write_string(AVBPrint *buf, const char *val)
 {
@@ -593,7 +733,6 @@ static void json_write_string(AVBPrint *buf, const char *val)
 
 /**
  * Write a JSON "key": value pair, where value is a string literal.
- * Pairs with json_read_key(), which reads the key half of the same shape.
  */
 static void json_write_key_string(AVBPrint *buf, const char *key, const char *val)
 {
@@ -603,7 +742,6 @@ static void json_write_key_string(AVBPrint *buf, const char *key, const char *va
 
 /**
  * Write a JSON "key": {"numerator": N, "denominator": D} pair.
- * Pairs with json_read_rational().
  */
 static void json_write_rational(AVBPrint *buf, const char *key, AVRational r)
 {
@@ -623,169 +761,12 @@ static void json_write_sep(AVBPrint *buf, int *first)
 }
 
 /* ====================================================================
- * TAMS specific serialization
- * ==================================================================== */
-
-static void json_write_container_mapping(AVBPrint *buf, const TAMSContainerMapping *m)
-{
-    int first = 1;
-
-    av_bprintf(buf, "{");
-    if (m->has_track_index) {
-        av_bprintf(buf, "\"track_index\":%d", m->track_index);
-        first = 0;
-    }
-    if (m->has_format_track_index) {
-        av_bprintf(buf, "%s\"format_track_index\":%d", first ? "" : ",", m->format_track_index);
-        first = 0;
-    }
-    if (m->has_mp2ts_pid) {
-        av_bprintf(buf, "%s\"mp2ts_container\":{\"pid\":%d}", first ? "" : ",", m->mp2ts_pid);
-        first = 0;
-    }
-    if (m->has_isobmff_track_id) {
-        av_bprintf(buf, "%s\"isobmff_container\":{\"track_id\":%d}", first ? "" : ",", m->isobmff_track_id);
-        first = 0;
-    }
-    if (m->mxf_package_uid[0] || m->has_mxf_track_id) {
-        av_bprintf(buf, "%s\"mxf_container\":{", first ? "" : ",");
-        first = 0;
-        if (m->mxf_package_uid[0]) {
-            json_write_key_string(buf, "package_uid", m->mxf_package_uid);
-            if (m->has_mxf_track_id)
-                av_bprintf(buf, ",");
-        }
-        if (m->has_mxf_track_id)
-            av_bprintf(buf, "\"track_id\":%d", m->mxf_track_id);
-        av_bprintf(buf, "}");
-    }
-    if (m->audio_channel_range[0]) {
-        av_bprintf(buf, "%s\"audio_track\":{", first ? "" : ",");
-        json_write_key_string(buf, "channel_range", m->audio_channel_range);
-        av_bprintf(buf, "}");
-        first = 0;
-    }
-    av_bprintf(buf, "}");
-}
-
-static void json_write_video_essence(AVBPrint *buf, const TAMSFlow *flow)
-{
-    const char *s;
-    int first = 1;
-
-    av_bprintf(buf, "\"essence_parameters\":{");
-
-    json_write_sep(buf, &first); av_bprintf(buf, "\"frame_width\":%d", flow->frame_width);
-    json_write_sep(buf, &first); av_bprintf(buf, "\"frame_height\":%d", flow->frame_height);
-    if (flow->frame_rate.num) {
-        json_write_sep(buf, &first); json_write_rational(buf, "frame_rate", flow->frame_rate);
-    }
-    if (flow->bit_depth) {
-        json_write_sep(buf, &first); av_bprintf(buf, "\"bit_depth\":%d", flow->bit_depth);
-    }
-    if ((s = tams_interlace_mode_strs[flow->interlace_mode])) {
-        json_write_sep(buf, &first); json_write_key_string(buf, "interlace_mode", s);
-    }
-    if ((s = tams_colorspace_strs[flow->colorspace])) {
-        json_write_sep(buf, &first); json_write_key_string(buf, "colorspace", s);
-    }
-    if ((s = tams_transfer_characteristic_strs[flow->transfer_characteristic])) {
-        json_write_sep(buf, &first); json_write_key_string(buf, "transfer_characteristic", s);
-    }
-    if (flow->aspect_ratio.num) {
-        json_write_sep(buf, &first); json_write_rational(buf, "aspect_ratio", flow->aspect_ratio);
-    }
-    if (flow->pixel_aspect_ratio.num) {
-        json_write_sep(buf, &first); json_write_rational(buf, "pixel_aspect_ratio", flow->pixel_aspect_ratio);
-    }
-    if ((s = tams_component_type_strs[flow->component_type])) {
-        json_write_sep(buf, &first); json_write_key_string(buf, "component_type", s);
-    }
-    if (flow->horiz_chroma_subs) {
-        json_write_sep(buf, &first); av_bprintf(buf, "\"horiz_chroma_subs\":%d", flow->horiz_chroma_subs);
-    }
-    if (flow->vert_chroma_subs) {
-        json_write_sep(buf, &first); av_bprintf(buf, "\"vert_chroma_subs\":%d", flow->vert_chroma_subs);
-    }
-    json_write_sep(buf, &first); av_bprintf(buf, "\"vfr\":%s", flow->vfr ? "true" : "false");
-    if ((s = tams_video_unc_type_strs[flow->video_unc_type])) {
-        json_write_sep(buf, &first); av_bprintf(buf, "\"unc_parameters\":{");
-        json_write_key_string(buf, "unc_type", s);
-        av_bprintf(buf, "}");
-    }
-    if (flow->has_avc_parameters) {
-        json_write_sep(buf, &first);
-        av_bprintf(buf, "\"avc_parameters\":{\"profile\":%d,\"level\":%d,\"flags\":%d}",
-                   flow->avc_parameters.profile, flow->avc_parameters.level,
-                   flow->avc_parameters.flags);
-    }
-
-    av_bprintf(buf, "}");
-}
-
-static void json_write_audio_essence(AVBPrint *buf, const TAMSFlow *flow)
-{
-    const char *s;
-    int first = 1;
-
-    av_bprintf(buf, "\"essence_parameters\":{");
-
-    json_write_sep(buf, &first); av_bprintf(buf, "\"sample_rate\":%d", flow->sample_rate);
-    json_write_sep(buf, &first); av_bprintf(buf, "\"channels\":%d", flow->channels);
-    if (flow->bit_depth) {
-        json_write_sep(buf, &first); av_bprintf(buf, "\"bit_depth\":%d", flow->bit_depth);
-    }
-    if (flow->coded_frame_size || flow->mp4_oti) {
-        json_write_sep(buf, &first); av_bprintf(buf, "\"codec_parameters\":{");
-        if (flow->coded_frame_size)
-            av_bprintf(buf, "\"coded_frame_size\":%d%s", flow->coded_frame_size,
-                       flow->mp4_oti ? "," : "");
-        if (flow->mp4_oti)
-            av_bprintf(buf, "\"mp4_oti\":%d", flow->mp4_oti);
-        av_bprintf(buf, "}");
-    }
-    if ((s = tams_audio_unc_type_strs[flow->audio_unc_type])) {
-        json_write_sep(buf, &first); av_bprintf(buf, "\"unc_parameters\":{");
-        json_write_key_string(buf, "unc_type", s);
-        av_bprintf(buf, "}");
-    }
-
-    av_bprintf(buf, "}");
-}
-
-static void json_write_flow_collection(AVBPrint *buf, const TAMSFlow *flow)
-{
-    av_bprintf(buf, "\"flow_collection\":[");
-    for (int i = 0; i < flow->nb_flow_collection_items; i++) {
-        const TAMSFlowCollectionItem *item = &flow->flow_collection_items[i];
-
-        if (i)
-            av_bprintf(buf, ",");
-        av_bprintf(buf, "{");
-        json_write_key_string(buf, "id", item->id);
-        if (item->role[0]) {
-            av_bprintf(buf, ",");
-            json_write_key_string(buf, "role", item->role);
-        }
-        if (item->has_container_mapping) {
-            av_bprintf(buf, ",\"container_mapping\":");
-            json_write_container_mapping(buf, &item->container_mapping);
-        }
-        av_bprintf(buf, "}");
-    }
-    av_bprintf(buf, "]");
-}
-
-/* ====================================================================
  * TAMS specific parsing
  * ==================================================================== */
 
 /**
  * Parse a tag value: a JSON string, or an array of strings flattened with ','.
  * Any other type is skipped and buf is set to empty string.
- * TAMS-specific quirk (tags), not a generic JSON value type -- kept next to
- * the Flow parsing below where it's used, rather than in the generic
- * JSON utilities section.
  */
 static int json_parse_tag_value(const char **p, char *buf, size_t size)
 {
@@ -1467,10 +1448,8 @@ static int parse_get_urls(const char **p, char *url, size_t url_size)
 }
 
 /**
- * Parse a single TAMS Flow JSON object from a buffer, advancing the cursor
- * past it. Internal building block for ff_tams_flows_from_json(); not part
- * of the public API since every caller needs the array-or-single-object
- * handling that function provides.
+ * Parse a single TAMS Flow JSON from a buffer, advancing the cursor
+ * past it. Internal building block for ff_tams_flows_from_json().
  */
 static int tams_flow_from_json(const char **p, TAMSFlow *flow)
 {
@@ -1604,9 +1583,9 @@ static int tams_flow_from_json(const char **p, TAMSFlow *flow)
 }
 
 /**
- * Parse a single TAMS Flow Segment JSON object from a buffer, advancing the
+ * Parse a single TAMS Flow Segment object from a buffer, advancing the
  * cursor past it. Internal building block for
- * ff_tams_flow_segments_from_json(); not part of the public API.
+ * ff_tams_flow_segments_from_json().
  */
 static int tams_flow_segment_from_json(const char **p, TAMSFlowSegment *seg)
 {
@@ -1674,87 +1653,251 @@ static int tams_flow_segment_from_json(const char **p, TAMSFlowSegment *seg)
     return 0;
 }
 
+/* Fill put_url and put_content_type from a "put_url" http-request object */
+static int tams_put_url_from_json(const char **p, TAMSMediaObject *obj)
+{
+    char key[64];
+    int ret;
+
+    ret = json_expect(p, '{');
+    if (ret < 0)
+        return ret;
+
+    while (1) {
+        ff_tams_json_skip_ws(p);
+        if (**p == '}')
+            break;
+
+        ret = json_read_key(p, key, sizeof(key));
+        if (ret < 0)
+            return ret;
+
+        if (json_is_null(p)) {
+            /* null value: skip */
+        } else if (!strcmp(key, "url")) {
+            ret = json_read_string(p, obj->put_url, sizeof(obj->put_url));
+        } else if (!strcmp(key, "content-type")) {
+            ret = json_read_string(p, obj->put_content_type, sizeof(obj->put_content_type));
+        } else {
+            ret = json_skip_value(p);
+        }
+
+        if (ret < 0)
+            return ret;
+
+        ff_tams_json_skip_ws(p);
+        if (**p == ',')
+            (*p)++;
+    }
+
+    (*p)++; /* skip '}' */
+
+    return 0;
+}
+
+static int tams_media_object_from_json(const char **p, TAMSMediaObject *obj)
+{
+    char key[64];
+    int ret;
+
+    memset(obj, 0, sizeof(*obj));
+
+    ret = json_expect(p, '{');
+    if (ret < 0)
+        return ret;
+
+    while (1) {
+        ff_tams_json_skip_ws(p);
+        if (**p == '}')
+            break;
+
+        ret = json_read_key(p, key, sizeof(key));
+        if (ret < 0)
+            return ret;
+
+        if (json_is_null(p)) {
+            /* null value: skip */
+        } else if (!strcmp(key, "object_id")) {
+            ret = json_read_string(p, obj->object_id, sizeof(obj->object_id));
+        } else if (!strcmp(key, "put_url")) {
+            ret = tams_put_url_from_json(p, obj);
+        } else {
+            ret = json_skip_value(p);
+        }
+
+        if (ret < 0)
+            return ret;
+
+        ff_tams_json_skip_ws(p);
+        if (**p == ',')
+            (*p)++;
+    }
+
+    (*p)++; /* skip '}' */
+
+    if (!obj->object_id[0] || !obj->put_url[0])
+        return AVERROR_INVALIDDATA;
+
+    return 0;
+}
+
 /* ====================================================================
- * Main functions for converting TAMS Flow and Flow Segment structures to/from JSON.
+ * TAMS specific serialization
  * ==================================================================== */
 
-int ff_tams_flow_to_json(AVBPrint *buf, const TAMSFlow *flow)
+static void json_write_container_mapping(AVBPrint *buf, const TAMSContainerMapping *m)
 {
     int first = 1;
 
-    if (flow->format == TAMS_FORMAT_UNKNOWN || flow->format > TAMS_FORMAT_IMAGE)
-        return AVERROR(EINVAL);
-
     av_bprintf(buf, "{");
-
-    if (flow->id[0]) {
-        json_write_sep(buf, &first); json_write_key_string(buf, "id", flow->id);
+    if (m->has_track_index) {
+        av_bprintf(buf, "\"track_index\":%d", m->track_index);
+        first = 0;
     }
-    if (flow->source_id[0]) {
-        json_write_sep(buf, &first); json_write_key_string(buf, "source_id", flow->source_id);
+    if (m->has_format_track_index) {
+        av_bprintf(buf, "%s\"format_track_index\":%d", first ? "" : ",", m->format_track_index);
+        first = 0;
     }
-    if (flow->label[0]) {
-        json_write_sep(buf, &first); json_write_key_string(buf, "label", flow->label);
+    if (m->has_mp2ts_pid) {
+        av_bprintf(buf, "%s\"mp2ts_container\":{\"pid\":%d}", first ? "" : ",", m->mp2ts_pid);
+        first = 0;
     }
-    if (flow->description[0]) {
-        json_write_sep(buf, &first); json_write_key_string(buf, "description", flow->description);
+    if (m->has_isobmff_track_id) {
+        av_bprintf(buf, "%s\"isobmff_container\":{\"track_id\":%d}", first ? "" : ",", m->isobmff_track_id);
+        first = 0;
     }
-    json_write_sep(buf, &first); json_write_key_string(buf, "format", tams_format_urns[flow->format - 1]);
-    if (flow->codec[0]) {
-        json_write_sep(buf, &first); json_write_key_string(buf, "codec", flow->codec);
-    }
-    if (flow->container[0]) {
-        json_write_sep(buf, &first); json_write_key_string(buf, "container", flow->container);
-    }
-    json_write_sep(buf, &first); av_bprintf(buf, "\"generation\":%d", flow->generation);
-    if (flow->avg_bit_rate) {
-        json_write_sep(buf, &first); av_bprintf(buf, "\"avg_bit_rate\":%d", flow->avg_bit_rate);
-    }
-    if (flow->max_bit_rate) {
-        json_write_sep(buf, &first); av_bprintf(buf, "\"max_bit_rate\":%d", flow->max_bit_rate);
-    }
-    json_write_sep(buf, &first); av_bprintf(buf, "\"read_only\":%s", flow->read_only ? "true" : "false");
-    if (flow->segment_duration.num) {
-        json_write_sep(buf, &first); json_write_rational(buf, "segment_duration", flow->segment_duration);
-    }
-    if (flow->nb_tags) {
-        json_write_sep(buf, &first); av_bprintf(buf, "\"tags\":{");
-        for (int i = 0; i < flow->nb_tags; i++) {
-            if (i)
+    if (m->mxf_package_uid[0] || m->has_mxf_track_id) {
+        av_bprintf(buf, "%s\"mxf_container\":{", first ? "" : ",");
+        first = 0;
+        if (m->mxf_package_uid[0]) {
+            json_write_key_string(buf, "package_uid", m->mxf_package_uid);
+            if (m->has_mxf_track_id)
                 av_bprintf(buf, ",");
-            json_write_key_string(buf, flow->tags[i].key, flow->tags[i].value);
         }
+        if (m->has_mxf_track_id)
+            av_bprintf(buf, "\"track_id\":%d", m->mxf_track_id);
         av_bprintf(buf, "}");
     }
-    if (flow->created_by[0]) {
-        json_write_sep(buf, &first); json_write_key_string(buf, "created_by", flow->created_by);
+    if (m->audio_channel_range[0]) {
+        av_bprintf(buf, "%s\"audio_track\":{", first ? "" : ",");
+        json_write_key_string(buf, "channel_range", m->audio_channel_range);
+        av_bprintf(buf, "}");
+        first = 0;
     }
-    if (flow->updated_by[0]) {
-        json_write_sep(buf, &first); json_write_key_string(buf, "updated_by", flow->updated_by);
-    }
-    if (flow->metadata_version[0]) {
-        json_write_sep(buf, &first); json_write_key_string(buf, "metadata_version", flow->metadata_version);
-    }
-    if (flow->status[0]) {
-        json_write_sep(buf, &first); json_write_key_string(buf, "status", flow->status);
-    }
+    av_bprintf(buf, "}");
+}
 
-    if (flow->format == TAMS_FORMAT_VIDEO || flow->format == TAMS_FORMAT_IMAGE) {
-        json_write_sep(buf, &first); json_write_video_essence(buf, flow);
-    } else if (flow->format == TAMS_FORMAT_AUDIO) {
-        json_write_sep(buf, &first); json_write_audio_essence(buf, flow);
-    } else if (flow->format == TAMS_FORMAT_DATA) {
-        json_write_sep(buf, &first); av_bprintf(buf, "\"essence_parameters\":{");
-        json_write_key_string(buf, "data_type", flow->data_type);
+static void json_write_video_essence(AVBPrint *buf, const TAMSFlow *flow)
+{
+    const char *s;
+    int first = 1;
+
+    av_bprintf(buf, "\"essence_parameters\":{");
+
+    json_write_sep(buf, &first); av_bprintf(buf, "\"frame_width\":%d", flow->frame_width);
+    json_write_sep(buf, &first); av_bprintf(buf, "\"frame_height\":%d", flow->frame_height);
+    if (flow->frame_rate.num) {
+        json_write_sep(buf, &first); json_write_rational(buf, "frame_rate", flow->frame_rate);
+    }
+    if (flow->bit_depth) {
+        json_write_sep(buf, &first); av_bprintf(buf, "\"bit_depth\":%d", flow->bit_depth);
+    }
+    if ((s = tams_interlace_mode_strs[flow->interlace_mode])) {
+        json_write_sep(buf, &first); json_write_key_string(buf, "interlace_mode", s);
+    }
+    if ((s = tams_colorspace_strs[flow->colorspace])) {
+        json_write_sep(buf, &first); json_write_key_string(buf, "colorspace", s);
+    }
+    if ((s = tams_transfer_characteristic_strs[flow->transfer_characteristic])) {
+        json_write_sep(buf, &first); json_write_key_string(buf, "transfer_characteristic", s);
+    }
+    if (flow->aspect_ratio.num) {
+        json_write_sep(buf, &first); json_write_rational(buf, "aspect_ratio", flow->aspect_ratio);
+    }
+    if (flow->pixel_aspect_ratio.num) {
+        json_write_sep(buf, &first); json_write_rational(buf, "pixel_aspect_ratio", flow->pixel_aspect_ratio);
+    }
+    if ((s = tams_component_type_strs[flow->component_type])) {
+        json_write_sep(buf, &first); json_write_key_string(buf, "component_type", s);
+    }
+    if (flow->horiz_chroma_subs) {
+        json_write_sep(buf, &first); av_bprintf(buf, "\"horiz_chroma_subs\":%d", flow->horiz_chroma_subs);
+    }
+    if (flow->vert_chroma_subs) {
+        json_write_sep(buf, &first); av_bprintf(buf, "\"vert_chroma_subs\":%d", flow->vert_chroma_subs);
+    }
+    json_write_sep(buf, &first); av_bprintf(buf, "\"vfr\":%s", flow->vfr ? "true" : "false");
+    if ((s = tams_video_unc_type_strs[flow->video_unc_type])) {
+        json_write_sep(buf, &first); av_bprintf(buf, "\"unc_parameters\":{");
+        json_write_key_string(buf, "unc_type", s);
         av_bprintf(buf, "}");
-    } else if (flow->format == TAMS_FORMAT_MULTI && flow->nb_flow_collection_items) {
-        json_write_sep(buf, &first); json_write_flow_collection(buf, flow);
+    }
+    if (flow->has_avc_parameters) {
+        json_write_sep(buf, &first);
+        av_bprintf(buf, "\"avc_parameters\":{\"profile\":%d,\"level\":%d,\"flags\":%d}",
+                   flow->avc_parameters.profile, flow->avc_parameters.level,
+                   flow->avc_parameters.flags);
     }
 
     av_bprintf(buf, "}");
-
-    return av_bprint_is_complete(buf) ? 0 : AVERROR(ENOMEM);
 }
+
+static void json_write_audio_essence(AVBPrint *buf, const TAMSFlow *flow)
+{
+    const char *s;
+    int first = 1;
+
+    av_bprintf(buf, "\"essence_parameters\":{");
+
+    json_write_sep(buf, &first); av_bprintf(buf, "\"sample_rate\":%d", flow->sample_rate);
+    json_write_sep(buf, &first); av_bprintf(buf, "\"channels\":%d", flow->channels);
+    if (flow->bit_depth) {
+        json_write_sep(buf, &first); av_bprintf(buf, "\"bit_depth\":%d", flow->bit_depth);
+    }
+    if (flow->coded_frame_size || flow->mp4_oti) {
+        json_write_sep(buf, &first); av_bprintf(buf, "\"codec_parameters\":{");
+        if (flow->coded_frame_size)
+            av_bprintf(buf, "\"coded_frame_size\":%d%s", flow->coded_frame_size,
+                       flow->mp4_oti ? "," : "");
+        if (flow->mp4_oti)
+            av_bprintf(buf, "\"mp4_oti\":%d", flow->mp4_oti);
+        av_bprintf(buf, "}");
+    }
+    if ((s = tams_audio_unc_type_strs[flow->audio_unc_type])) {
+        json_write_sep(buf, &first); av_bprintf(buf, "\"unc_parameters\":{");
+        json_write_key_string(buf, "unc_type", s);
+        av_bprintf(buf, "}");
+    }
+
+    av_bprintf(buf, "}");
+}
+
+static void json_write_flow_collection(AVBPrint *buf, const TAMSFlow *flow)
+{
+    av_bprintf(buf, "\"flow_collection\":[");
+    for (int i = 0; i < flow->nb_flow_collection_items; i++) {
+        const TAMSFlowCollectionItem *item = &flow->flow_collection_items[i];
+
+        if (i)
+            av_bprintf(buf, ",");
+        av_bprintf(buf, "{");
+        json_write_key_string(buf, "id", item->id);
+        if (item->role[0]) {
+            av_bprintf(buf, ",");
+            json_write_key_string(buf, "role", item->role);
+        }
+        if (item->has_container_mapping) {
+            av_bprintf(buf, ",\"container_mapping\":");
+            json_write_container_mapping(buf, &item->container_mapping);
+        }
+        av_bprintf(buf, "}");
+    }
+    av_bprintf(buf, "]");
+}
+
+/* ====================================================================
+ * Main functions for converting TAMS Flow and Flow Segment structures to/from JSON.
+ * ==================================================================== */
 
 int ff_tams_flows_from_json(const char *json,
                             TAMSFlow **flows_inout, int *nb_flows_inout)
@@ -1805,40 +1948,6 @@ int ff_tams_flows_from_json(const char *json,
     }
 
     return 0;
-}
-
-int ff_tams_flow_segment_to_json(AVBPrint *buf, const TAMSFlowSegment *seg)
-{
-    char tr_buf[64], ts_buf[32];
-    int ret;
-
-    ret = ff_tams_timerange_to_str(&seg->timerange, tr_buf, sizeof(tr_buf));
-    if (ret < 0)
-        return ret;
-
-    av_bprintf(buf, "{");
-    json_write_key_string(buf, "object_id", seg->object_id);
-    av_bprintf(buf, ",");
-    json_write_key_string(buf, "timerange", tr_buf);
-
-    ret = ff_tams_timestamp_to_str(seg->ts_offset, ts_buf, sizeof(ts_buf));
-    if (ret < 0)
-        return ret;
-    av_bprintf(buf, ",");
-    json_write_key_string(buf, "ts_offset", ts_buf);
-
-    if (seg->has_last_duration) {
-        char ld_buf[32];
-        ret = ff_tams_timestamp_to_str(seg->last_duration, ld_buf, sizeof(ld_buf));
-        if (ret < 0)
-            return ret;
-        av_bprintf(buf, ",");
-        json_write_key_string(buf, "last_duration", ld_buf);
-    }
-
-    av_bprintf(buf, "}");
-
-    return av_bprint_is_complete(buf) ? 0 : AVERROR(ENOMEM);
 }
 
 int ff_tams_flow_segments_from_json(const char *json,
@@ -1933,98 +2042,6 @@ int ff_tams_service_from_json(const char *json, TAMSService *service)
     return 0;
 }
 
-static int tams_http_request_from_json(const char **p, TAMSHttpRequest *req)
-{
-    char key[64];
-    int ret;
-
-    memset(req, 0, sizeof(*req));
-
-    ret = json_expect(p, '{');
-    if (ret < 0)
-        return ret;
-
-    while (1) {
-        ff_tams_json_skip_ws(p);
-        if (**p == '}')
-            break;
-
-        ret = json_read_key(p, key, sizeof(key));
-        if (ret < 0)
-            return ret;
-
-        if (json_is_null(p)) {
-            /* null value: skip */
-        } else if (!strcmp(key, "url")) {
-            ret = json_read_string(p, req->url, sizeof(req->url));
-        } else if (!strcmp(key, "content-type")) {
-            ret = json_read_string(p, req->content_type, sizeof(req->content_type));
-        } else {
-            ret = json_skip_value(p);
-        }
-
-        if (ret < 0)
-            return ret;
-
-        ff_tams_json_skip_ws(p);
-        if (**p == ',')
-            (*p)++;
-    }
-
-    (*p)++; /* skip '}' */
-
-    if (!req->url[0])
-        return AVERROR_INVALIDDATA;
-
-    return 0;
-}
-
-static int tams_media_object_from_json(const char **p, TAMSMediaObject *obj)
-{
-    char key[64];
-    int ret;
-
-    memset(obj, 0, sizeof(*obj));
-
-    ret = json_expect(p, '{');
-    if (ret < 0)
-        return ret;
-
-    while (1) {
-        ff_tams_json_skip_ws(p);
-        if (**p == '}')
-            break;
-
-        ret = json_read_key(p, key, sizeof(key));
-        if (ret < 0)
-            return ret;
-
-        if (json_is_null(p)) {
-            /* null value: skip */
-        } else if (!strcmp(key, "object_id")) {
-            ret = json_read_string(p, obj->object_id, sizeof(obj->object_id));
-        } else if (!strcmp(key, "put_url")) {
-            ret = tams_http_request_from_json(p, &obj->put_url);
-        } else {
-            ret = json_skip_value(p);
-        }
-
-        if (ret < 0)
-            return ret;
-
-        ff_tams_json_skip_ws(p);
-        if (**p == ',')
-            (*p)++;
-    }
-
-    (*p)++; /* skip '}' */
-
-    if (!obj->object_id[0] || !obj->put_url.url[0])
-        return AVERROR_INVALIDDATA;
-
-    return 0;
-}
-
 int ff_tams_storage_allocation_from_json(const char *json,
                                          TAMSMediaObject **objects_inout,
                                          int *nb_objects_inout)
@@ -2091,57 +2108,116 @@ int ff_tams_storage_allocation_from_json(const char *json,
     return 0;
 }
 
-/* ====================================================================
- * Codec MIME type <-> AVCodecID: TAMS Flow.codec strings, one entry per
- * accepted MIME alias; is_preferred marks the alias ff_tams_mime_from_codec()
- * maps back to when several alternatives exist for one codec.
- * ==================================================================== */
-
-static const struct {
-    const char *mime;
-    enum AVCodecID id;
-    int is_preferred;
-} tams_codec_mime_map[] = {
-    { "video/h264",      AV_CODEC_ID_H264,       1 },
-    { "video/hevc",      AV_CODEC_ID_HEVC,       1 },
-    { "video/h265",      AV_CODEC_ID_HEVC,       0 },
-    { "video/vp8",       AV_CODEC_ID_VP8,        1 },
-    { "video/vp9",       AV_CODEC_ID_VP9,        1 },
-    { "video/av1",       AV_CODEC_ID_AV1,        1 },
-    { "video/mpeg2",     AV_CODEC_ID_MPEG2VIDEO, 1 },
-    { "video/raw",       AV_CODEC_ID_RAWVIDEO,   1 },
-    { "audio/aac",       AV_CODEC_ID_AAC,        1 },
-    { "audio/mp4a-latm", AV_CODEC_ID_AAC,        0 },
-    { "audio/opus",      AV_CODEC_ID_OPUS,       1 },
-    { "audio/mp2",       AV_CODEC_ID_MP2,        1 },
-    { "audio/mp3",       AV_CODEC_ID_MP3,        1 },
-    { "audio/mpeg",      AV_CODEC_ID_MP3,        0 },
-    { "audio/flac",      AV_CODEC_ID_FLAC,       1 },
-    { "audio/vorbis",    AV_CODEC_ID_VORBIS,     1 },
-    { "audio/ac3",       AV_CODEC_ID_AC3,        1 },
-    { "audio/eac3",      AV_CODEC_ID_EAC3,       1 },
-    /* one MIME for all PCM; bit_depth selects the sample size */
-    { "audio/pcm",       AV_CODEC_ID_PCM_S24LE,  1 },
-    { "audio/pcm",       AV_CODEC_ID_PCM_S16LE,  1 },
-    { "audio/pcm",       AV_CODEC_ID_PCM_S32LE,  1 },
-    { "text/vtt",        AV_CODEC_ID_WEBVTT,     1 },
-    { "text/srt",        AV_CODEC_ID_SUBRIP,     1 },
-};
-
-enum AVCodecID ff_tams_codec_from_mime(const char *mime)
+int ff_tams_flow_to_json(AVBPrint *buf, const TAMSFlow *flow)
 {
-    for (int i = 0; i < FF_ARRAY_ELEMS(tams_codec_mime_map); i++)
-        if (!strcmp(mime, tams_codec_mime_map[i].mime))
-            return tams_codec_mime_map[i].id;
-    return AV_CODEC_ID_NONE;
+    int first = 1;
+
+    if (flow->format == TAMS_FORMAT_UNKNOWN || flow->format > TAMS_FORMAT_IMAGE)
+        return AVERROR(EINVAL);
+
+    av_bprintf(buf, "{");
+
+    if (flow->id[0]) {
+        json_write_sep(buf, &first); json_write_key_string(buf, "id", flow->id);
+    }
+    if (flow->source_id[0]) {
+        json_write_sep(buf, &first); json_write_key_string(buf, "source_id", flow->source_id);
+    }
+    if (flow->label[0]) {
+        json_write_sep(buf, &first); json_write_key_string(buf, "label", flow->label);
+    }
+    if (flow->description[0]) {
+        json_write_sep(buf, &first); json_write_key_string(buf, "description", flow->description);
+    }
+    json_write_sep(buf, &first); json_write_key_string(buf, "format", tams_format_urns[flow->format - 1]);
+    if (flow->codec[0]) {
+        json_write_sep(buf, &first); json_write_key_string(buf, "codec", flow->codec);
+    }
+    if (flow->container[0]) {
+        json_write_sep(buf, &first); json_write_key_string(buf, "container", flow->container);
+    }
+    json_write_sep(buf, &first); av_bprintf(buf, "\"generation\":%d", flow->generation);
+    if (flow->avg_bit_rate) {
+        json_write_sep(buf, &first); av_bprintf(buf, "\"avg_bit_rate\":%d", flow->avg_bit_rate);
+    }
+    if (flow->max_bit_rate) {
+        json_write_sep(buf, &first); av_bprintf(buf, "\"max_bit_rate\":%d", flow->max_bit_rate);
+    }
+    json_write_sep(buf, &first); av_bprintf(buf, "\"read_only\":%s", flow->read_only ? "true" : "false");
+    if (flow->segment_duration.num) {
+        json_write_sep(buf, &first); json_write_rational(buf, "segment_duration", flow->segment_duration);
+    }
+    if (flow->nb_tags) {
+        json_write_sep(buf, &first); av_bprintf(buf, "\"tags\":{");
+        for (int i = 0; i < flow->nb_tags; i++) {
+            if (i)
+                av_bprintf(buf, ",");
+            json_write_key_string(buf, flow->tags[i].key, flow->tags[i].value);
+        }
+        av_bprintf(buf, "}");
+    }
+    if (flow->created_by[0]) {
+        json_write_sep(buf, &first); json_write_key_string(buf, "created_by", flow->created_by);
+    }
+    if (flow->updated_by[0]) {
+        json_write_sep(buf, &first); json_write_key_string(buf, "updated_by", flow->updated_by);
+    }
+    if (flow->metadata_version[0]) {
+        json_write_sep(buf, &first); json_write_key_string(buf, "metadata_version", flow->metadata_version);
+    }
+    if (flow->status[0]) {
+        json_write_sep(buf, &first); json_write_key_string(buf, "status", flow->status);
+    }
+
+    if (flow->format == TAMS_FORMAT_VIDEO || flow->format == TAMS_FORMAT_IMAGE) {
+        json_write_sep(buf, &first); json_write_video_essence(buf, flow);
+    } else if (flow->format == TAMS_FORMAT_AUDIO) {
+        json_write_sep(buf, &first); json_write_audio_essence(buf, flow);
+    } else if (flow->format == TAMS_FORMAT_DATA) {
+        json_write_sep(buf, &first); av_bprintf(buf, "\"essence_parameters\":{");
+        json_write_key_string(buf, "data_type", flow->data_type);
+        av_bprintf(buf, "}");
+    } else if (flow->format == TAMS_FORMAT_MULTI && flow->nb_flow_collection_items) {
+        json_write_sep(buf, &first); json_write_flow_collection(buf, flow);
+    }
+
+    av_bprintf(buf, "}");
+
+    return av_bprint_is_complete(buf) ? 0 : AVERROR(ENOMEM);
 }
 
-const char *ff_tams_mime_from_codec(enum AVCodecID codec_id)
+int ff_tams_flow_segment_to_json(AVBPrint *buf, const TAMSFlowSegment *seg)
 {
-    for (int i = 0; i < FF_ARRAY_ELEMS(tams_codec_mime_map); i++)
-        if (tams_codec_mime_map[i].id == codec_id && tams_codec_mime_map[i].is_preferred)
-            return tams_codec_mime_map[i].mime;
-    return NULL;
+    char tr_buf[64], ts_buf[32];
+    int ret;
+
+    ret = ff_tams_timerange_to_str(&seg->timerange, tr_buf, sizeof(tr_buf));
+    if (ret < 0)
+        return ret;
+
+    av_bprintf(buf, "{");
+    json_write_key_string(buf, "object_id", seg->object_id);
+    av_bprintf(buf, ",");
+    json_write_key_string(buf, "timerange", tr_buf);
+
+    ret = ff_tams_timestamp_to_str(seg->ts_offset, ts_buf, sizeof(ts_buf));
+    if (ret < 0)
+        return ret;
+    av_bprintf(buf, ",");
+    json_write_key_string(buf, "ts_offset", ts_buf);
+
+    if (seg->has_last_duration) {
+        char ld_buf[32];
+        ret = ff_tams_timestamp_to_str(seg->last_duration, ld_buf, sizeof(ld_buf));
+        if (ret < 0)
+            return ret;
+        av_bprintf(buf, ",");
+        json_write_key_string(buf, "last_duration", ld_buf);
+    }
+
+    av_bprintf(buf, "}");
+
+    return av_bprint_is_complete(buf) ? 0 : AVERROR(ENOMEM);
 }
 
 /* ====================================================================
@@ -2155,6 +2231,45 @@ int ff_tams_same_host(const char *url1, const char *url2)
     av_url_split(NULL, 0, NULL, 0, host2, sizeof(host2), NULL, NULL, 0, url2);
     return !av_strcasecmp(host1, host2);
 }
+
+void ff_tams_log_flow_summary(void *avcl, int level, const TAMSFlow *flow)
+{
+    static const char *const flow_type_names[] = {
+        "UNKNOWN", "VIDEO", "AUDIO", "DATA", "MULTI", "IMAGE"
+    };
+    const char *type_name = (flow->format < FF_ARRAY_ELEMS(flow_type_names))
+                           ? flow_type_names[flow->format] : "INVALID";
+
+    av_log(avcl, level, "id=%s, format=%s(%d)", flow->id, type_name, flow->format);
+
+    if (flow->format == TAMS_FORMAT_VIDEO || flow->format == TAMS_FORMAT_IMAGE) {
+        if (flow->frame_rate.num > 0)
+            av_log(avcl, level, ", frame_rate=" AVRATIONAL_FORMAT, AVRATIONAL_ARG(flow->frame_rate));
+        if (flow->frame_width > 0 && flow->frame_height > 0)
+            av_log(avcl, level, ", resolution=%dx%d", flow->frame_width, flow->frame_height);
+    } else if (flow->format == TAMS_FORMAT_AUDIO) {
+        if (flow->sample_rate > 0)
+            av_log(avcl, level, ", sample_rate=%d", flow->sample_rate);
+        if (flow->channels > 0)
+            av_log(avcl, level, ", channels=%d", flow->channels);
+    } else if (flow->format == TAMS_FORMAT_MULTI) {
+        av_log(avcl, level, ", sub_flows=%d", flow->nb_flow_collection_items);
+    }
+
+    if (flow->timerange.has_start || flow->timerange.has_end) {
+        av_log(avcl, level, ", timerange=[%s%"PRId64"_%"PRId64"%s)",
+               flow->timerange.start_inclusive ? "[" : "(",
+               flow->timerange.has_start ? flow->timerange.start : 0,
+               flow->timerange.has_end ? flow->timerange.end : 0,
+               flow->timerange.end_inclusive ? "]" : ")");
+    }
+
+    av_log(avcl, level, "\n");
+}
+
+/* ====================================================================
+ * URL utilities
+ * ==================================================================== */
 
 int ff_tams_get_base_url(const char *full_url, char *base_url, size_t base_size,
                                  int *is_exact)
@@ -2223,6 +2338,10 @@ int ff_tams_service_url(const char *flows_base_url, char *out, size_t out_size)
         return AVERROR(ENAMETOOLONG);
     return 0;
 }
+
+/* ====================================================================
+ * TAMS request support
+ * ==================================================================== */
 
 static int tams_is_transient_error(int ret)
 {
@@ -2350,39 +2469,4 @@ int ff_tams_request(AVFormatContext *s, AVDictionary *const *avio_opts,
             return AVERROR_EXIT;
         av_usleep(retry_backoff_us << attempt);
     }
-}
-
-void ff_tams_log_flow_summary(void *avcl, int level, const TAMSFlow *flow)
-{
-    static const char *const flow_type_names[] = {
-        "UNKNOWN", "VIDEO", "AUDIO", "DATA", "MULTI", "IMAGE"
-    };
-    const char *type_name = (flow->format < FF_ARRAY_ELEMS(flow_type_names))
-                           ? flow_type_names[flow->format] : "INVALID";
-
-    av_log(avcl, level, "id=%s, format=%s(%d)", flow->id, type_name, flow->format);
-
-    if (flow->format == TAMS_FORMAT_VIDEO || flow->format == TAMS_FORMAT_IMAGE) {
-        if (flow->frame_rate.num > 0)
-            av_log(avcl, level, ", frame_rate=" AVRATIONAL_FORMAT, AVRATIONAL_ARG(flow->frame_rate));
-        if (flow->frame_width > 0 && flow->frame_height > 0)
-            av_log(avcl, level, ", resolution=%dx%d", flow->frame_width, flow->frame_height);
-    } else if (flow->format == TAMS_FORMAT_AUDIO) {
-        if (flow->sample_rate > 0)
-            av_log(avcl, level, ", sample_rate=%d", flow->sample_rate);
-        if (flow->channels > 0)
-            av_log(avcl, level, ", channels=%d", flow->channels);
-    } else if (flow->format == TAMS_FORMAT_MULTI) {
-        av_log(avcl, level, ", sub_flows=%d", flow->nb_flow_collection_items);
-    }
-
-    if (flow->timerange.has_start || flow->timerange.has_end) {
-        av_log(avcl, level, ", timerange=[%s%"PRId64"_%"PRId64"%s)",
-               flow->timerange.start_inclusive ? "[" : "(",
-               flow->timerange.has_start ? flow->timerange.start : 0,
-               flow->timerange.has_end ? flow->timerange.end : 0,
-               flow->timerange.end_inclusive ? "]" : ")");
-    }
-
-    av_log(avcl, level, "\n");
 }

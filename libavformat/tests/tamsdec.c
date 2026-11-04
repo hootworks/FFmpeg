@@ -19,13 +19,10 @@
  */
 
 /**
- * Tests for TAMS demuxer internals: codec lookup, live detection, URL
- * building, and packet restamping/boundary classification. All pure or
- * near-pure functions exercised directly, no network I/O.
+ * @file
+ * Tests for TAMS demuxer internals.
  *
  * @author Nick Ryan
- * @file
- * @ingroup lavu_tams
  */
 
 #include "libavformat/tamsdec.c"
@@ -42,54 +39,60 @@
     return 1; \
 } while (0)
 
-typedef struct RestampFixture {
+/* ====================================================================
+ * Test helpers
+ * ==================================================================== */
+
+typedef struct PacketFixture {
     AVFormatContext *s;
     AVFormatContext *sub_ctx;
     TAMSDemuxContext c;
     TAMSFlow flow;
     TAMSStreamContext sc;
     TAMSSegmentContext segc;
-} RestampFixture;
+} PacketFixture;
 
-/* ====================================================================
- * tams_codec_lookup
- * ==================================================================== */
+typedef struct URLFixture {
+    AVFormatContext *s;
+    TAMSDemuxContext c;
+    TAMSFlow flow;
+    TAMSSegmentContext segc;
+} URLFixture;
 
-static int test_codec_lookup(void)
+static int url_fixture_init(URLFixture *f, const char *url, const char *flow_tr,
+                            const char *status, const char *url_tr)
 {
-    if (ff_tams_codec_from_mime("video/h264") != AV_CODEC_ID_H264)
-        FAIL("codec_lookup: video/h264 wrong");
-    if (ff_tams_codec_from_mime("audio/aac") != AV_CODEC_ID_AAC)
-        FAIL("codec_lookup: audio/aac wrong");
-    if (ff_tams_codec_from_mime("audio/mp2") != AV_CODEC_ID_MP2)
-        FAIL("codec_lookup: audio/mp2 wrong");
-    if (ff_tams_codec_from_mime("video/mp2t") != AV_CODEC_ID_NONE)
-        FAIL("codec_lookup: unknown mime should return AV_CODEC_ID_NONE");
+    memset(f, 0, sizeof(*f));
 
-    printf("OK: codec_lookup\n");
+    f->s = avformat_alloc_context();
+    if (!f->s || !(f->s->url = av_strdup(url)))
+        return AVERROR(ENOMEM);
+
+    av_strlcpy(f->flow.id, "abc", sizeof(f->flow.id));
+    av_strlcpy(f->flow.status, status, sizeof(f->flow.status));
+    if (ff_tams_timerange_from_str(flow_tr, &f->flow.timerange) < 0)
+        return AVERROR(EINVAL);
+
+    if (url_tr) {
+        if (ff_tams_timerange_from_str(url_tr, &f->c.url_tr) < 0)
+            return AVERROR(EINVAL);
+        f->c.has_url_tr = 1;
+    }
+
+    f->c.flows      = &f->flow;
+    f->c.nb_flows   = 1;
+    f->s->priv_data = &f->c;
     return 0;
 }
 
-/* ====================================================================
- * tams_same_host
- * ==================================================================== */
-
-static int test_same_host(void)
+static void url_fixture_free(URLFixture *f)
 {
-    if (!ff_tams_same_host("http://example.com/flows/1",
-                        "http://example.com/flows/1/segments"))
-        FAIL("same_host: identical hosts should match");
-    if (!ff_tams_same_host("http://EXAMPLE.com/a", "http://example.com/b"))
-        FAIL("same_host: host comparison should be case-insensitive");
-    if (ff_tams_same_host("http://example.com/a", "http://other.com/b"))
-        FAIL("same_host: different hosts should not match");
-
-    printf("OK: same_host\n");
-    return 0;
+    f->s->priv_data = NULL;
+    avformat_free_context(f->s);
 }
 
 /* ====================================================================
- * tams_segment_duration_us
+ * Basic utility tests
  * ==================================================================== */
 
 static int test_segment_duration_us(void)
@@ -114,10 +117,6 @@ static int test_segment_duration_us(void)
     return 0;
 }
 
-/* ====================================================================
- * tams_find_flow_by_id
- * ==================================================================== */
-
 static int test_find_flow_by_id(void)
 {
     TAMSDemuxContext c;
@@ -140,7 +139,7 @@ static int test_find_flow_by_id(void)
 }
 
 /* ====================================================================
- * tams_check_live / tams_check_live_expired
+ * Live status utility tests
  * ==================================================================== */
 
 static int test_check_live_recent(void)
@@ -150,11 +149,12 @@ static int test_check_live_recent(void)
     TAMSFlow flow;
 
     memset(&c, 0, sizeof(c));
-    c.live_threshold = -1; /* auto: 2 x segment_duration */
-    c.live_timeout   = -1; /* auto: 4 x segment_duration */
+    c.live_threshold_s = -1; /* auto: 2 x segment_duration */
+    c.live_timeout_s   = -1; /* auto: 4 x segment_duration */
 
     memset(&flow, 0, sizeof(flow));
     flow.segment_duration = (AVRational){1, 1}; /* 1s -> threshold 2s, timeout 4s */
+    /* an ISO 8601 date-time; "now" is also accepted by av_parse_time() */
     av_strlcpy(flow.segments_updated, "now", sizeof(flow.segments_updated));
 
     if (!tams_check_live(&c, &flow))
@@ -173,8 +173,8 @@ static int test_check_live_stale(void)
     TAMSFlow flow;
 
     memset(&c, 0, sizeof(c));
-    c.live_threshold = -1;
-    c.live_timeout   = -1;
+    c.live_threshold_s = -1;
+    c.live_timeout_s   = -1;
 
     memset(&flow, 0, sizeof(flow));
     flow.segment_duration = (AVRational){1, 1};
@@ -210,39 +210,64 @@ static int test_check_live_no_segments_updated(void)
 static int test_check_live_status(void)
 {
     TAMSDemuxContext c;
-    TAMSSegmentContext segc = { 0 };
     TAMSFlow flow;
 
     memset(&c, 0, sizeof(c));
-    c.live_threshold = -1;
-    c.live_timeout   = -1;
+    c.live_threshold_s = -1;
+    c.live_timeout_s   = -1;
 
     /* status wins over a missing/stale segments_updated */
-    memset(&flow, 0, sizeof(flow));
+    memset(&flow, 0, sizeof(flow)); /* segments_updated left empty */
     av_strlcpy(flow.status, "ingesting", sizeof(flow.status));
     if (!tams_check_live(&c, &flow))
         FAIL("check_live_status: an ingesting flow should be live");
 
+    /* an ISO 8601 date-time; "now" is also accepted by av_parse_time() */
     av_strlcpy(flow.segments_updated, "now", sizeof(flow.segments_updated));
     av_strlcpy(flow.status, "closed_complete", sizeof(flow.status));
     if (tams_check_live(&c, &flow))
         FAIL("check_live_status: a closed_complete flow should not be live");
 
-    /* a stale segments_updated is not expired while this reader keeps
-     * seeing new segments */
-    flow.segment_duration = (AVRational){1, 1};
-    av_strlcpy(flow.segments_updated, "2000-01-01T00:00:00Z", sizeof(flow.segments_updated));
-    segc.last_new_seg_us = av_gettime();
-    if (tams_check_live_expired(&c, &segc, &flow))
-        FAIL("check_live_status: recently seen segments should not be expired");
-
     printf("OK: check_live_status\n");
     return 0;
 }
 
-/* ====================================================================
- * tams_get_poll_init / tams_get_min_buffer_ns
- * ==================================================================== */
+/*
+ * The Flow (and so segments_updated) is only re-fetched when a live reader
+ * reaches the live edge, never while segments keep arriving, so by then the
+ * copy held can be long out of date. Expiry must therefore also count this
+ * reader's own last sight of new segments (last_new_seg_us), otherwise the
+ * first empty poll would end a Flow that is still being written.
+ */
+static int test_check_live_expiry_uses_reader_activity(void)
+{
+    TAMSDemuxContext c;
+    TAMSSegmentContext segc = { 0 };
+    TAMSFlow flow;
+
+    memset(&c, 0, sizeof(c));
+    c.live_threshold_s = -1;
+    c.live_timeout_s   = -1; /* auto: 4 x segment_duration */
+
+    memset(&flow, 0, sizeof(flow));
+    flow.segment_duration = (AVRational){1, 1}; /* 1s -> timeout 4s */
+    /* segments_updated alone is decades past the timeout */
+    av_strlcpy(flow.segments_updated, "2000-01-01T00:00:00Z", sizeof(flow.segments_updated));
+
+    /* ... but this reader saw new segments just now: not expired */
+    segc.last_new_seg_us = av_gettime();
+    if (tams_check_live_expired(&c, &segc, &flow))
+        FAIL("check_live_expiry_uses_reader_activity: recently seen segments should not be expired");
+
+    /* ... and once the reader has also seen nothing for longer than the
+     * timeout (5s > 4s), the Flow is expired */
+    segc.last_new_seg_us = av_gettime() - 5000000;
+    if (!tams_check_live_expired(&c, &segc, &flow))
+        FAIL("check_live_expiry_uses_reader_activity: no new segments for 5s should be expired");
+
+    printf("OK: check_live_expiry_uses_reader_activity\n");
+    return 0;
+}
 
 static int test_get_poll_init(void)
 {
@@ -253,17 +278,21 @@ static int test_get_poll_init(void)
     flow.segment_duration = (AVRational){2, 1}; /* 2s -> 2000000us */
 
     memset(&c, 0, sizeof(c));
-    c.seg_poll_init = -1; /* auto */
-    if (tams_get_poll_init(&c, &flow) != 2000000)
+    c.seg_poll_init_us = -1; /* auto */
+    if (tams_get_poll_init_us(&c, &flow) != 2000000)
         FAIL("get_poll_init: auto should equal segment_duration_us");
 
-    c.seg_poll_init = 12345;
-    if (tams_get_poll_init(&c, &flow) != 12345)
+    c.seg_poll_init_us = 12345;
+    if (tams_get_poll_init_us(&c, &flow) != 12345)
         FAIL("get_poll_init: explicit value should be used as-is");
 
     printf("OK: get_poll_init\n");
     return 0;
 }
+
+/* ====================================================================
+ * Buffer utility tests
+ * ==================================================================== */
 
 static int test_get_min_buffer_ns(void)
 {
@@ -274,21 +303,17 @@ static int test_get_min_buffer_ns(void)
     flow.segment_duration = (AVRational){2, 1}; /* 2s -> 3 x 2s = 6s auto buffer */
 
     memset(&c, 0, sizeof(c));
-    c.min_segment_buffer = -1; /* auto */
+    c.min_segment_buffer_s = -1; /* auto */
     if (tams_get_min_buffer_ns(&c, &flow) != INT64_C(6000000000))
         FAIL("get_min_buffer_ns: auto should be 3 x segment_duration");
 
-    c.min_segment_buffer = 10; /* seconds */
+    c.min_segment_buffer_s = 10; /* seconds */
     if (tams_get_min_buffer_ns(&c, &flow) != INT64_C(10000000000))
         FAIL("get_min_buffer_ns: explicit seconds should convert to ns");
 
     printf("OK: get_min_buffer_ns\n");
     return 0;
 }
-
-/* ====================================================================
- * tams_buffered_ns
- * ==================================================================== */
 
 static int test_buffered_ns(void)
 {
@@ -325,7 +350,7 @@ static int test_buffered_ns(void)
 }
 
 /* ====================================================================
- * tams_compact_segments
+ * Segment tests
  * ==================================================================== */
 
 static int test_compact_segments(void)
@@ -336,8 +361,7 @@ static int test_compact_segments(void)
     if (!segs)
         FAIL("compact_segments: alloc failed");
     for (int i = 0; i < 4; i++)
-        av_strlcpy(segs[i].object_id, i == 0 ? "seg0" : i == 1 ? "seg1" :
-                   i == 2 ? "seg2" : "seg3", sizeof(segs[i].object_id));
+        snprintf(segs[i].object_id, sizeof(segs[i].object_id), "seg%d", i);
 
     memset(&segc, 0, sizeof(segc));
     segc.flow_segments          = segs;
@@ -385,7 +409,7 @@ static int test_compact_segments_all_consumed(void)
 }
 
 /* ====================================================================
- * tams_build_base_url / tams_build_clean_query / tams_resolve_relative_url
+ * URL utility tests
  * ==================================================================== */
 
 static int test_build_base_url(void)
@@ -399,8 +423,8 @@ static int test_build_base_url(void)
     if (strcmp(base, "http://host/flows"))
         FAIL("build_base_url: expected 'http://host/flows', got '%s'", base);
 
-    /* /flows?source_id=...: already at the collection endpoint, special-
-     * cased to keep the "/flows" suffix rather than stripping it */
+    /* /flows?source_id=...: already at the collection endpoint,
+    * does not strip the last path segment */
     if (ff_tams_get_base_url("http://host/flows?source_id=x", base, sizeof(base), NULL) < 0)
         FAIL("build_base_url: call failed (flows list)");
     if (strcmp(base, "http://host/flows"))
@@ -431,28 +455,175 @@ static int test_build_clean_query(void)
     return 0;
 }
 
-static int test_resolve_relative_url(void)
+/*
+ * The first segments request is limited to the Flow's timerange. Later
+ * pages start at the cursor and keep the end where reading stops. A local
+ * file takes no query string.
+ */
+static int test_build_segments_url(void)
 {
-    char out[2048];
+    static const struct {
+        const char *url, *flow_tr, *url_tr;
+        int was_live, is_local;
+        int64_t cursor_ns; /* < 0: first request */
+        const char *expected;
+    } cases[] = {
+        { "http://host/flows/abc", "[5:0_)",     NULL, 0, 0, -1,
+          "http://host/flows/abc/segments?timerange=[5:0_)" },
+        { "http://host/flows/abc", "[5:0_10:0)", NULL, 0, 0, -1,
+          "http://host/flows/abc/segments?timerange=[5:0_10:0)" },
+        { "http://host/flows/abc", "_",          NULL, 0, 0, -1,
+          "http://host/flows/abc/segments" },
+        { "http://host/flows/abc", "[5:0_10:0)", NULL, 0, 0, INT64_C(7000000000),
+          "http://host/flows/abc/segments?timerange=[7:0_10:0)" },
+        { "http://host/flows/abc", "[5:0_10:0)", NULL, 1, 0, INT64_C(7000000000),
+          "http://host/flows/abc/segments?timerange=[7:0_)" },
+        { "http://host/flows/abc", "[5:0_10:0)", "[0:0_9:0)", 1, 0, INT64_C(7000000000),
+          "http://host/flows/abc/segments?timerange=[7:0_9:0)" },
+        { "samples/flows/abc.json", "[5:0_10:0)", NULL, 0, 1, -1,
+          "samples/flows/abc/segments" },
+    };
 
-    if (tams_resolve_relative_url("http://host/flows/abc/segments", "obj-1.ts",
-                                  out, sizeof(out)) < 0)
-        FAIL("resolve_relative_url: call failed (simple)");
-    if (strcmp(out, "http://host/flows/abc/obj-1.ts"))
-        FAIL("resolve_relative_url: expected 'http://host/flows/abc/obj-1.ts', got '%s'", out);
+    for (int i = 0; i < FF_ARRAY_ELEMS(cases); i++) {
+        URLFixture f;
+        char out[4096];
 
-    if (tams_resolve_relative_url("http://host/flows/abc/segments", "../other/obj-1.ts",
-                                  out, sizeof(out)) < 0)
-        FAIL("resolve_relative_url: call failed (..)");
-    if (strcmp(out, "http://host/flows/other/obj-1.ts"))
-        FAIL("resolve_relative_url: expected '.. ' resolution, got '%s'", out);
+        if (url_fixture_init(&f, cases[i].url, cases[i].flow_tr, "", cases[i].url_tr) < 0)
+            FAIL("build_segments_url: fixture init failed (case %d)", i);
 
-    printf("OK: resolve_relative_url\n");
+        f.c.is_local     = cases[i].is_local;
+        f.segc.was_live  = cases[i].was_live;
+        if (cases[i].cursor_ns >= 0) {
+            f.segc.has_fetch_cursor = 1;
+            f.segc.fetch_cursor_ns  = cases[i].cursor_ns;
+        }
+        tams_build_segments_url(f.s, &f.flow, &f.segc, out, sizeof(out));
+        url_fixture_free(&f);
+
+        if (strcmp(out, cases[i].expected))
+            FAIL("build_segments_url: case %d: expected '%s', got '%s'", i, cases[i].expected, out);
+    }
+
+    printf("OK: build_segments_url\n");
     return 0;
 }
 
 /* ====================================================================
- * tams_probe
+ * Timerange tests
+ * ==================================================================== */
+
+/*
+ * The Flow's timerange is intersected with the URL timerange. With no
+ * overlap it is never, unless the Flow is live and may still reach the URL
+ * timerange: after its end, or with no segments yet ("()").
+ */
+static int test_apply_url_timerange(void)
+{
+    static const struct {
+        const char *flow_tr, *status, *url_tr, *expected;
+    } cases[] = {
+        { "[0:0_10:0)",  "closed_complete", "[5:0_20:0)",  "[5:0_10:0)"  }, /* overlap */
+        { "[0:0_10:0)",  "closed_complete", "[20:0_30:0)", "()"          }, /* after the end */
+        { "[0:0_10:0)",  "ingesting",       "[20:0_30:0)", "[20:0_30:0)" }, /* live: wait */
+        { "[0:0_10:0)",  "ingesting",       "[10:0_20:0)", "[10:0_20:0)" }, /* live: from the end */
+        { "[10:0_20:0)", "ingesting",       "[0:0_5:0)",   "()"          }, /* live, before the start */
+        { "()",          "ingesting",       "[20:0_30:0)", "[20:0_30:0)" }, /* live, no segments yet */
+        { "()",          "closed_complete", "[20:0_30:0)", "()"          }, /* nothing to read */
+        { "[0:0_10:0)",  "closed_complete", NULL,          "[0:0_10:0)"  }, /* no URL timerange */
+    };
+
+    for (int i = 0; i < FF_ARRAY_ELEMS(cases); i++) {
+        URLFixture f;
+        char out[128];
+
+        if (url_fixture_init(&f, "http://host/flows/abc", cases[i].flow_tr,
+                             cases[i].status, cases[i].url_tr) < 0)
+            FAIL("apply_url_timerange: fixture init failed (case %d)", i);
+
+        tams_apply_url_timerange(f.s, &f.flow);
+        ff_tams_timerange_to_str(&f.flow.timerange, out, sizeof(out));
+        url_fixture_free(&f);
+
+        if (strcmp(out, cases[i].expected))
+            FAIL("apply_url_timerange: %s %s with %s: expected %s, got %s",
+                 cases[i].flow_tr, cases[i].status,
+                 cases[i].url_tr ? cases[i].url_tr : "no URL timerange",
+                 cases[i].expected, out);
+    }
+
+    printf("OK: apply_url_timerange\n");
+    return 0;
+}
+
+/*
+ * A non-live Flow stops at its own (already intersected) end. A live Flow's
+ * end is only how far it has been written, so only a URL timerange end counts.
+ */
+static int test_get_final_end(void)
+{
+    static const struct {
+        const char *flow_tr, *url_tr;
+        int was_live, found;
+        int64_t end_ns;
+        int end_inclusive;
+    } cases[] = {
+        { "[0:0_10:0)", NULL,        0, 1, INT64_C(10000000000), 0 },
+        { "[0:0_)",     NULL,        0, 0, 0,                    0 },
+        { "[0:0_10:0)", NULL,        1, 0, 0,                    0 },
+        { "[0:0_10:0)", "[0:0_5:0]", 1, 1, INT64_C(5000000000),  1 },
+        { "[0:0_10:0)", "[5:0_)",    1, 0, 0,                    0 },
+    };
+
+    for (int i = 0; i < FF_ARRAY_ELEMS(cases); i++) {
+        URLFixture f;
+        int64_t end_ns = 0;
+        int end_inclusive = 0, found;
+
+        if (url_fixture_init(&f, "http://host/flows/abc", cases[i].flow_tr,
+                             "", cases[i].url_tr) < 0)
+            FAIL("get_final_end: fixture init failed (case %d)", i);
+
+        f.segc.was_live = cases[i].was_live;
+        found = tams_get_final_end(&f.c, &f.segc, &f.flow, &end_ns, &end_inclusive);
+        url_fixture_free(&f);
+
+        if (found != cases[i].found)
+            FAIL("get_final_end: case %d: expected found=%d, got %d", i, cases[i].found, found);
+        if (found && (end_ns != cases[i].end_ns || end_inclusive != cases[i].end_inclusive))
+            FAIL("get_final_end: case %d: expected %"PRId64" inclusive=%d, got %"PRId64" inclusive=%d",
+                 i, cases[i].end_ns, cases[i].end_inclusive, end_ns, end_inclusive);
+    }
+
+    printf("OK: get_final_end\n");
+    return 0;
+}
+
+
+/* A local file holds all the segments, so there is no next page to request. */
+static int test_fetch_segments_local_single_page(void)
+{
+    URLFixture f;
+    int ret;
+
+    if (url_fixture_init(&f, "samples/flows/abc.json", "[0:0_10:0)", "", NULL) < 0)
+        FAIL("fetch_segments_local_single_page: fixture init failed");
+
+    f.c.is_local            = 1;
+    f.segc.has_fetch_cursor = 1;
+    f.segc.fetch_cursor_ns  = INT64_C(5000000000);
+    ret = tams_fetch_segments(f.s, &f.segc);
+    url_fixture_free(&f);
+
+    if (ret != 0 || f.segc.nb_flow_segments != 0)
+        FAIL("fetch_segments_local_single_page: expected 0 and no segments, got %d and %d",
+             ret, f.segc.nb_flow_segments);
+
+    printf("OK: fetch_segments_local_single_page\n");
+    return 0;
+}
+
+/* ====================================================================
+ * Probe tests
  * ==================================================================== */
 
 static int test_probe_format_urn(void)
@@ -504,11 +675,15 @@ static int test_probe_rejects_non_json(void)
     return 0;
 }
 
-static int restamp_fixture_init(RestampFixture *f, int64_t flow_end_ns,
-                                 int64_t seg_start_ns, int seg_start_inclusive,
-                                 int64_t seg_end_ns, int seg_end_inclusive,
-                                 int64_t ts_offset,
-                                 TAMSFlowSegment *seg_out)
+/* ====================================================================
+ * Packet mapping/classification test helpers
+ * ==================================================================== */
+
+static int packet_fixture_init(PacketFixture *f, int64_t flow_end_ns,
+                               int64_t seg_start_ns, int seg_start_inclusive,
+                               int64_t seg_end_ns, int seg_end_inclusive,
+                               int64_t ts_offset,
+                               TAMSFlowSegment *seg_out)
 {
     AVStream *st, *sub_st;
 
@@ -540,8 +715,8 @@ static int restamp_fixture_init(RestampFixture *f, int64_t flow_end_ns,
 
     memset(&f->sc, 0, sizeof(f->sc));
     f->sc.flow_index = 0;
-    f->sc.next_pts   = AV_NOPTS_VALUE;
-    f->sc.prev_seg_end = AV_NOPTS_VALUE;
+    f->sc.next_pts_ns   = AV_NOPTS_VALUE;
+    f->sc.prev_seg_end_ns = AV_NOPTS_VALUE;
 
     memset(&f->segc, 0, sizeof(f->segc));
     f->segc.sub_ctx = f->sub_ctx;
@@ -559,7 +734,7 @@ static int restamp_fixture_init(RestampFixture *f, int64_t flow_end_ns,
     return 0;
 }
 
-static void restamp_fixture_free(RestampFixture *f)
+static void packet_fixture_free(PacketFixture *f)
 {
     f->s->priv_data = NULL;
     avformat_free_context(f->s);
@@ -578,237 +753,347 @@ static AVPacket *make_test_packet(int64_t pts, int64_t dts, int64_t duration)
     return pkt;
 }
 
-static int test_restamp_ok(void)
+/* ====================================================================
+ * Packet timestamp mapping tests
+ * ==================================================================== */
+
+/*
+ * Setup: Flow [0,10s). Segment [0,5s) with ts_offset 0.
+ * The segment timebase is 1/1000. The packet is at 1s with a 40ms duration.
+ * Expected: pts and dts are 1s in ns. The duration is 40ms in ns.
+ * The stream index is the output stream. current_ts_ns is the packet pts.
+ */
+static int test_map_packet_timestamps_ok(void)
 {
-    RestampFixture f;
+    PacketFixture f;
     TAMSFlowSegment seg;
     AVPacket *pkt;
-    int ret;
 
-    /* flow [0,10s), segment [0,5s), no ts_offset */
-    if (restamp_fixture_init(&f, INT64_C(10000000000), 0, 1,
-                             INT64_C(5000000000), 0, 0, &seg) < 0)
-        FAIL("restamp_ok: fixture init failed");
+    /* flow [0,10s), segment [0,5s), ts_offset 0; segment timebase is 1/1000 */
+    if (packet_fixture_init(&f, INT64_C(10000000000), 0, 1,
+                            INT64_C(5000000000), 0, 0, &seg) < 0)
+        FAIL("map_packet_timestamps_ok: fixture init failed");
 
     pkt = make_test_packet(1000, 1000, 40); /* 1s pts/dts, 40ms duration */
-    if (!pkt) { restamp_fixture_free(&f); FAIL("restamp_ok: alloc packet failed"); }
+    if (!pkt) { packet_fixture_free(&f); FAIL("map_packet_timestamps_ok: alloc packet failed"); }
 
-    ret = tams_restamp_packet(f.s, &f.segc, &seg, &f.sc, 0, pkt);
+    tams_map_packet_timestamps(f.s, &f.segc, &seg, &f.sc, 0, pkt);
 
-    if (ret != TAMS_PKT_OK)
-        FAIL("restamp_ok: expected TAMS_PKT_OK, got %d", ret);
-    if (pkt->pts != INT64_C(1000000000))
-        FAIL("restamp_ok: wrong pts: %"PRId64, pkt->pts);
+    if (pkt->pts != INT64_C(1000000000) || pkt->dts != INT64_C(1000000000))
+        FAIL("map_packet_timestamps_ok: wrong pts/dts: %"PRId64"/%"PRId64, pkt->pts, pkt->dts);
     if (pkt->duration != INT64_C(40000000))
-        FAIL("restamp_ok: wrong duration: %"PRId64, pkt->duration);
+        FAIL("map_packet_timestamps_ok: wrong duration: %"PRId64, pkt->duration);
     if (pkt->stream_index != 0)
-        FAIL("restamp_ok: wrong stream_index: %d", pkt->stream_index);
-    if (f.sc.current_ts != pkt->pts)
-        FAIL("restamp_ok: current_ts not updated");
-    if (f.sc.next_pts != pkt->pts + pkt->duration)
-        FAIL("restamp_ok: next_pts not updated");
+        FAIL("map_packet_timestamps_ok: wrong stream_index: %d", pkt->stream_index);
+    if (f.sc.current_ts_ns != pkt->pts)
+        FAIL("map_packet_timestamps_ok: current_ts_ns not updated");
 
     av_packet_free(&pkt);
-    restamp_fixture_free(&f);
-    printf("OK: restamp_ok\n");
+    packet_fixture_free(&f);
+    printf("OK: map_packet_timestamps_ok\n");
     return 0;
 }
 
-static int test_restamp_offset_cached_once(void)
+/*
+ * Setup: Flow starting at 1000s. Segment [1005s,1010s) with ts_offset 1005s.
+ * Packets are at container pts 0 and 1s.
+ * Expected: they map to 5s and 6s on the Flow timeline.
+ * The mapping is pts + ts_offset - flow_start.
+ */
+static int test_map_packet_timestamps_ts_offset_and_flow_start(void)
 {
-    RestampFixture f;
+    PacketFixture f;
     TAMSFlowSegment seg;
     AVPacket *pkt;
-    int ret;
 
-    if (restamp_fixture_init(&f, INT64_C(10000000000), 0, 1,
-                             INT64_C(5000000000), 0, 0, &seg) < 0)
-        FAIL("restamp_offset_cached_once: fixture init failed");
+    if (packet_fixture_init(&f, INT64_C(1010000000000), INT64_C(1005000000000), 1,
+                            INT64_C(1010000000000), 0, INT64_C(1005000000000), &seg) < 0)
+        FAIL("map_packet_timestamps_ts_offset_and_flow_start: fixture init failed");
+    f.flow.timerange.start = INT64_C(1000000000000);
 
-    pkt = make_test_packet(0, 0, 0);
-    ret = tams_restamp_packet(f.s, &f.segc, &seg, &f.sc, 0, pkt);
-    if (ret != TAMS_PKT_OK || pkt->pts != 0)
-        FAIL("restamp_offset_cached_once: first packet unexpected result ret=%d pts=%"PRId64,
-             ret, pkt->pts);
+    pkt = make_test_packet(0, 0, 40);
+    tams_map_packet_timestamps(f.s, &f.segc, &seg, &f.sc, 0, pkt);
+    if (pkt->pts != INT64_C(5000000000) || pkt->dts != INT64_C(5000000000))
+        FAIL("map_packet_timestamps_ts_offset_and_flow_start: pts/dts=%"PRId64"/%"PRId64,
+             pkt->pts, pkt->dts);
     av_packet_free(&pkt);
 
-    if (!f.segc.cur_pts_offset_set || f.segc.cur_pts_offset != 0)
-        FAIL("restamp_offset_cached_once: offset should be cached as 0");
+    pkt = make_test_packet(1000, 1000, 40);
+    tams_map_packet_timestamps(f.s, &f.segc, &seg, &f.sc, 0, pkt);
+    if (pkt->pts != INT64_C(6000000000))
+        FAIL("map_packet_timestamps_ts_offset_and_flow_start: second pts=%"PRId64, pkt->pts);
+
+    av_packet_free(&pkt);
+    packet_fixture_free(&f);
+    printf("OK: map_packet_timestamps_ts_offset_and_flow_start\n");
+    return 0;
+}
+
+/*
+ * Setup: Flow [0,10s). Segment [0,5s) with ts_offset 0.
+ * A first packet is mapped at 0. The segment's ts_offset is then changed.
+ * A second packet is at 500ms.
+ * Expected: the offset is cached from the first packet.
+ * The second packet maps to 500ms. The changed ts_offset is ignored.
+ */
+static int test_map_packet_timestamps_offset_cached_once(void)
+{
+    PacketFixture f;
+    TAMSFlowSegment seg;
+    AVPacket *pkt;
+
+    if (packet_fixture_init(&f, INT64_C(10000000000), 0, 1,
+                            INT64_C(5000000000), 0, 0, &seg) < 0)
+        FAIL("map_packet_timestamps_offset_cached_once: fixture init failed");
+
+    pkt = make_test_packet(0, 0, 0);
+    tams_map_packet_timestamps(f.s, &f.segc, &seg, &f.sc, 0, pkt);
+    if (pkt->pts != 0)
+        FAIL("map_packet_timestamps_offset_cached_once: first packet pts=%"PRId64, pkt->pts);
+    av_packet_free(&pkt);
+
+    if (!f.segc.cur_pts_offset_set || f.segc.cur_pts_offset_ns != 0)
+        FAIL("map_packet_timestamps_offset_cached_once: offset should be cached as 0");
 
     /* mutate the segment's ts_offset as if a later packet carried a
      * different value; the cached offset must NOT change mid-segment */
     seg.ts_offset = INT64_C(999000000000);
 
     pkt = make_test_packet(500, 500, 0); /* 500ms in */
-    ret = tams_restamp_packet(f.s, &f.segc, &seg, &f.sc, 0, pkt);
-    if (ret != TAMS_PKT_OK)
-        FAIL("restamp_offset_cached_once: second packet unexpected ret %d", ret);
+    tams_map_packet_timestamps(f.s, &f.segc, &seg, &f.sc, 0, pkt);
     if (pkt->pts != INT64_C(500000000))
-        FAIL("restamp_offset_cached_once: cached offset was not honoured, pts=%"PRId64,
+        FAIL("map_packet_timestamps_offset_cached_once: cached offset was not honoured, pts=%"PRId64,
              pkt->pts);
 
     av_packet_free(&pkt);
-    restamp_fixture_free(&f);
-    printf("OK: restamp_offset_cached_once\n");
+    packet_fixture_free(&f);
+    printf("OK: map_packet_timestamps_offset_cached_once\n");
     return 0;
 }
 
-static int test_restamp_discard_at_exclusive_segment_start(void)
+/*
+ * Setup: Segment [5s,10s) with no ts_offset.
+ * Its media timestamps start at 3600s. MPEG-TS often does this. Packets are at 3600s and 3601s.
+ * Expected: the offset is inferred from the first packet. The packets map to 5s and 6s.
+ */
+static int test_map_packet_timestamps_infer_missing_ts_offset(void)
 {
-    RestampFixture f;
+    PacketFixture f;
+    TAMSFlowSegment seg;
+    AVPacket *pkt;
+
+    /* segment [5s,10s) without ts_offset whose media starts at 3600s (as
+     * MPEG-TS often does): the offset is inferred from the first packet */
+    if (packet_fixture_init(&f, INT64_C(10000000000), INT64_C(5000000000), 1,
+                            INT64_C(10000000000), 0, 0, &seg) < 0)
+        FAIL("map_packet_timestamps_infer_ts_offset: fixture init failed");
+    seg.has_ts_offset = 0;
+
+    pkt = make_test_packet(3600000, 3600000, 40);
+    tams_map_packet_timestamps(f.s, &f.segc, &seg, &f.sc, 0, pkt);
+    if (pkt->pts != INT64_C(5000000000))
+        FAIL("map_packet_timestamps_infer_ts_offset: pts=%"PRId64, pkt->pts);
+    av_packet_free(&pkt);
+
+    pkt = make_test_packet(3601000, 3601000, 40);
+    tams_map_packet_timestamps(f.s, &f.segc, &seg, &f.sc, 0, pkt);
+    if (pkt->pts != INT64_C(6000000000))
+        FAIL("map_packet_timestamps_infer_ts_offset: second pts=%"PRId64, pkt->pts);
+
+    av_packet_free(&pkt);
+    packet_fixture_free(&f);
+    printf("OK: map_packet_timestamps_infer_missing_ts_offset\n");
+    return 0;
+}
+
+/* ====================================================================
+ * Packet classification tests
+ * ==================================================================== */
+
+/*
+ * Setup: Flow [0,10s). Segment [0,5s). The packet is at 1s with a 40ms duration.
+ * Expected: the packet is kept (TAMS_PKT_OK). next_pts_ns moves to the packet end.
+ */
+static int test_classify_packet_ok(void)
+{
+    PacketFixture f;
+    TAMSFlowSegment seg;
+    AVPacket *pkt;
+    int ret;
+
+    /* flow [0,10s), segment [0,5s) */
+    if (packet_fixture_init(&f, INT64_C(10000000000), 0, 1,
+                            INT64_C(5000000000), 0, 0, &seg) < 0)
+        FAIL("classify_packet_ok: fixture init failed");
+
+    pkt = make_test_packet(INT64_C(1000000000), INT64_C(1000000000), INT64_C(40000000));
+    ret = tams_classify_packet(f.s, &f.segc, &seg, &f.sc, pkt);
+
+    if (ret != TAMS_PKT_OK)
+        FAIL("classify_packet_ok: expected TAMS_PKT_OK, got %d", ret);
+    if (f.sc.next_pts_ns != pkt->pts + pkt->duration)
+        FAIL("classify_packet_ok: next_pts_ns not updated");
+
+    av_packet_free(&pkt);
+    packet_fixture_free(&f);
+    printf("OK: classify_packet_ok\n");
+    return 0;
+}
+
+/*
+ * Setup: Segment (0s,5s) with an exclusive start. The packet is at 0s.
+ * Expected: the packet is discarded (TAMS_PKT_DISCARD).
+ */
+static int test_classify_packet_discard_at_exclusive_segment_start(void)
+{
+    PacketFixture f;
     TAMSFlowSegment seg;
     AVPacket *pkt;
     int ret;
 
     /* exclusive segment start: pts exactly at the boundary must discard */
-    if (restamp_fixture_init(&f, INT64_C(10000000000), 0, 0,
-                             INT64_C(5000000000), 0, 0, &seg) < 0)
-        FAIL("restamp_discard_start: fixture init failed");
+    if (packet_fixture_init(&f, INT64_C(10000000000), 0, 0,
+                            INT64_C(5000000000), 0, 0, &seg) < 0)
+        FAIL("classify_packet_discard_start: fixture init failed");
 
     pkt = make_test_packet(0, 0, 0);
-    ret = tams_restamp_packet(f.s, &f.segc, &seg, &f.sc, 0, pkt);
+    ret = tams_classify_packet(f.s, &f.segc, &seg, &f.sc, pkt);
 
     if (ret != TAMS_PKT_DISCARD)
-        FAIL("restamp_discard_start: expected TAMS_PKT_DISCARD, got %d", ret);
+        FAIL("classify_packet_discard_start: expected TAMS_PKT_DISCARD, got %d", ret);
 
     av_packet_free(&pkt);
-    restamp_fixture_free(&f);
-    printf("OK: restamp_discard_at_exclusive_segment_start\n");
+    packet_fixture_free(&f);
+    printf("OK: classify_packet_discard_at_exclusive_segment_start\n");
     return 0;
 }
 
-static int test_restamp_eoseg(void)
+/*
+ * Setup: Segment [0,5s). The packet pts and dts are both 6s.
+ * Expected: the segment ends (TAMS_PKT_EOSEG).
+ */
+static int test_classify_packet_eoseg(void)
 {
-    RestampFixture f;
+    PacketFixture f;
     TAMSFlowSegment seg;
     AVPacket *pkt;
     int ret;
 
     /* segment [0,5s) exclusive end; both pts and dts past the end -> EOSEG */
-    if (restamp_fixture_init(&f, INT64_C(10000000000), 0, 1,
-                             INT64_C(5000000000), 0, 0, &seg) < 0)
-        FAIL("restamp_eoseg: fixture init failed");
+    if (packet_fixture_init(&f, INT64_C(10000000000), 0, 1,
+                            INT64_C(5000000000), 0, 0, &seg) < 0)
+        FAIL("classify_packet_eoseg: fixture init failed");
 
-    pkt = make_test_packet(6000, 6000, 0); /* 6s, past the 5s segment end */
-    ret = tams_restamp_packet(f.s, &f.segc, &seg, &f.sc, 0, pkt);
+    pkt = make_test_packet(INT64_C(6000000000), INT64_C(6000000000), 0); /* 6s, past the 5s segment end */
+    ret = tams_classify_packet(f.s, &f.segc, &seg, &f.sc, pkt);
 
     if (ret != TAMS_PKT_EOSEG)
-        FAIL("restamp_eoseg: expected TAMS_PKT_EOSEG, got %d", ret);
+        FAIL("classify_packet_eoseg: expected TAMS_PKT_EOSEG, got %d", ret);
 
     av_packet_free(&pkt);
-    restamp_fixture_free(&f);
-    printf("OK: restamp_eoseg\n");
+    packet_fixture_free(&f);
+    printf("OK: classify_packet_eoseg\n");
     return 0;
 }
 
-static int test_restamp_discard_still_needed_at_segment_end(void)
+/*
+ * Setup: Segment [0,5s). The packet pts is 6s and its dts is 4s. This is B-frame reordering.
+ * Expected: the packet is discarded (TAMS_PKT_DISCARD).
+ */
+static int test_classify_packet_discard_still_needed_at_segment_end(void)
 {
-    RestampFixture f;
+    PacketFixture f;
     TAMSFlowSegment seg;
     AVPacket *pkt;
     int ret;
 
     /* pts past segment end, but dts still within it (B-frame reordering):
      * must DISCARD, not EOSEG, so the decoder still gets the reference. */
-    if (restamp_fixture_init(&f, INT64_C(10000000000), 0, 1,
-                             INT64_C(5000000000), 0, 0, &seg) < 0)
-        FAIL("restamp_discard_seg_end: fixture init failed");
+    if (packet_fixture_init(&f, INT64_C(10000000000), 0, 1,
+                            INT64_C(5000000000), 0, 0, &seg) < 0)
+        FAIL("classify_packet_discard_seg_end: fixture init failed");
 
-    pkt = make_test_packet(6000, 4000, 0); /* pts=6s, dts=4s (< 5s seg end) */
-    ret = tams_restamp_packet(f.s, &f.segc, &seg, &f.sc, 0, pkt);
+    pkt = make_test_packet(INT64_C(6000000000), INT64_C(4000000000), 0); /* pts=6s, dts=4s (< 5s seg end) */
+    ret = tams_classify_packet(f.s, &f.segc, &seg, &f.sc, pkt);
 
     if (ret != TAMS_PKT_DISCARD)
-        FAIL("restamp_discard_seg_end: expected TAMS_PKT_DISCARD, got %d", ret);
+        FAIL("classify_packet_discard_seg_end: expected TAMS_PKT_DISCARD, got %d", ret);
 
     av_packet_free(&pkt);
-    restamp_fixture_free(&f);
-    printf("OK: restamp_discard_still_needed_at_segment_end\n");
+    packet_fixture_free(&f);
+    printf("OK: classify_packet_discard_still_needed_at_segment_end\n");
     return 0;
 }
 
-static int test_restamp_eof(void)
+/*
+ * Setup: Flow [0,10s). Segment [0,20s) extends past the Flow end. The packet pts and dts are both 11s.
+ * Expected: the stream ends (TAMS_PKT_EOF).
+ */
+static int test_classify_packet_eof(void)
 {
-    RestampFixture f;
+    PacketFixture f;
     TAMSFlowSegment seg;
     AVPacket *pkt;
     int ret;
 
     /* flow ends at 10s; segment end is unbounded within the flow window so
      * only the flow-end boundary is exercised here */
-    if (restamp_fixture_init(&f, INT64_C(10000000000), 0, 1,
-                             INT64_C(20000000000), 0, 0, &seg) < 0)
-        FAIL("restamp_eof: fixture init failed");
+    if (packet_fixture_init(&f, INT64_C(10000000000), 0, 1,
+                            INT64_C(20000000000), 0, 0, &seg) < 0)
+        FAIL("classify_packet_eof: fixture init failed");
 
-    pkt = make_test_packet(11000, 11000, 0); /* 11s: past flow end, dts too */
-    ret = tams_restamp_packet(f.s, &f.segc, &seg, &f.sc, 0, pkt);
+    pkt = make_test_packet(INT64_C(11000000000), INT64_C(11000000000), 0); /* 11s: past flow end, dts too */
+    ret = tams_classify_packet(f.s, &f.segc, &seg, &f.sc, pkt);
 
     if (ret != TAMS_PKT_EOF)
-        FAIL("restamp_eof: expected TAMS_PKT_EOF, got %d", ret);
+        FAIL("classify_packet_eof: expected TAMS_PKT_EOF, got %d", ret);
 
     av_packet_free(&pkt);
-    restamp_fixture_free(&f);
-    printf("OK: restamp_eof\n");
+    packet_fixture_free(&f);
+    printf("OK: classify_packet_eof\n");
     return 0;
 }
 
-static int test_restamp_discard_still_needed_at_flow_end(void)
+/*
+ * Setup: Flow [0,10s). Segment [0,20s). The packet pts is 11s and its dts is 9s.
+ * Expected: the packet is discarded (TAMS_PKT_DISCARD).
+ */
+static int test_classify_packet_discard_still_needed_at_flow_end(void)
 {
-    RestampFixture f;
+    PacketFixture f;
     TAMSFlowSegment seg;
     AVPacket *pkt;
     int ret;
 
     /* pts past flow end, but dts still within it: must DISCARD, not EOF */
-    if (restamp_fixture_init(&f, INT64_C(10000000000), 0, 1,
-                             INT64_C(20000000000), 0, 0, &seg) < 0)
-        FAIL("restamp_discard_flow_end: fixture init failed");
+    if (packet_fixture_init(&f, INT64_C(10000000000), 0, 1,
+                            INT64_C(20000000000), 0, 0, &seg) < 0)
+        FAIL("classify_packet_discard_flow_end: fixture init failed");
 
-    pkt = make_test_packet(11000, 9000, 0); /* pts=11s, dts=9s (< 10s flow end) */
-    ret = tams_restamp_packet(f.s, &f.segc, &seg, &f.sc, 0, pkt);
+    pkt = make_test_packet(INT64_C(11000000000), INT64_C(9000000000), 0); /* pts=11s, dts=9s (< 10s flow end) */
+    ret = tams_classify_packet(f.s, &f.segc, &seg, &f.sc, pkt);
 
     if (ret != TAMS_PKT_DISCARD)
-        FAIL("restamp_discard_flow_end: expected TAMS_PKT_DISCARD, got %d", ret);
+        FAIL("classify_packet_discard_flow_end: expected TAMS_PKT_DISCARD, got %d", ret);
 
     av_packet_free(&pkt);
-    restamp_fixture_free(&f);
-    printf("OK: restamp_discard_still_needed_at_flow_end\n");
+    packet_fixture_free(&f);
+    printf("OK: classify_packet_discard_still_needed_at_flow_end\n");
     return 0;
 }
 
-static int test_restamp_infer_missing_ts_offset(void)
+/*
+ * Setup: Segment [5s,10s). The stream delivered up to 4.96s before it.
+ * One packet is at 4.96s. It is new: it starts where the stream ended.
+ * Another is at 4.9s. The stream already delivered it.
+ * New packets before a segment start are normal. Audio after a keyframe
+ * cut is one cause. Open-GOP leading pictures are another.
+ * Expected: the packet at 4.96s is kept (TAMS_PKT_OK).
+ * The packet at 4.9s is discarded (TAMS_PKT_DISCARD).
+ */
+static int test_classify_packet_keep_continuation_before_segment_start(void)
 {
-    RestampFixture f;
-    TAMSFlowSegment seg;
-    AVPacket *pkt;
-    int ret;
-
-    /* segment [5s,10s) without ts_offset whose media starts at 3600s (as
-     * MPEG-TS often does): the offset is inferred from the first packet */
-    if (restamp_fixture_init(&f, INT64_C(10000000000), INT64_C(5000000000), 1,
-                             INT64_C(10000000000), 0, 0, &seg) < 0)
-        FAIL("restamp_infer_ts_offset: fixture init failed");
-    seg.has_ts_offset = 0;
-
-    pkt = make_test_packet(3600000, 3600000, 40);
-    ret = tams_restamp_packet(f.s, &f.segc, &seg, &f.sc, 0, pkt);
-    if (ret != TAMS_PKT_OK || pkt->pts != INT64_C(5000000000))
-        FAIL("restamp_infer_ts_offset: ret=%d pts=%"PRId64, ret, pkt->pts);
-    av_packet_free(&pkt);
-
-    pkt = make_test_packet(3601000, 3601000, 40);
-    ret = tams_restamp_packet(f.s, &f.segc, &seg, &f.sc, 0, pkt);
-    if (ret != TAMS_PKT_OK || pkt->pts != INT64_C(6000000000))
-        FAIL("restamp_infer_ts_offset: second ret=%d pts=%"PRId64, ret, pkt->pts);
-
-    av_packet_free(&pkt);
-    restamp_fixture_free(&f);
-    printf("OK: restamp_infer_missing_ts_offset\n");
-    return 0;
-}
-
-static int test_restamp_keep_continuation_before_segment_start(void)
-{
-    RestampFixture f;
+    PacketFixture f;
     TAMSFlowSegment seg;
     AVPacket *pkt;
     int ret;
@@ -816,27 +1101,27 @@ static int test_restamp_keep_continuation_before_segment_start(void)
     /* segment [5s,10s); before it this stream delivered up to 4.96s, so a
      * packet at 4.96s that landed in this segment (audio after a keyframe
      * cut, or an open-GOP leading picture) is kept */
-    if (restamp_fixture_init(&f, INT64_C(10000000000), INT64_C(5000000000), 1,
-                             INT64_C(10000000000), 0, 0, &seg) < 0)
-        FAIL("restamp_continuation: fixture init failed");
-    f.sc.prev_seg_end = INT64_C(4960000000);
-    f.sc.next_pts     = INT64_C(6000000000); /* a later keyframe came first */
+    if (packet_fixture_init(&f, INT64_C(10000000000), INT64_C(5000000000), 1,
+                            INT64_C(10000000000), 0, 0, &seg) < 0)
+        FAIL("classify_packet_continuation: fixture init failed");
+    f.sc.prev_seg_end_ns = INT64_C(4960000000);
+    f.sc.next_pts_ns     = INT64_C(6000000000); /* a later keyframe came first */
 
-    pkt = make_test_packet(4960, 4960, 20);
-    ret = tams_restamp_packet(f.s, &f.segc, &seg, &f.sc, 0, pkt);
+    pkt = make_test_packet(INT64_C(4960000000), INT64_C(4960000000), INT64_C(20000000));
+    ret = tams_classify_packet(f.s, &f.segc, &seg, &f.sc, pkt);
     if (ret != TAMS_PKT_OK)
-        FAIL("restamp_continuation: expected TAMS_PKT_OK, got %d", ret);
+        FAIL("classify_packet_continuation: expected TAMS_PKT_OK, got %d", ret);
     av_packet_free(&pkt);
 
     /* but a packet already covered by what was delivered is discarded */
-    pkt = make_test_packet(4900, 4900, 20);
-    ret = tams_restamp_packet(f.s, &f.segc, &seg, &f.sc, 0, pkt);
+    pkt = make_test_packet(INT64_C(4900000000), INT64_C(4900000000), INT64_C(20000000));
+    ret = tams_classify_packet(f.s, &f.segc, &seg, &f.sc, pkt);
     if (ret != TAMS_PKT_DISCARD)
-        FAIL("restamp_continuation: expected TAMS_PKT_DISCARD, got %d", ret);
+        FAIL("classify_packet_continuation: expected TAMS_PKT_DISCARD, got %d", ret);
 
     av_packet_free(&pkt);
-    restamp_fixture_free(&f);
-    printf("OK: restamp_keep_continuation_before_segment_start\n");
+    packet_fixture_free(&f);
+    printf("OK: classify_packet_keep_continuation_before_segment_start\n");
     return 0;
 }
 
@@ -848,8 +1133,6 @@ int main(int argc, char *argv[])
 {
     int ret = 0;
 
-    ret |= test_codec_lookup();
-    ret |= test_same_host();
     ret |= test_segment_duration_us();
     ret |= test_find_flow_by_id();
 
@@ -857,6 +1140,7 @@ int main(int argc, char *argv[])
     ret |= test_check_live_stale();
     ret |= test_check_live_no_segments_updated();
     ret |= test_check_live_status();
+    ret |= test_check_live_expiry_uses_reader_activity();
 
     ret |= test_get_poll_init();
     ret |= test_get_min_buffer_ns();
@@ -867,21 +1151,28 @@ int main(int argc, char *argv[])
 
     ret |= test_build_base_url();
     ret |= test_build_clean_query();
-    ret |= test_resolve_relative_url();
+
+    ret |= test_apply_url_timerange();
+    ret |= test_get_final_end();
+    ret |= test_build_segments_url();
+    ret |= test_fetch_segments_local_single_page();
 
     ret |= test_probe_format_urn();
     ret |= test_probe_fallback_keys();
     ret |= test_probe_rejects_non_json();
 
-    ret |= test_restamp_ok();
-    ret |= test_restamp_offset_cached_once();
-    ret |= test_restamp_discard_at_exclusive_segment_start();
-    ret |= test_restamp_eoseg();
-    ret |= test_restamp_discard_still_needed_at_segment_end();
-    ret |= test_restamp_eof();
-    ret |= test_restamp_discard_still_needed_at_flow_end();
-    ret |= test_restamp_infer_missing_ts_offset();
-    ret |= test_restamp_keep_continuation_before_segment_start();
+    ret |= test_map_packet_timestamps_ok();
+    ret |= test_map_packet_timestamps_ts_offset_and_flow_start();
+    ret |= test_map_packet_timestamps_offset_cached_once();
+    ret |= test_map_packet_timestamps_infer_missing_ts_offset();
+
+    ret |= test_classify_packet_ok();
+    ret |= test_classify_packet_discard_at_exclusive_segment_start();
+    ret |= test_classify_packet_eoseg();
+    ret |= test_classify_packet_discard_still_needed_at_segment_end();
+    ret |= test_classify_packet_eof();
+    ret |= test_classify_packet_discard_still_needed_at_flow_end();
+    ret |= test_classify_packet_keep_continuation_before_segment_start();
 
     if (ret)
         printf("\nSOME TESTS FAILED\n");
