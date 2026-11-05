@@ -160,11 +160,11 @@ typedef struct TAMSMuxContext {
 
 /*
  * Per-codec default raw elementary-stream muxer. Used when -container isn't
- * specified and the container has exactly one stream. Raw video and PCM are
- * absent: TAMS allows them without a container, but the ffmpeg TAMS demuxer
- * detects segment formats by probing rather than from the Flow's container,
- * and their raw forms have no header or sync bytes to probe. They fall
- * through to the mp4 (mov for raw video) fallback below.
+ * specified and the container has exactly one stream. Raw video and PCM have
+ * no raw elementary-stream entry: TAMS allows them without a container, but
+ * the ffmpeg TAMS demuxer detects segment formats by probing rather than from
+ * the Flow's container, and their raw forms have no header or sync bytes to
+ * probe. Raw video goes in Matroska, PCM falls through to the mp4 fallback.
  */
 static const struct {
     enum AVCodecID codec_id;
@@ -176,6 +176,7 @@ static const struct {
     { AV_CODEC_ID_VP9,        "ivf"        },
     { AV_CODEC_ID_AV1,        "obu"        },
     { AV_CODEC_ID_MPEG2VIDEO, "mpeg2video" },
+    { AV_CODEC_ID_RAWVIDEO,   "matroska"   },
     { AV_CODEC_ID_AAC,        "adts"       },
     { AV_CODEC_ID_OPUS,       "opus"       },
     { AV_CODEC_ID_MP2,        "mp2"        },
@@ -238,10 +239,7 @@ static int tams_resolve_oformat(AVFormatContext *s, TAMSContainerContext *cc)
         }
     }
 
-    /* mp4 cannot carry raw video, use mov instead */
-    oformat = av_guess_format(cc->nb_streams == 1 &&
-                              s->streams[cc->stream_indices[0]]->codecpar->codec_id == AV_CODEC_ID_RAWVIDEO
-                              ? "mov" : "mp4", NULL, NULL);
+    oformat = av_guess_format("mp4", NULL, NULL);
     if (!oformat) {
         av_log(s, AV_LOG_ERROR, "mp4 muxer not available for fragmented-MP4 fallback\n");
         return AVERROR_MUXER_NOT_FOUND;
