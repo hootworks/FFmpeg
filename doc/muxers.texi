@@ -3975,7 +3975,7 @@ Force the physical container format for every mapped container. Supported
 values are @code{mp4}, @code{mov}, @code{mpegts} and @code{matroska}, plus
 the codec-specific raw elementary-stream muxers (e.g. @code{h264}). By
 default, a single-stream container uses a raw elementary-stream muxer where
-one exists (Matroska for Vorbis, MOV for raw video), and anything else,
+one exists (Matroska for Vorbis and raw video), and anything else,
 including a multi-stream (multi-Flow) container, uses MP4.
 
 @item start_timestamp @var{timestamp}
