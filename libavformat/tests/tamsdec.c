@@ -142,7 +142,7 @@ static int test_find_flow_by_id(void)
  * Live status utility tests
  * ==================================================================== */
 
-static int test_check_live_recent(void)
+static int test_is_live_recent(void)
 {
     TAMSDemuxContext c;
     TAMSSegmentContext segc = { 0 };
@@ -158,15 +158,15 @@ static int test_check_live_recent(void)
     av_strlcpy(flow.segments_updated, "now", sizeof(flow.segments_updated));
 
     if (!tams_is_live(&c, &flow))
-        FAIL("check_live_recent: a just-updated flow should be live");
+        FAIL("is_live_recent: a just-updated flow should be live");
     if (tams_is_live_expired(&c, &segc, &flow))
-        FAIL("check_live_recent: a just-updated flow should not be expired");
+        FAIL("is_live_recent: a just-updated flow should not be expired");
 
-    printf("OK: check_live_recent\n");
+    printf("OK: is_live_recent\n");
     return 0;
 }
 
-static int test_check_live_stale(void)
+static int test_is_live_stale(void)
 {
     TAMSDemuxContext c;
     TAMSSegmentContext segc = { 0 };
@@ -181,15 +181,15 @@ static int test_check_live_stale(void)
     av_strlcpy(flow.segments_updated, "2000-01-01T00:00:00Z", sizeof(flow.segments_updated));
 
     if (tams_is_live(&c, &flow))
-        FAIL("check_live_stale: a long-stale flow should not be live");
+        FAIL("is_live_stale: a long-stale flow should not be live");
     if (!tams_is_live_expired(&c, &segc, &flow))
-        FAIL("check_live_stale: a long-stale flow should be expired");
+        FAIL("is_live_stale: a long-stale flow should be expired");
 
-    printf("OK: check_live_stale\n");
+    printf("OK: is_live_stale\n");
     return 0;
 }
 
-static int test_check_live_no_segments_updated(void)
+static int test_is_live_no_segments_updated(void)
 {
     TAMSDemuxContext c;
     TAMSSegmentContext segc = { 0 };
@@ -199,15 +199,15 @@ static int test_check_live_no_segments_updated(void)
     memset(&flow, 0, sizeof(flow)); /* segments_updated left empty */
 
     if (tams_is_live(&c, &flow))
-        FAIL("check_live_no_segments_updated: empty segments_updated should not be live");
+        FAIL("is_live_no_segments_updated: empty segments_updated should not be live");
     if (!tams_is_live_expired(&c, &segc, &flow))
-        FAIL("check_live_no_segments_updated: empty segments_updated should be treated as expired");
+        FAIL("is_live_no_segments_updated: empty segments_updated should be treated as expired");
 
-    printf("OK: check_live_no_segments_updated\n");
+    printf("OK: is_live_no_segments_updated\n");
     return 0;
 }
 
-static int test_check_live_status(void)
+static int test_is_live_status(void)
 {
     TAMSDemuxContext c;
     TAMSFlow flow;
@@ -220,15 +220,15 @@ static int test_check_live_status(void)
     memset(&flow, 0, sizeof(flow)); /* segments_updated left empty */
     av_strlcpy(flow.status, "ingesting", sizeof(flow.status));
     if (!tams_is_live(&c, &flow))
-        FAIL("check_live_status: an ingesting flow should be live");
+        FAIL("is_live_status: an ingesting flow should be live");
 
     /* an ISO 8601 date-time; "now" is also accepted by av_parse_time() */
     av_strlcpy(flow.segments_updated, "now", sizeof(flow.segments_updated));
     av_strlcpy(flow.status, "closed_complete", sizeof(flow.status));
     if (tams_is_live(&c, &flow))
-        FAIL("check_live_status: a closed_complete flow should not be live");
+        FAIL("is_live_status: a closed_complete flow should not be live");
 
-    printf("OK: check_live_status\n");
+    printf("OK: is_live_status\n");
     return 0;
 }
 
@@ -239,7 +239,7 @@ static int test_check_live_status(void)
  * reader's own last sight of new segments (last_new_seg_us), otherwise the
  * first empty poll would end a Flow that is still being written.
  */
-static int test_check_live_expiry_uses_reader_activity(void)
+static int test_is_live_expiry_uses_reader_activity(void)
 {
     TAMSDemuxContext c;
     TAMSSegmentContext segc = { 0 };
@@ -257,19 +257,19 @@ static int test_check_live_expiry_uses_reader_activity(void)
     /* ... but this reader saw new segments just now: not expired */
     segc.last_new_seg_us = av_gettime();
     if (tams_is_live_expired(&c, &segc, &flow))
-        FAIL("check_live_expiry_uses_reader_activity: recently seen segments should not be expired");
+        FAIL("is_live_expiry_uses_reader_activity: recently seen segments should not be expired");
 
     /* ... and once the reader has also seen nothing for longer than the
      * timeout (5s > 4s), the Flow is expired */
     segc.last_new_seg_us = av_gettime() - 5000000;
     if (!tams_is_live_expired(&c, &segc, &flow))
-        FAIL("check_live_expiry_uses_reader_activity: no new segments for 5s should be expired");
+        FAIL("is_live_expiry_uses_reader_activity: no new segments for 5s should be expired");
 
-    printf("OK: check_live_expiry_uses_reader_activity\n");
+    printf("OK: is_live_expiry_uses_reader_activity\n");
     return 0;
 }
 
-static int test_get_poll_init(void)
+static int test_poll_init_us(void)
 {
     TAMSDemuxContext c;
     TAMSFlow flow;
@@ -280,13 +280,13 @@ static int test_get_poll_init(void)
     memset(&c, 0, sizeof(c));
     c.seg_poll_init_us = -1; /* auto */
     if (tams_poll_init_us(&c, &flow) != 2000000)
-        FAIL("get_poll_init: auto should equal segment_duration_us");
+        FAIL("poll_init_us: auto should equal segment_duration_us");
 
     c.seg_poll_init_us = 12345;
     if (tams_poll_init_us(&c, &flow) != 12345)
-        FAIL("get_poll_init: explicit value should be used as-is");
+        FAIL("poll_init_us: explicit value should be used as-is");
 
-    printf("OK: get_poll_init\n");
+    printf("OK: poll_init_us\n");
     return 0;
 }
 
@@ -294,7 +294,7 @@ static int test_get_poll_init(void)
  * Buffer utility tests
  * ==================================================================== */
 
-static int test_get_min_buffer_ns(void)
+static int test_min_buffer_ns(void)
 {
     TAMSDemuxContext c;
     TAMSFlow flow;
@@ -305,13 +305,13 @@ static int test_get_min_buffer_ns(void)
     memset(&c, 0, sizeof(c));
     c.min_segment_buffer_s = -1; /* auto */
     if (tams_min_buffer_ns(&c, &flow) != INT64_C(6000000000))
-        FAIL("get_min_buffer_ns: auto should be 3 x segment_duration");
+        FAIL("min_buffer_ns: auto should be 3 x segment_duration");
 
     c.min_segment_buffer_s = 10; /* seconds */
     if (tams_min_buffer_ns(&c, &flow) != INT64_C(10000000000))
-        FAIL("get_min_buffer_ns: explicit seconds should convert to ns");
+        FAIL("min_buffer_ns: explicit seconds should convert to ns");
 
-    printf("OK: get_min_buffer_ns\n");
+    printf("OK: min_buffer_ns\n");
     return 0;
 }
 
@@ -559,7 +559,7 @@ static int test_apply_url_timerange(void)
  * A non-live Flow stops at its own (already intersected) end. A live Flow's
  * end is only how far it has been written, so only a URL timerange end counts.
  */
-static int test_get_final_end(void)
+static int test_final_end(void)
 {
     static const struct {
         const char *flow_tr, *url_tr;
@@ -581,20 +581,20 @@ static int test_get_final_end(void)
 
         if (url_fixture_init(&f, "http://host/flows/abc", cases[i].flow_tr,
                              "", cases[i].url_tr) < 0)
-            FAIL("get_final_end: fixture init failed (case %d)", i);
+            FAIL("final_end: fixture init failed (case %d)", i);
 
         f.segc.was_live = cases[i].was_live;
         found = tams_final_end(&f.c, &f.segc, &f.flow, &end_ns, &end_inclusive);
         url_fixture_free(&f);
 
         if (found != cases[i].found)
-            FAIL("get_final_end: case %d: expected found=%d, got %d", i, cases[i].found, found);
+            FAIL("final_end: case %d: expected found=%d, got %d", i, cases[i].found, found);
         if (found && (end_ns != cases[i].end_ns || end_inclusive != cases[i].end_inclusive))
-            FAIL("get_final_end: case %d: expected %"PRId64" inclusive=%d, got %"PRId64" inclusive=%d",
+            FAIL("final_end: case %d: expected %"PRId64" inclusive=%d, got %"PRId64" inclusive=%d",
                  i, cases[i].end_ns, cases[i].end_inclusive, end_ns, end_inclusive);
     }
 
-    printf("OK: get_final_end\n");
+    printf("OK: final_end\n");
     return 0;
 }
 
@@ -1136,14 +1136,14 @@ int main(int argc, char *argv[])
     ret |= test_segment_duration_us();
     ret |= test_find_flow_by_id();
 
-    ret |= test_check_live_recent();
-    ret |= test_check_live_stale();
-    ret |= test_check_live_no_segments_updated();
-    ret |= test_check_live_status();
-    ret |= test_check_live_expiry_uses_reader_activity();
+    ret |= test_is_live_recent();
+    ret |= test_is_live_stale();
+    ret |= test_is_live_no_segments_updated();
+    ret |= test_is_live_status();
+    ret |= test_is_live_expiry_uses_reader_activity();
 
-    ret |= test_get_poll_init();
-    ret |= test_get_min_buffer_ns();
+    ret |= test_poll_init_us();
+    ret |= test_min_buffer_ns();
     ret |= test_buffered_ns();
 
     ret |= test_compact_segments();
@@ -1153,7 +1153,7 @@ int main(int argc, char *argv[])
     ret |= test_build_clean_query();
 
     ret |= test_apply_url_timerange();
-    ret |= test_get_final_end();
+    ret |= test_final_end();
     ret |= test_build_segments_url();
     ret |= test_fetch_segments_local_single_page();
 
