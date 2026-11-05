@@ -1043,9 +1043,16 @@ static int tams_process_flow(AVFormatContext *s, int flow_index)
             !c->flows[sub_index].timerange.never)
             tams_refresh_flow(s, sub_index);
 
-        if (!c->flows[sub_index].timerange.has_start &&
-            !c->flows[sub_index].timerange.has_end &&
-            !c->flows[sub_index].timerange.never &&
+        /*
+         * A sub-flow without a container of its own has no segments of its
+         * own (a store reports its timerange as never "()"): its media is in
+         * the parent's segments, so it takes the parent's timerange. A
+         * sub-flow whose timerange is still unknown also takes the parent's.
+         */
+        if ((!c->flows[sub_index].container[0] ||
+             (!c->flows[sub_index].timerange.has_start &&
+              !c->flows[sub_index].timerange.has_end &&
+              !c->flows[sub_index].timerange.never)) &&
             flow->timerange.has_start) {
             c->flows[sub_index].timerange = flow->timerange;
         }
