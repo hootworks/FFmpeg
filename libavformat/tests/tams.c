@@ -235,7 +235,7 @@ const char *flow_json_audio_unc =
     "    \"id\": \"cccccccc-dddd-eeee-ffff-aaaaaaaaaaaa\","
     "    \"source_id\": \"11111111-2222-3333-4444-555555555555\","
     "    \"format\": \"urn:x-nmos:format:audio\","
-    "    \"codec\": \"audio/pcm\","
+    "    \"codec\": \"audio/x-raw-int\","
     "    \"essence_parameters\": {"
     "        \"sample_rate\": 96000,"
     "        \"channels\": 8,"
@@ -627,21 +627,21 @@ static int test_parse_iso8601(void)
     int64_t t;
 
     /* NULL and empty inputs must return 0 */
-    t = ff_tams_iso8601_from_str(NULL);
+    t = ff_tams_datetime_from_str(NULL);
     if (t != 0)
         FAIL("iso8601 NULL: expected 0, got %"PRId64, t);
 
-    t = ff_tams_iso8601_from_str("");
+    t = ff_tams_datetime_from_str("");
     if (t != 0)
         FAIL("iso8601 empty: expected 0, got %"PRId64, t);
 
     /* Invalid string must return 0 */
-    t = ff_tams_iso8601_from_str("not-a-date");
+    t = ff_tams_datetime_from_str("not-a-date");
     if (t != 0)
         FAIL("iso8601 invalid: expected 0, got %"PRId64, t);
 
     /* Valid UTC datetime must return a non-zero epoch microsecond value */
-    t = ff_tams_iso8601_from_str("2018-03-06T09:10:22Z");
+    t = ff_tams_datetime_from_str("2018-03-06T09:10:22Z");
     if (t == 0)
         FAIL("iso8601 2018-03-06T09:10:22Z: expected non-zero");
     /* Sanity-check: must be after 2010-01-01 (1262304000s) and before 2030-01-01 */
@@ -649,7 +649,7 @@ static int test_parse_iso8601(void)
         FAIL("iso8601 2018-03-06T09:10:22Z: value out of plausible range: %"PRId64, t);
 
     /* Second valid sample */
-    t = ff_tams_iso8601_from_str("2023-09-14T09:45:26Z");
+    t = ff_tams_datetime_from_str("2023-09-14T09:45:26Z");
     if (t == 0)
         FAIL("iso8601 2023-09-14T09:45:26Z: expected non-zero");
 
@@ -1292,12 +1292,12 @@ static int test_pixel_format_conversion(void)
 
 static int test_same_host(void)
 {
-    if (!ff_tams_same_host("http://example.com/flows/1",
-                           "http://example.com/flows/1/segments"))
+    if (!ff_tams_is_same_host("http://example.com/flows/1",
+                              "http://example.com/flows/1/segments"))
         FAIL("same_host: identical hosts should match");
-    if (!ff_tams_same_host("http://EXAMPLE.com/a", "http://example.com/b"))
+    if (!ff_tams_is_same_host("http://EXAMPLE.com/a", "http://example.com/b"))
         FAIL("same_host: host comparison should be case-insensitive");
-    if (ff_tams_same_host("http://example.com/a", "http://other.com/b"))
+    if (ff_tams_is_same_host("http://example.com/a", "http://other.com/b"))
         FAIL("same_host: different hosts should not match");
 
     printf("OK: same_host\n");

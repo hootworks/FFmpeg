@@ -45,7 +45,6 @@
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/pixfmt.h"
-#include "libavutil/samplefmt.h"
 #include "libavutil/time.h"
 
 #include "libavcodec/codec_par.h"
@@ -287,7 +286,7 @@ static int64_t tams_segment_duration_us(const TAMSFlow *flow)
     return 1000000;
 }
 
-static int64_t tams_get_poll_init_us(TAMSDemuxContext *c, const TAMSFlow *flow)
+static int64_t tams_poll_init_us(TAMSDemuxContext *c, const TAMSFlow *flow)
 {
     if (c->seg_poll_init_us >= 0)
         return c->seg_poll_init_us;
@@ -298,7 +297,7 @@ static int64_t tams_get_poll_init_us(TAMSDemuxContext *c, const TAMSFlow *flow)
  * Target nanoseconds of segments to pre-buffer ahead of the current position.
  * Defaults to 3 x segment_duration when min_segment_buffer is not set.
  */
-static int64_t tams_get_min_buffer_ns(TAMSDemuxContext *c, const TAMSFlow *flow)
+static int64_t tams_min_buffer_ns(TAMSDemuxContext *c, const TAMSFlow *flow)
 {
     if (c->min_segment_buffer_s >= 0)
         return c->min_segment_buffer_s * 1000000000LL;
@@ -320,7 +319,7 @@ static int64_t tams_buffered_ns(TAMSDemuxContext *c, const TAMSSegmentContext *s
     return total;
 }
 
-static int tams_check_live(TAMSDemuxContext *c, const TAMSFlow *flow)
+static int tams_is_live(TAMSDemuxContext *c, const TAMSFlow *flow)
 {
     int64_t seg_updated, age, threshold;
 
@@ -334,7 +333,7 @@ static int tams_check_live(TAMSDemuxContext *c, const TAMSFlow *flow)
      * Live if segments were added recently. A Flow without
      * segments_updated (no segments yet, or not given by the store) is not live.
      */
-    seg_updated = ff_tams_iso8601_from_str(flow->segments_updated);
+    seg_updated = ff_tams_datetime_from_str(flow->segments_updated);
     if (!seg_updated)
         return 0;
 
@@ -366,10 +365,10 @@ static int tams_check_live(TAMSDemuxContext *c, const TAMSFlow *flow)
  * the segments_updated can be outdated. Hence the usage of last_new_seg_us
  * which records the timestamp of the last new segment seen by this reader.
  */
-static int tams_check_live_expired(TAMSDemuxContext *c, const TAMSSegmentContext *segc,
-                                   const TAMSFlow *flow)
+static int tams_is_live_expired(TAMSDemuxContext *c, const TAMSSegmentContext *segc,
+                                const TAMSFlow *flow)
 {
-    int64_t last = ff_tams_iso8601_from_str(flow->segments_updated);
+    int64_t last = ff_tams_datetime_from_str(flow->segments_updated);
     int64_t base = tams_segment_duration_us(flow);
     int64_t timeout;
 
@@ -394,8 +393,8 @@ static int tams_check_live_expired(TAMSDemuxContext *c, const TAMSSegmentContext
  * end is only how far it has been written, so only the URL timerange's end
  * is used if specified. Returns 0 if there is no known end.
  */
-static int tams_get_final_end(const TAMSDemuxContext *c, const TAMSSegmentContext *segc,
-                              const TAMSFlow *flow, int64_t *end_ns, int *end_inclusive)
+static int tams_final_end(const TAMSDemuxContext *c, const TAMSSegmentContext *segc,
+                          const TAMSFlow *flow, int64_t *end_ns, int *end_inclusive)
 {
     const TAMSTimeRange *tr = segc->was_live ? (c->has_url_tr ? &c->url_tr : NULL)
                                              : &flow->timerange;
@@ -570,6 +569,8 @@ static int tams_setup_audio_stream(AVStream *st, const TAMSFlow *flow)
         st->codecpar->codec_id = flow->bit_depth == 16 ? AV_CODEC_ID_PCM_S16LE :
                                  flow->bit_depth == 32 ? AV_CODEC_ID_PCM_S32LE :
                                                          AV_CODEC_ID_PCM_S24LE;
+    else if (st->codecpar->codec_id == AV_CODEC_ID_PCM_F32LE && flow->bit_depth == 64)
+        st->codecpar->codec_id = AV_CODEC_ID_PCM_F64LE;
 
     if (flow->coded_frame_size > 0)
         st->codecpar->frame_size = flow->coded_frame_size;
@@ -745,7 +746,7 @@ static int tams_build_segments_url(AVFormatContext *s, const TAMSFlow *flow,
     const char *query = strchr(s->url, '?');
     int ret;
 
-    ret = ff_tams_get_base_url(s->url, base_url, sizeof(base_url), NULL);
+    ret = ff_tams_derive_base_url(s->url, base_url, sizeof(base_url), NULL);
     if (ret < 0)
         return ret;
 
@@ -770,7 +771,7 @@ static int tams_build_segments_url(AVFormatContext *s, const TAMSFlow *flow,
     if (segc->has_fetch_cursor) {
         TAMSTimeRange tr = { .has_start = 1, .start_inclusive = 1,
                              .start = segc->fetch_cursor_ns };
-        tr.has_end = tams_get_final_end(c, segc, flow, &tr.end, &tr.end_inclusive);
+        tr.has_end = tams_final_end(c, segc, flow, &tr.end, &tr.end_inclusive);
         ret = ff_tams_timerange_to_str(&tr, tr_buf, sizeof(tr_buf));
         if (ret < 0)
             return ret;
@@ -828,7 +829,7 @@ static void tams_apply_url_timerange(AVFormatContext *s, TAMSFlow *flow)
 
     /* no segments, only a live Flow has anything to wait for */
     if (flow_tr->never) {
-        if (tams_check_live(c, flow))
+        if (tams_is_live(c, flow))
             *flow_tr = *url_tr;
         return;
     }
@@ -838,7 +839,7 @@ static void tams_apply_url_timerange(AVFormatContext *s, TAMSFlow *flow)
     if (!flow_tr->never)
         return;
 
-    if (url_start_after_flow_end && tams_check_live(c, flow)) {
+    if (url_start_after_flow_end && tams_is_live(c, flow)) {
         av_log(s, AV_LOG_VERBOSE, "TAMS live flow %s has not reached the URL timerange\n",
                flow->id);
         *flow_tr = *url_tr;
@@ -862,7 +863,7 @@ static int tams_fetch_sub_flow(AVFormatContext *s, const char *flow_id)
     const char *query;
     int ret;
 
-    ret = ff_tams_get_base_url(s->url, base_url, sizeof(base_url), NULL);
+    ret = ff_tams_derive_base_url(s->url, base_url, sizeof(base_url), NULL);
     if (ret < 0)
         return ret;
 
@@ -922,7 +923,7 @@ static int tams_refresh_flow(AVFormatContext *s, int flow_index)
     if (c->is_local)
         return 0;
 
-    ret = ff_tams_get_base_url(s->url, base_url, sizeof(base_url), NULL);
+    ret = ff_tams_derive_base_url(s->url, base_url, sizeof(base_url), NULL);
     if (ret < 0)
         return ret;
 
@@ -1087,7 +1088,7 @@ static int tams_validate_segment_stream(AVFormatContext *s,
 
     if (flow->codec[0]) {
         enum AVCodecID expected = ff_tams_codec_from_mime(flow->codec);
-        if (expected == AV_CODEC_ID_PCM_S24LE)
+        if (expected == AV_CODEC_ID_PCM_S24LE || expected == AV_CODEC_ID_PCM_F32LE)
             expected = s->streams[tams_index]->codecpar->codec_id;
         if (expected != AV_CODEC_ID_NONE && par->codec_id != AV_CODEC_ID_NONE &&
             par->codec_id != expected) {
@@ -1323,7 +1324,7 @@ static int tams_open_segment(AVFormatContext *s, TAMSSegmentContext *segc)
     if ((ret = ff_copy_whiteblacklists(segc->sub_ctx, s)) < 0)
         goto fail;
 
-    if (ff_tams_same_host(s->url, seg_url)) {
+    if (ff_tams_is_same_host(s->url, seg_url)) {
         if ((ret = av_dict_copy(&opts, c->avio_opts, 0)) < 0)
             goto fail;
     }
@@ -1500,7 +1501,7 @@ static int tams_ensure_segments(AVFormatContext *s, TAMSSegmentContext *segc)
 {
     TAMSDemuxContext *c = s->priv_data;
     const TAMSFlow *flow = &c->flows[segc->flow_index];
-    int64_t needed_ns = tams_get_min_buffer_ns(c, flow);
+    int64_t needed_ns = tams_min_buffer_ns(c, flow);
     int64_t buffered, end_ns;
     int end_inclusive, ret;
 
@@ -1529,7 +1530,7 @@ static int tams_ensure_segments(AVFormatContext *s, TAMSSegmentContext *segc)
 
         if (buffered >= needed_ns) {
             if (segc->is_live)
-                segc->poll_interval_us = tams_get_poll_init_us(c, flow);
+                segc->poll_interval_us = tams_poll_init_us(c, flow);
             return 0;
         }
 
@@ -1537,7 +1538,7 @@ static int tams_ensure_segments(AVFormatContext *s, TAMSSegmentContext *segc)
         if (!segc->is_live) {
             if (segc->nb_flow_segments == old_nb)
                 break;  /* no new pages available */
-            if (tams_get_final_end(c, segc, flow, &end_ns, &end_inclusive) &&
+            if (tams_final_end(c, segc, flow, &end_ns, &end_inclusive) &&
                 segc->nb_flow_segments > 0) {
                 const TAMSFlowSegment *last = &segc->flow_segments[segc->nb_flow_segments - 1];
                 if (last->timerange.end >= end_ns)
@@ -1548,7 +1549,7 @@ static int tams_ensure_segments(AVFormatContext *s, TAMSSegmentContext *segc)
 
         /* live */
         if (segc->nb_flow_segments > old_nb) {
-            segc->poll_interval_us = tams_get_poll_init_us(c, flow);
+            segc->poll_interval_us = tams_poll_init_us(c, flow);
             /* Got new segments but buffer not yet full: fetch the next page */
             continue;
         }
@@ -1564,7 +1565,7 @@ static int tams_ensure_segments(AVFormatContext *s, TAMSSegmentContext *segc)
             continue;
         }
 
-        if (tams_check_live_expired(c, segc, flow)) {
+        if (tams_is_live_expired(c, segc, flow)) {
             av_log(s, AV_LOG_VERBOSE, "TAMS live flow expired, ending\n");
             segc->is_live = 0;
             break;
@@ -1796,7 +1797,7 @@ static int tams_classify_packet(AVFormatContext *s,
          */
         int64_t end_ns;
         int end_inclusive;
-        if (tams_get_final_end(c, segc, flow, &end_ns, &end_inclusive)) {
+        if (tams_final_end(c, segc, flow, &end_ns, &end_inclusive)) {
             int64_t flow_dur = end_ns - flow_start;
 
             int past_flow_end = end_inclusive ? (pts_ns > flow_dur) : (pts_ns >= flow_dur);
@@ -1985,7 +1986,7 @@ static int tams_read_header(AVFormatContext *s)
     {
         char base_url[2048], service_url[2100];
 
-        if (ff_tams_get_base_url(s->url, base_url, sizeof(base_url), NULL) >= 0 &&
+        if (ff_tams_derive_base_url(s->url, base_url, sizeof(base_url), NULL) >= 0 &&
             ff_tams_service_url(base_url, service_url, sizeof(service_url)) >= 0) {
             AVBPrint sbuf;
             int sret = ff_tams_request(s, &c->avio_opts, service_url, NULL, NULL, 0, NULL,
@@ -2132,11 +2133,11 @@ static int tams_read_header(AVFormatContext *s)
             memset(segc, 0, sizeof(*segc));
             segc->flow_index = seg_flow_index;
             seg_flow = &c->flows[seg_flow_index];
-            segc->is_live = tams_check_live(c, seg_flow);
+            segc->is_live = tams_is_live(c, seg_flow);
             segc->was_live = segc->is_live;
             segc->last_new_seg_us = av_gettime();
             if (segc->is_live) {
-                segc->poll_interval_us = tams_get_poll_init_us(c, seg_flow);
+                segc->poll_interval_us = tams_poll_init_us(c, seg_flow);
                 av_log(s, AV_LOG_VERBOSE,
                        "TAMS segment context %d (flow %s) detected as live "
                        "(poll=%"PRId64"us)\n",
@@ -2294,7 +2295,7 @@ static const AVOption tams_options[] = {
         OFFSET(live_timeout_s), AV_OPT_TYPE_INT64, {.i64 = -1}, -1, INT_MAX, FLAGS },
     { "seg_poll_init", "Initial segment poll interval (in microseconds) for live streams (-1=auto: segment_duration)",
         OFFSET(seg_poll_init_us), AV_OPT_TYPE_INT64, {.i64 = -1}, -1, INT_MAX, FLAGS },
-    { "seg_poll_max", "Max segment poll interval (in microseconds) when backoff is applied to seg_poll_init for live streams",
+    { "seg_poll_max", "Max segment poll interval (in microseconds) for live streams, once backoff (doubling on each poll that finds no new segments) is applied to seg_poll_init",
         OFFSET(seg_poll_max_us), AV_OPT_TYPE_INT64, {.i64 = 30000000}, 0, INT_MAX, FLAGS },
     { "min_segment_buffer", "target seconds of segments to buffer ahead of current position (-1=auto: 3 x segment_duration)",
         OFFSET(min_segment_buffer_s), AV_OPT_TYPE_INT64, {.i64 = -1}, -1, INT_MAX, FLAGS },

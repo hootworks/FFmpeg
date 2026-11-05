@@ -157,9 +157,9 @@ static int test_check_live_recent(void)
     /* an ISO 8601 date-time; "now" is also accepted by av_parse_time() */
     av_strlcpy(flow.segments_updated, "now", sizeof(flow.segments_updated));
 
-    if (!tams_check_live(&c, &flow))
+    if (!tams_is_live(&c, &flow))
         FAIL("check_live_recent: a just-updated flow should be live");
-    if (tams_check_live_expired(&c, &segc, &flow))
+    if (tams_is_live_expired(&c, &segc, &flow))
         FAIL("check_live_recent: a just-updated flow should not be expired");
 
     printf("OK: check_live_recent\n");
@@ -180,9 +180,9 @@ static int test_check_live_stale(void)
     flow.segment_duration = (AVRational){1, 1};
     av_strlcpy(flow.segments_updated, "2000-01-01T00:00:00Z", sizeof(flow.segments_updated));
 
-    if (tams_check_live(&c, &flow))
+    if (tams_is_live(&c, &flow))
         FAIL("check_live_stale: a long-stale flow should not be live");
-    if (!tams_check_live_expired(&c, &segc, &flow))
+    if (!tams_is_live_expired(&c, &segc, &flow))
         FAIL("check_live_stale: a long-stale flow should be expired");
 
     printf("OK: check_live_stale\n");
@@ -198,9 +198,9 @@ static int test_check_live_no_segments_updated(void)
     memset(&c, 0, sizeof(c));
     memset(&flow, 0, sizeof(flow)); /* segments_updated left empty */
 
-    if (tams_check_live(&c, &flow))
+    if (tams_is_live(&c, &flow))
         FAIL("check_live_no_segments_updated: empty segments_updated should not be live");
-    if (!tams_check_live_expired(&c, &segc, &flow))
+    if (!tams_is_live_expired(&c, &segc, &flow))
         FAIL("check_live_no_segments_updated: empty segments_updated should be treated as expired");
 
     printf("OK: check_live_no_segments_updated\n");
@@ -219,13 +219,13 @@ static int test_check_live_status(void)
     /* status wins over a missing/stale segments_updated */
     memset(&flow, 0, sizeof(flow)); /* segments_updated left empty */
     av_strlcpy(flow.status, "ingesting", sizeof(flow.status));
-    if (!tams_check_live(&c, &flow))
+    if (!tams_is_live(&c, &flow))
         FAIL("check_live_status: an ingesting flow should be live");
 
     /* an ISO 8601 date-time; "now" is also accepted by av_parse_time() */
     av_strlcpy(flow.segments_updated, "now", sizeof(flow.segments_updated));
     av_strlcpy(flow.status, "closed_complete", sizeof(flow.status));
-    if (tams_check_live(&c, &flow))
+    if (tams_is_live(&c, &flow))
         FAIL("check_live_status: a closed_complete flow should not be live");
 
     printf("OK: check_live_status\n");
@@ -256,13 +256,13 @@ static int test_check_live_expiry_uses_reader_activity(void)
 
     /* ... but this reader saw new segments just now: not expired */
     segc.last_new_seg_us = av_gettime();
-    if (tams_check_live_expired(&c, &segc, &flow))
+    if (tams_is_live_expired(&c, &segc, &flow))
         FAIL("check_live_expiry_uses_reader_activity: recently seen segments should not be expired");
 
     /* ... and once the reader has also seen nothing for longer than the
      * timeout (5s > 4s), the Flow is expired */
     segc.last_new_seg_us = av_gettime() - 5000000;
-    if (!tams_check_live_expired(&c, &segc, &flow))
+    if (!tams_is_live_expired(&c, &segc, &flow))
         FAIL("check_live_expiry_uses_reader_activity: no new segments for 5s should be expired");
 
     printf("OK: check_live_expiry_uses_reader_activity\n");
@@ -279,11 +279,11 @@ static int test_get_poll_init(void)
 
     memset(&c, 0, sizeof(c));
     c.seg_poll_init_us = -1; /* auto */
-    if (tams_get_poll_init_us(&c, &flow) != 2000000)
+    if (tams_poll_init_us(&c, &flow) != 2000000)
         FAIL("get_poll_init: auto should equal segment_duration_us");
 
     c.seg_poll_init_us = 12345;
-    if (tams_get_poll_init_us(&c, &flow) != 12345)
+    if (tams_poll_init_us(&c, &flow) != 12345)
         FAIL("get_poll_init: explicit value should be used as-is");
 
     printf("OK: get_poll_init\n");
@@ -304,11 +304,11 @@ static int test_get_min_buffer_ns(void)
 
     memset(&c, 0, sizeof(c));
     c.min_segment_buffer_s = -1; /* auto */
-    if (tams_get_min_buffer_ns(&c, &flow) != INT64_C(6000000000))
+    if (tams_min_buffer_ns(&c, &flow) != INT64_C(6000000000))
         FAIL("get_min_buffer_ns: auto should be 3 x segment_duration");
 
     c.min_segment_buffer_s = 10; /* seconds */
-    if (tams_get_min_buffer_ns(&c, &flow) != INT64_C(10000000000))
+    if (tams_min_buffer_ns(&c, &flow) != INT64_C(10000000000))
         FAIL("get_min_buffer_ns: explicit seconds should convert to ns");
 
     printf("OK: get_min_buffer_ns\n");
@@ -418,19 +418,19 @@ static int test_build_base_url(void)
 
     /* /flows/<id>: strips only the last path segment, back to the /flows
      * collection endpoint so other flow ids can be appended later */
-    if (ff_tams_get_base_url("http://host/flows/abc-123", base, sizeof(base), NULL) < 0)
+    if (ff_tams_derive_base_url("http://host/flows/abc-123", base, sizeof(base), NULL) < 0)
         FAIL("build_base_url: call failed");
     if (strcmp(base, "http://host/flows"))
         FAIL("build_base_url: expected 'http://host/flows', got '%s'", base);
 
     /* /flows?source_id=...: already at the collection endpoint,
     * does not strip the last path segment */
-    if (ff_tams_get_base_url("http://host/flows?source_id=x", base, sizeof(base), NULL) < 0)
+    if (ff_tams_derive_base_url("http://host/flows?source_id=x", base, sizeof(base), NULL) < 0)
         FAIL("build_base_url: call failed (flows list)");
     if (strcmp(base, "http://host/flows"))
         FAIL("build_base_url: expected 'http://host/flows', got '%s'", base);
 
-    if (ff_tams_get_base_url("relative-id", base, sizeof(base), NULL) < 0)
+    if (ff_tams_derive_base_url("relative-id", base, sizeof(base), NULL) < 0)
         FAIL("build_base_url: call failed (no slash)");
     if (base[0])
         FAIL("build_base_url: expected empty base, got '%s'", base);
@@ -584,7 +584,7 @@ static int test_get_final_end(void)
             FAIL("get_final_end: fixture init failed (case %d)", i);
 
         f.segc.was_live = cases[i].was_live;
-        found = tams_get_final_end(&f.c, &f.segc, &f.flow, &end_ns, &end_inclusive);
+        found = tams_final_end(&f.c, &f.segc, &f.flow, &end_ns, &end_inclusive);
         url_fixture_free(&f);
 
         if (found != cases[i].found)
