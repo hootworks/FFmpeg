@@ -343,7 +343,7 @@ void ff_tams_timerange_intersect(const TAMSTimeRange *a, const TAMSTimeRange *b,
  * callers treat a missing or invalid Flow date-time (e.g. segments_updated)
  * as 0 ("unknown") without their own error handling.
  */
-int64_t ff_tams_iso8601_from_str(const char *str);
+int64_t ff_tams_datetime_from_str(const char *str);
 
 /**
  * Skip JSON whitespace.
@@ -426,7 +426,7 @@ void ff_tams_log_flow_summary(void *avcl, int level, const TAMSFlow *flow);
  * Compare the hosts of two URLs (case-insensitively).
  * @return non-zero if the hosts match
  */
-int ff_tams_same_host(const char *url1, const char *url2);
+int ff_tams_is_same_host(const char *url1, const char *url2);
 
 /**
  * Derive the store's "/flows" collection base URL from a full URL that is
@@ -442,8 +442,8 @@ int ff_tams_same_host(const char *url1, const char *url2);
  *
  * @return 0 on success, negative AVERROR on failure
  */
-int ff_tams_get_base_url(const char *full_url, char *base_url, size_t base_size,
-                                 int *is_exact);
+int ff_tams_derive_base_url(const char *full_url, char *base_url, size_t base_size,
+                            int *is_exact);
 
 /**
  * Build the URL for a single Flow: "{flows_base_url}/{flow_id}".
