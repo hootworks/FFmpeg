@@ -1195,9 +1195,11 @@ Flows without a @code{status}, while @code{segments_updated} is recent (see
 @code{closed_complete} or no new segments arrive within @option{live_timeout}.
 
 Flows whose segments use separate initialisation objects
-(@code{init_object}) are not supported. Where a segment has no
-@code{ts_offset} but its media timestamps lie outside its timerange, the
-offset is inferred from its first packet.
+(@code{init_object}) are not supported. Segment formats are detected by
+probing, not from the Flow's @code{container}, so formats with no header or
+sync bytes, such as raw video or PCM audio with no container, are not
+supported. Where a segment has no @code{ts_offset} but its media timestamps
+lie outside its timerange, the offset is inferred from its first packet.
 
 A @code{timerange} in the URL limits what is read: each Flow's timerange is
 narrowed to its intersection with it, and a Flow which does not overlap it is
@@ -1223,8 +1225,9 @@ Initial segment poll interval for live streams. By default (@code{-1}),
 @code{segment_duration} is used.
 
 @item seg_poll_max @var{microseconds}
-Maximum segment poll interval for live streams, once backoff is applied to
-@option{seg_poll_init}. Default is 30000000 (30s).
+Maximum segment poll interval for live streams, once backoff (doubling on
+each poll that finds no new segments) is applied to @option{seg_poll_init}.
+Default is 30000000 (30s).
 
 @item min_segment_buffer @var{seconds}
 Target seconds of segments to buffer ahead of the current position. By

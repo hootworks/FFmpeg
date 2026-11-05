@@ -147,10 +147,12 @@ static const struct {
     { "audio/vorbis",    AV_CODEC_ID_VORBIS,     1 },
     { "audio/ac3",       AV_CODEC_ID_AC3,        1 },
     { "audio/eac3",      AV_CODEC_ID_EAC3,       1 },
-    /* one MIME for all PCM; bit_depth selects the sample size */
-    { "audio/pcm",       AV_CODEC_ID_PCM_S24LE,  1 },
-    { "audio/pcm",       AV_CODEC_ID_PCM_S16LE,  1 },
-    { "audio/pcm",       AV_CODEC_ID_PCM_S32LE,  1 },
+    /* one MIME each for integer and float PCM; bit_depth selects the sample size */
+    { "audio/x-raw-int",   AV_CODEC_ID_PCM_S24LE, 1 },
+    { "audio/x-raw-int",   AV_CODEC_ID_PCM_S16LE, 1 },
+    { "audio/x-raw-int",   AV_CODEC_ID_PCM_S32LE, 1 },
+    { "audio/x-raw-float", AV_CODEC_ID_PCM_F32LE, 1 },
+    { "audio/x-raw-float", AV_CODEC_ID_PCM_F64LE, 1 },
     { "text/vtt",        AV_CODEC_ID_WEBVTT,     1 },
     { "text/srt",        AV_CODEC_ID_SUBRIP,     1 },
 };
@@ -425,7 +427,7 @@ void ff_tams_timerange_intersect(const TAMSTimeRange *a, const TAMSTimeRange *b,
     *out = r;
 }
 
-int64_t ff_tams_iso8601_from_str(const char *str)
+int64_t ff_tams_datetime_from_str(const char *str)
 {
     int64_t t_us;
     if (!str || !str[0])
@@ -2224,7 +2226,7 @@ int ff_tams_flow_segment_to_json(AVBPrint *buf, const TAMSFlowSegment *seg)
  * Utilities
  * ==================================================================== */
 
-int ff_tams_same_host(const char *url1, const char *url2)
+int ff_tams_is_same_host(const char *url1, const char *url2)
 {
     char host1[256] = "", host2[256] = "";
     av_url_split(NULL, 0, NULL, 0, host1, sizeof(host1), NULL, NULL, 0, url1);
@@ -2271,8 +2273,8 @@ void ff_tams_log_flow_summary(void *avcl, int level, const TAMSFlow *flow)
  * URL utilities
  * ==================================================================== */
 
-int ff_tams_get_base_url(const char *full_url, char *base_url, size_t base_size,
-                                 int *is_exact)
+int ff_tams_derive_base_url(const char *full_url, char *base_url, size_t base_size,
+                            int *is_exact)
 {
     const char *query = strchr(full_url, '?');
     int path_len = query ? (int)(query - full_url) : (int)strlen(full_url);
@@ -2366,7 +2368,7 @@ int ff_tams_request(AVFormatContext *s, AVDictionary *const *avio_opts,
         AVDictionary *opts = NULL;
         int ret;
 
-        if (avio_opts && ff_tams_same_host(s->url, url)) {
+        if (avio_opts && ff_tams_is_same_host(s->url, url)) {
             ret = av_dict_copy(&opts, *avio_opts, 0);
             if (ret < 0)
                 return ret;
