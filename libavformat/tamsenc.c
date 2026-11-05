@@ -679,7 +679,7 @@ fail_no_indices:
 }
 
 /**
- * Parse one standalone 'multi_flow=N,...' token. 
+ * Parse one standalone 'multi_flow=N,...' token.
  * The 'multi_flow=' prefix should already be consumed by the caller with p
  * pointing at 'N,...'.
  */
@@ -849,21 +849,21 @@ static int tams_parse_multi_flow_token(const char *p, const char *tok_end,
  * is omitted entirely.
  *
  * id= may repeat within one flow_token, positionally paired with the streams= list.
- * 
+ *
  * A source_id=/multi_flow= may each appear at most once per flow_token.
  *
  * A flow_token with more than one stream requires a multi_flow= attr, as a
  * shared container is only possible within a multi-Flow. A multi_flow_token
  * for that N is optional: it is only needed to set the multi-Flow's
  * id=/source_id=/label=/description=/tags.
- * 
+ *
  * label=/description=/tags.<name>= are not supported on a flow_token,
  * as a mono Flow's label/description come from that AVStream's "title"/"comment"
  * metadata instead, and its tags from any other AVStream metadata key.
- * 
+ *
  * A multi_flow_token with id= is considered pinned and never modified
  * so label=/description=/tags.<name>= are ignored.
- * 
+ *
  * tags.<name>= may repeat.
  *
  * Because ',' and ' ' are the token/attr delimiters, text values may contain neither.
@@ -1218,7 +1218,7 @@ static int tams_create_flow(AVFormatContext *s, TAMSFlow *flow)
 
 /*
  * Create every multi-Flow which -flow_map did not pin to an id=. Its flow_collection
- * lists each member container's resolved mono Flows. 
+ * lists each member container's resolved mono Flows.
  */
 static int tams_create_multi_flows(AVFormatContext *s)
 {
@@ -1370,7 +1370,7 @@ static int tams_build_container_mux(AVFormatContext *s, TAMSContainerContext *cc
          * packets to Annex B and inserts the parameter sets before each IDR.
          */
         if (opar->extradata_size >= 4 &&
-            // Annex B starts with a 00 00 01 or 00 00 00 01 
+            // Annex B starts with a 00 00 01 or 00 00 00 01
             (AV_RB24(opar->extradata) == 1 || AV_RB32(opar->extradata) == 1) &&
             (!strcmp(oc->oformat->name, "h264") || !strcmp(oc->oformat->name, "hevc") ||
              !strcmp(oc->oformat->name, "mpeg2video"))) {
@@ -1674,7 +1674,7 @@ static int tams_set_created_flow_status(AVFormatContext *s, const char *status)
  * - GET and validate it
  * - match every one of its member streams that wasn't itself explicitly pinned
  *   against a remaining, essence-type-compatible entry in the fetched flow_collection.
- * 
+ *
  * Hard error on ambiguity (more than one equally-valid candidate) or an unclaimed
  * flow_collection entry or a member stream matching nothing.
  */
