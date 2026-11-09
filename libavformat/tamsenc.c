@@ -1099,10 +1099,7 @@ static int tams_validate_pinned_flow(AVFormatContext *s, const AVStream *ist, co
     return 0;
 }
 
-/*
- * GET /service. Warn on an api_version mismatch. Hard-error if any container's
- * segment duration is longer than the store's minimum presigned URL timeout.
- */
+/* GET /service. Warn on an api_version mismatch and store the timeouts. */
 static int tams_fetch_service_limits(AVFormatContext *s)
 {
     TAMSMuxContext *c = s->priv_data;
@@ -1138,6 +1135,17 @@ static int tams_fetch_service_limits(AVFormatContext *s)
                               ? service.min_object_timeout * INT64_C(1000000) : 300 * INT64_C(1000000);
     c->min_presigned_url_timeout_us = service.min_presigned_url_timeout > 0
                                      ? service.min_presigned_url_timeout * INT64_C(1000000) : 30 * INT64_C(1000000);
+
+    return 0;
+}
+
+/*
+ * Hard-error if any container's segment duration is longer than the store's
+ * minimum presigned URL timeout.
+ */
+static int tams_check_segment_durations(AVFormatContext *s)
+{
+    TAMSMuxContext *c = s->priv_data;
 
     for (int i = 0; i < c->nb_container_ctxs; i++) {
         int64_t dur_us = c->container_ctxs[i].segment_duration_ns / 1000;
@@ -1569,16 +1577,15 @@ static void tams_resolve_segment_duration(AVFormatContext *s, TAMSContainerConte
 }
 
 /*
- * Resolve every mono Flow. If -flow_map gave an id=, resolve Flow via GET and validate it,
- * else build and PUT a new one.
+ * GET and validate every mono Flow -flow_map pinned with an id=, and resolve each
+ * container's MIME type and segment duration. Nothing is written to the store.
  */
-static int tams_resolve_mono_flows(AVFormatContext *s)
+static int tams_check_mono_flows(AVFormatContext *s)
 {
     TAMSMuxContext *c = s->priv_data;
 
     for (int i = 0; i < c->nb_container_ctxs; i++) {
         TAMSContainerContext *cc = &c->container_ctxs[i];
-        int shared_container = cc->nb_streams > 1;
         int ret;
 
         ret = tams_resolve_container_mime(s, cc, cc->container_mime, sizeof(cc->container_mime));
@@ -1591,21 +1598,44 @@ static int tams_resolve_mono_flows(AVFormatContext *s)
             TAMSFlowContext *fc = &cc->flow_ctxs[j];
             AVStream *ist = s->streams[cc->stream_indices[j]];
 
-            if (fc->has_flow_id) {
-                ret = tams_fetch_flow(s, fc->flow_id, &fc->flow);
-                if (ret < 0)
-                    return ret;
-                ret = tams_validate_pinned_flow(s, ist, &fc->flow);
-                if (ret < 0)
-                    return ret;
-                if (fc->has_source_id && strcmp(fc->flow.source_id, fc->source_id)) {
-                    av_log(s, AV_LOG_ERROR,
-                           "TAMS: pinned Flow %s source_id %s != -flow_map source_id %s\n",
-                           fc->flow_id, fc->flow.source_id, fc->source_id);
-                    return AVERROR(EINVAL);
-                }
+            if (!fc->has_flow_id)
                 continue;
+            ret = tams_fetch_flow(s, fc->flow_id, &fc->flow);
+            if (ret < 0)
+                return ret;
+            ret = tams_validate_pinned_flow(s, ist, &fc->flow);
+            if (ret < 0)
+                return ret;
+            if (fc->has_source_id && strcmp(fc->flow.source_id, fc->source_id)) {
+                av_log(s, AV_LOG_ERROR,
+                       "TAMS: pinned Flow %s source_id %s != -flow_map source_id %s\n",
+                       fc->flow_id, fc->flow.source_id, fc->source_id);
+                return AVERROR(EINVAL);
             }
+        }
+
+        tams_resolve_segment_duration(s, cc);
+    }
+
+    return 0;
+}
+
+/* Build and PUT a new mono Flow for every stream -flow_map did not pin. */
+static int tams_create_mono_flows(AVFormatContext *s)
+{
+    TAMSMuxContext *c = s->priv_data;
+
+    for (int i = 0; i < c->nb_container_ctxs; i++) {
+        TAMSContainerContext *cc = &c->container_ctxs[i];
+        int shared_container = cc->nb_streams > 1;
+
+        for (int j = 0; j < cc->nb_streams; j++) {
+            TAMSFlowContext *fc = &cc->flow_ctxs[j];
+            AVStream *ist = s->streams[cc->stream_indices[j]];
+            int ret;
+
+            if (fc->has_flow_id)
+                continue;
 
             ret = tams_build_flow(s, ist, cc->container_mime, shared_container, &fc->flow);
             if (ret < 0)
@@ -1626,8 +1656,6 @@ static int tams_resolve_mono_flows(AVFormatContext *s)
                 return ret;
             fc->created = 1;
         }
-
-        tams_resolve_segment_duration(s, cc);
     }
 
     return 0;
@@ -1980,7 +2008,37 @@ end:
     return ret;
 }
 
-static int tams_write_header(AVFormatContext *s)
+/*
+ * DELETE the Flows this muxer created, multi-Flows first so no multi-Flow is
+ * left referencing a deleted member. Best effort: failures are only logged.
+ */
+static void tams_delete_created_flows(AVFormatContext *s)
+{
+    TAMSMuxContext *c = s->priv_data;
+    char url[2100];
+
+    for (int i = 0; i < c->nb_multi_flow_ctxs; i++) {
+        TAMSMultiFlowContext *mc = &c->multi_flow_ctxs[i];
+        if (!mc->created || ff_tams_flow_url(c->flows_base_url, mc->flow_id, url, sizeof(url)) < 0)
+            continue;
+        if (tams_request(s, url, "DELETE", NULL, 0, NULL, NULL) < 0)
+            av_log(s, AV_LOG_WARNING, "TAMS: failed to delete multi-Flow %s\n", mc->flow_id);
+        mc->created = 0;
+    }
+    for (int i = 0; i < c->nb_container_ctxs; i++) {
+        TAMSContainerContext *cc = &c->container_ctxs[i];
+        for (int j = 0; j < cc->nb_streams; j++) {
+            TAMSFlowContext *fc = &cc->flow_ctxs[j];
+            if (!fc->created || ff_tams_flow_url(c->flows_base_url, fc->flow_id, url, sizeof(url)) < 0)
+                continue;
+            if (tams_request(s, url, "DELETE", NULL, 0, NULL, NULL) < 0)
+                av_log(s, AV_LOG_WARNING, "TAMS: failed to delete Flow %s\n", fc->flow_id);
+            fc->created = 0;
+        }
+    }
+}
+
+static int tams_init_flows(AVFormatContext *s)
 {
     TAMSMuxContext *c = s->priv_data;
     int ret;
@@ -2024,6 +2082,14 @@ static int tams_write_header(AVFormatContext *s)
     }
 
     /*
+     * Everything which can be checked is checked before any Flow is created,
+     * so a bad -flow_map or -segment_duration leaves nothing on the store.
+     */
+    ret = tams_fetch_service_limits(s);
+    if (ret < 0)
+        return ret;
+
+    /*
      * Match existing multi-Flows' members first, so an implicitly-matched
      * member takes a GET+validate path below rather than creating a brand new Flow.
      */
@@ -2031,7 +2097,15 @@ static int tams_write_header(AVFormatContext *s)
     if (ret < 0)
         return ret;
 
-    ret = tams_resolve_mono_flows(s);
+    ret = tams_check_mono_flows(s);
+    if (ret < 0)
+        return ret;
+
+    ret = tams_check_segment_durations(s);
+    if (ret < 0)
+        return ret;
+
+    ret = tams_create_mono_flows(s);
     if (ret < 0)
         return ret;
 
@@ -2058,10 +2132,6 @@ static int tams_write_header(AVFormatContext *s)
         }
     }
 
-    ret = tams_fetch_service_limits(s);
-    if (ret < 0)
-        return ret;
-
     for (int i = 0; i < c->nb_container_ctxs; i++) {
         TAMSContainerContext *cc = &c->container_ctxs[i];
 
@@ -2087,6 +2157,16 @@ static int tams_write_header(AVFormatContext *s)
     tams_log_mapping_summary(s);
 
     return 0;
+}
+
+/* A failed header deletes any Flows it created, as no segment was written to them. */
+static int tams_write_header(AVFormatContext *s)
+{
+    int ret = tams_init_flows(s);
+
+    if (ret < 0)
+        tams_delete_created_flows(s);
+    return ret;
 }
 
 static int tams_write_packet(AVFormatContext *s, AVPacket *pkt)
