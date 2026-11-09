@@ -1577,8 +1577,8 @@ static void tams_resolve_segment_duration(AVFormatContext *s, TAMSContainerConte
 }
 
 /*
- * GET and validate every mono Flow -flow_map pinned with an id=, and resolve each
- * container's MIME type and segment duration. Nothing is written to the store.
+ * GET and validate every mono Flow -flow_map pinned with an id= and resolve each
+ * container's MIME type and segment duration.
  */
 static int tams_check_mono_flows(AVFormatContext *s)
 {
