@@ -1,5 +1,6 @@
 /*
- * Copyright (c) 2026 Nick Ryan <nick.ryan@hoot.works>
+ * Copyright (C) 2026 Hoot Works Ltd
+ * Author    (C) 2026 Nick Ryan <hello.vectronic@gmail.com>
  *
  * This file is part of FFmpeg.
  *

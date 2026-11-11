@@ -1,5 +1,6 @@
 /*
- * Copyright (c) 2026 Nick Ryan <nick.ryan@hoot.works>
+ * Copyright (C) 2026 Hoot Works Ltd
+ * Author    (C) 2026 Nick Ryan <hello.vectronic@gmail.com>
  *
  * This file is part of FFmpeg.
  *
@@ -90,6 +91,15 @@ typedef struct TAMSContainerContext {
     int64_t next_boundary_ns;
     int64_t segment_end_ns;     /* max pts + duration written to this segment */
     int has_segment_data;
+    /*
+     * pts of the reference keyframe that starts the current segment object,
+     * in its stream's time base. It is subtracted from every packet so each
+     * object's timestamps start at 0 (raw FLAC excepted). Unset for the first
+     * segment, whose input timestamps already start at the timeline origin.
+     */
+    int64_t origin_pts;
+    AVRational origin_tb;
+    int origin_set;
     int64_t segment_index;
     int error;                  /* sticky: a failed flush leaves sub_ctx unusable */
 
@@ -182,7 +192,7 @@ static const struct {
     { AV_CODEC_ID_MP2,        "mp2"        },
     { AV_CODEC_ID_MP3,        "mp3"        },
     { AV_CODEC_ID_FLAC,       "flac"       },
-    { AV_CODEC_ID_VORBIS,     "matroska"   }, /* Ogg breaks across segments */
+    { AV_CODEC_ID_VORBIS,     "oga"        },
     { AV_CODEC_ID_AC3,        "ac3"        },
     { AV_CODEC_ID_EAC3,       "eac3"       },
     { AV_CODEC_ID_WEBVTT,     "webvtt"     },
@@ -1885,9 +1895,11 @@ static int tams_alloc_next_storage(AVFormatContext *s, TAMSContainerContext *cc)
  * ts_offset for the segment just written by cc->sub_ctx (whose trailer has
  * been written but which has not been freed yet): flow_ts - media_ts.
  *
- * Formats without timestamps restart at 0 in every segment. For other formats
- * the nested muxer keeps the input's continuous timestamps, plus any
- * negative-ts shift lavf applied and mpegts's fixed mux delay.
+ * Every segment object's timestamps start at 0 at its first reference
+ * keyframe (the origin), so ts_offset is the origin's position on the Flow
+ * timeline (the start of the input's timeline for the first segment), minus
+ * any negative-ts shift lavf applied and mpegts's fixed mux delay. Raw FLAC
+ * frames carry their sample number, so FLAC keeps continuous timestamps.
  */
 static int64_t tams_segment_ts_offset(const TAMSMuxContext *c, const TAMSContainerContext *cc,
                                       int64_t seg_start_tai_ns)
@@ -1896,9 +1908,12 @@ static int64_t tams_segment_ts_offset(const TAMSMuxContext *c, const TAMSContain
     const AVStream *st = oc->streams[cc->reference_stream_index];
     int64_t offset_ns = c->start_tai_ns;
 
+    if (cc->origin_set)
+        offset_ns += av_rescale_q(cc->origin_pts, cc->origin_tb, (AVRational){ 1, TAMS_TIMEBASE });
+
     /* raw FLAC frames carry their sample number, so stay continuous */
     if ((oc->oformat->flags & AVFMT_NOTIMESTAMPS) && strcmp(oc->oformat->name, "flac"))
-        return seg_start_tai_ns;
+        return cc->origin_set ? offset_ns : seg_start_tai_ns;
 
     offset_ns -= av_rescale_q(cffstream(st)->mux_ts_offset, st->time_base,
                               (AVRational){ 1, TAMS_TIMEBASE });
@@ -1994,6 +2009,7 @@ static int tams_flush_segment(AVFormatContext *s, TAMSContainerContext *cc,
 
     cc->segment_index++;
     cc->has_segment_data  = 0;
+    cc->origin_set        = 0;
     cc->segment_start_ns = end_ns;
 
     if (!is_final) {
@@ -2195,6 +2211,21 @@ static int tams_write_packet(AVFormatContext *s, AVPacket *pkt)
         if (ret < 0)
             return cc->error = ret;
         cc->next_boundary_ns = ts_ns + cc->segment_duration_ns;
+        if (strcmp(cc->sub_ctx->oformat->name, "flac")) {
+            const char *name = cc->sub_ctx->oformat->name;
+
+            cc->origin_pts = pkt->pts;
+            cc->origin_tb  = s->streams[pkt->stream_index]->time_base;
+            cc->origin_set = 1;
+            /*
+             * The first packet of a Vorbis stream decodes to no samples, so
+             * an Ogg reader takes it as ending where the stream starts: make
+             * the object start at 0 at the end of that packet.
+             */
+            if (s->streams[pkt->stream_index]->codecpar->codec_id == AV_CODEC_ID_VORBIS &&
+                (!strcmp(name, "ogg") || !strcmp(name, "oga")) && pkt->duration > 0)
+                cc->origin_pts += pkt->duration;
+        }
     }
 
     if (!cc->has_segment_data) {
@@ -2210,6 +2241,21 @@ static int tams_write_packet(AVFormatContext *s, AVPacket *pkt)
         cc->segment_end_ns = FFMAX(cc->segment_end_ns, ts_ns +
                                    av_rescale_q(pkt->duration, s->streams[pkt->stream_index]->time_base,
                                                 (AVRational){ 1, TAMS_TIMEBASE }));
+
+    if (cc->origin_set) {
+        int64_t pts = pkt->pts, dts = pkt->dts;
+        int64_t origin = av_rescale_q(cc->origin_pts, cc->origin_tb,
+                                      s->streams[pkt->stream_index]->time_base);
+
+        if (pts != AV_NOPTS_VALUE)
+            pkt->pts -= origin;
+        if (dts != AV_NOPTS_VALUE)
+            pkt->dts -= origin;
+        ret = ff_write_chained(cc->sub_ctx, sub_idx, pkt, s, 0);
+        pkt->pts = pts;
+        pkt->dts = dts;
+        return ret;
+    }
 
     return ff_write_chained(cc->sub_ctx, sub_idx, pkt, s, 0);
 }
