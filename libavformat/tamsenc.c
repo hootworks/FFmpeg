@@ -2237,6 +2237,15 @@ static int tams_write_packet(AVFormatContext *s, AVPacket *pkt)
         }
     }
 
+    /*
+     * The first segment starts at the earliest packet of any stream, e.g.
+     * audio ahead of video delayed for B-frames, so it is not left outside the
+     * segment's timerange. Priming (negative) timestamps stay before it.
+     */
+    if (!cc->segment_index && ts_ns != AV_NOPTS_VALUE && ts_ns >= 0 &&
+        ts_ns < cc->segment_start_ns)
+        cc->segment_start_ns = ts_ns;
+
     if (ts_ns != AV_NOPTS_VALUE)
         cc->segment_end_ns = FFMAX(cc->segment_end_ns, ts_ns +
                                    av_rescale_q(pkt->duration, s->streams[pkt->stream_index]->time_base,
