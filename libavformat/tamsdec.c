@@ -53,6 +53,7 @@
 #include "libavcodec/codec.h"
 
 #include "url.h"
+#include "urldecode.h"
 
 /*
  * Return codes from tams_classify_packet(), used by tams_read_packet() to
@@ -114,7 +115,9 @@ typedef struct TAMSStreamContext {
 
     enum AVMediaType media_type;
     int eof;
-    int extradata_copied;
+    uint8_t *extradata;  /* the extradata of the last segment read, NULL if none yet */
+    int extradata_size;
+    int new_extradata;   /* attach extradata to the segment's first packet */
 
     /* All in nanoseconds on the Flow timeline (TAMS timestamps) */
     int64_t current_ts_ns;   /* pts (else dts) of the last packet read, for picking the next stream */
@@ -1607,37 +1610,49 @@ static int tams_ensure_segments(AVFormatContext *s, TAMSSegmentContext *segc)
 }
 
 /*
- * Copy codec extradata from the first segment into the parent TAMS stream.
- *
- * The flow JSON is the authority for all declared codec parameters (dimensions,
- * sample rate, etc.) and those are already set from it. Extradata (e.g. H.264
- * SPS/PPS, AAC AudioSpecificConfig) is not expressed in the flow JSON and must
- * be obtained from the segment container.
+ * Track the codec extradata (e.g. H.264 SPS/PPS, AAC AudioSpecificConfig) of
+ * each segment, which is not expressed in the Flow JSON. The first segment's
+ * goes into the parent TAMS stream. A later segment whose extradata differs,
+ * e.g. an object from another encode re-used in an edited Flow, passes it to
+ * the decoder as AV_PKT_DATA_NEW_EXTRADATA on its first packet.
  */
-static int tams_copy_extradata(AVFormatContext *s, TAMSStreamContext *sc, int tams_index)
+static int tams_update_extradata(AVFormatContext *s, TAMSStreamContext *sc, int tams_index)
 {
     TAMSDemuxContext *c = s->priv_data;
     TAMSSegmentContext *segc = &c->seg_ctxs[sc->seg_ctx_index];
     AVStream *parent_st = s->streams[tams_index];
     AVCodecParameters *sub_par, *par;
+    int first = !sc->extradata;
 
-    if (sc->extradata_copied || sc->sub_stream_index < 0)
+    if (sc->sub_stream_index < 0)
         return 0;
-
-    sc->extradata_copied = 1;
 
     sub_par = segc->sub_ctx->streams[sc->sub_stream_index]->codecpar;
     par     = parent_st->codecpar;
 
-    if (!sub_par->extradata || sub_par->extradata_size <= 0 || par->extradata)
+    if (!sub_par->extradata || sub_par->extradata_size <= 0 ||
+        (sc->extradata_size == sub_par->extradata_size &&
+         !memcmp(sc->extradata, sub_par->extradata, sub_par->extradata_size)))
         return 0;
 
-    par->extradata = av_malloc(sub_par->extradata_size + AV_INPUT_BUFFER_PADDING_SIZE);
+    av_freep(&sc->extradata);
+    sc->extradata = av_memdup(sub_par->extradata, sub_par->extradata_size);
+    if (!sc->extradata)
+        return AVERROR(ENOMEM);
+    sc->extradata_size = sub_par->extradata_size;
+
+    if (!first) {
+        sc->new_extradata = 1;
+        return 0;
+    }
+    if (par->extradata)
+        return 0;
+
+    par->extradata = av_mallocz(sc->extradata_size + AV_INPUT_BUFFER_PADDING_SIZE);
     if (!par->extradata)
         return AVERROR(ENOMEM);
-    memcpy(par->extradata, sub_par->extradata, sub_par->extradata_size);
-    memset(par->extradata + sub_par->extradata_size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
-    par->extradata_size = sub_par->extradata_size;
+    memcpy(par->extradata, sc->extradata, sc->extradata_size);
+    par->extradata_size = sc->extradata_size;
 
     ffstream(parent_st)->need_context_update = 1;
 
@@ -1889,7 +1904,7 @@ retry:
                         ret = tams_validate_segment_stream(s, sc_i, i);
                         if (ret < 0)
                             return ret;
-                        ret = tams_copy_extradata(s, sc_i, i);
+                        ret = tams_update_extradata(s, sc_i, i);
                         if (ret < 0)
                             return ret;
                     }
@@ -1936,6 +1951,16 @@ retry:
 
                 tams_map_packet_timestamps(s, segc, seg, sc, tams_index, pkt);
                 action = tams_classify_packet(s, segc, seg, sc, pkt);
+                if (sc->new_extradata && (action == TAMS_PKT_OK || action == TAMS_PKT_DISCARD)) {
+                    uint8_t *side = av_packet_new_side_data(pkt, AV_PKT_DATA_NEW_EXTRADATA,
+                                                            sc->extradata_size);
+                    if (!side) {
+                        av_packet_unref(pkt);
+                        return AVERROR(ENOMEM);
+                    }
+                    memcpy(side, sc->extradata, sc->extradata_size);
+                    sc->new_extradata = 0;
+                }
                 if (action == TAMS_PKT_DISCARD) {
                     pkt->flags |= AV_PKT_FLAG_DISCARD;
                     return 0;
@@ -2039,9 +2064,8 @@ static int tams_read_header(AVFormatContext *s)
             const char *end = strchr(tr_str, '&');
             int tlen = end ? (int)(end - tr_str) : (int)strlen(tr_str);
             if (tlen > 0 && tlen < (int)sizeof(tr_val)) {
-                memcpy(tr_val, tr_str, tlen);
-                tr_val[tlen] = '\0';
-                /* not URL-decoded: a percent-encoded value may not parse */
+                /* clients may percent-encode the timerange, e.g. %5B for [ */
+                ff_urldecode_len(tr_val, sizeof(tr_val), tr_str, tlen, 0);
                 if (ff_tams_timerange_from_str(tr_val, &c->url_tr) >= 0)
                     c->has_url_tr = 1;
             }
@@ -2175,8 +2199,12 @@ static int tams_close(AVFormatContext *s)
         }
     }
     av_freep(&c->seg_ctxs);
-    for (int i = 0; i < s->nb_streams; i++)
+    for (int i = 0; i < s->nb_streams; i++) {
+        TAMSStreamContext *sc = s->streams[i]->priv_data;
+        if (sc)
+            av_freep(&sc->extradata);
         av_freep(&s->streams[i]->priv_data);
+    }
     av_dict_free(&c->avio_opts);
     av_freep(&c->flows);
 
