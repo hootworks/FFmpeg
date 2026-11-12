@@ -1195,7 +1195,9 @@ Flows without a @code{status}, while @code{segments_updated} is recent (see
 @code{closed_complete} or no new segments arrive within @option{live_timeout}.
 
 Flows whose segments use separate initialisation objects
-(@code{init_object}) are not supported. Segment formats are detected by
+(@code{init_object}) are not supported. A video or audio Flow whose
+@code{codec} is not a TAMS codec MIME type known to the demuxer is skipped
+with a warning, and the other Flows are still read. Segment formats are detected by
 probing, not from the Flow's @code{container}, so formats with no header or
 sync bytes, such as raw video or PCM audio with no container, are not
 supported. Where a segment has no @code{ts_offset} but its media timestamps
