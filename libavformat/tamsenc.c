@@ -60,6 +60,19 @@ typedef struct TAMSFlowContext {
     int  created;        /* Flow was created by this muxer */
 } TAMSFlowContext;
 
+/* A segment object whose timerange is known, waiting to be uploaded */
+typedef struct TAMSClosingObject {
+    AVFormatContext *sub_ctx;
+    char *put_url;
+    char *object_id;
+    char put_content_type[128];
+    int64_t start_ns;           /* timerange, relative to c->start_tai_ns */
+    int64_t end_ns;
+    int64_t last_ref_ns;
+    int64_t ts_offset;
+    int nb_pending;             /* streams still to pass end_ns */
+} TAMSClosingObject;
+
 /* one physical container / nested muxer i.e. one 'flow=' token from -flow_map */
 typedef struct TAMSContainerContext {
     int *stream_indices; /* indices into the parent AVFormatContext's streams[] */
@@ -91,22 +104,38 @@ typedef struct TAMSContainerContext {
     int64_t next_boundary_ns;
     int64_t segment_end_ns;     /* max pts + duration written to this segment */
     int has_segment_data;
+
     /*
-     * pts of the reference keyframe that starts the current segment object,
-     * in its stream's time base. It is subtracted from every packet so each
-     * object's timestamps start at 0 (raw FLAC excepted). Unset for the first
-     * segment, whose input timestamps already start at the timeline origin.
+     * Added to every timestamp written to the current object
+     * minus the pts of the reference keyframe that starts it. So each object
+     * starts at 0 (the first object and raw FLAC are not shifted) or for
+     * MPEG-TS the shift that makes its PTS the Flow time at 90 kHz modulo 2^33.
      */
-    int64_t origin_pts;
-    AVRational origin_tb;
-    int origin_set;
+    int64_t ts_shift;           /* in ts_shift_tb */
+    AVRational ts_shift_tb;
+
+    int64_t first_ns;           /* first packet timestamp in the current object */
+    int64_t last_ref_ns;        /* last reference stream timestamp in the current object */
+
     int64_t segment_index;
     int error;                  /* sticky: a failed flush leaves sub_ctx unusable */
 
     /*
-     * Eager pre-allocated storage for the *next* segment, requested at this
-     * segment's start so it's already available when this one flushes.
+     * The object before the last segment cut stays open until every other stream has
+     * passed the cut. This allows packets before the cut which still arrive to be
+     * stored in the object whose timerange contains them.
      */
+    TAMSClosingObject prev;
+    int has_prev;
+    int64_t ts_shift_prev;      /* ts_shift of the previous object in ts_shift_prev_tb */
+    AVRational ts_shift_prev_tb;
+    uint8_t *passed_cut;        /* per stream array: a packet at or after prev.end_ns was seen */
+
+    int64_t total_bytes;        /* for the owner Flow's avg_bit_rate/max_bit_rate */
+    int64_t total_ns;
+    int64_t max_bit_rate;       /* bit/s */
+
+    /* storage for the current object, allocated when it starts */
     char *next_put_url;
     char *next_object_id;
     char next_put_content_type[128]; /* from put_url's "content-type", may be empty */
@@ -224,7 +253,8 @@ static const AVOutputFormat *tams_default_raw_oformat(enum AVCodecID codec_id)
 
 /*
  * Resolve oformat using -container if given, else a per-codec raw-ES default
- * for a single-stream container, else fragmented mp4.
+ * for a single-stream container else MP4 as its edit lists
+ * keep the tracks in sync and mark the audio priming).
  */
 static int tams_resolve_oformat(AVFormatContext *s, TAMSContainerContext *cc)
 {
@@ -251,7 +281,7 @@ static int tams_resolve_oformat(AVFormatContext *s, TAMSContainerContext *cc)
 
     oformat = av_guess_format("mp4", NULL, NULL);
     if (!oformat) {
-        av_log(s, AV_LOG_ERROR, "mp4 muxer not available for fragmented-MP4 fallback\n");
+        av_log(s, AV_LOG_ERROR, "mp4 muxer not available for the default container\n");
         return AVERROR_MUXER_NOT_FOUND;
     }
     cc->oformat = oformat;
@@ -329,6 +359,16 @@ static void tams_free_container_ctxs(TAMSContainerContext *container_ctxs, int n
 
         av_freep(&cc->next_put_url);
         av_freep(&cc->next_object_id);
+        av_freep(&cc->prev.put_url);
+        av_freep(&cc->prev.object_id);
+        av_freep(&cc->passed_cut);
+        if (cc->prev.sub_ctx && cc->prev.sub_ctx->pb) {
+            uint8_t *buf = NULL;
+            avio_close_dyn_buf(cc->prev.sub_ctx->pb, &buf);
+            cc->prev.sub_ctx->pb = NULL;
+            av_free(buf);
+        }
+        avformat_free_context(cc->prev.sub_ctx);
         av_freep(&cc->stream_indices);
         av_freep(&cc->flow_ctxs);
         if (cc->sub_ctx && cc->sub_ctx->pb) {
@@ -1315,7 +1355,7 @@ static int tams_create_multi_flows(AVFormatContext *s)
             }
         }
 
-        av_strlcpy(mc->flow.status, "ingesting", sizeof(mc->flow.status));
+        av_strlcpy(mc->flow.status, "awaiting_content", sizeof(mc->flow.status));
         ret = tams_create_flow(s, &mc->flow);
         if (ret < 0)
             return ret;
@@ -1341,6 +1381,13 @@ static int tams_build_container_mux(AVFormatContext *s, TAMSContainerContext *cc
     oc->io_close2          = s->io_close2;
     oc->io_open            = s->io_open;
     oc->flags              = s->flags;
+
+    /* PTS are Flow times so no mux delay is added */
+    if (!strcmp(cc->oformat->name, "mpegts")) {
+        ret = av_opt_set_int(oc->priv_data, "mpegts_copyts", 1, 0);
+        if (ret < 0)
+            return ret;
+    }
 
     for (int i = 0; i < cc->nb_streams; i++) {
         AVStream *ist = s->streams[cc->stream_indices[i]];
@@ -1660,7 +1707,7 @@ static int tams_create_mono_flows(AVFormatContext *s)
             else
                 tams_generate_uuid(fc->flow.source_id);
 
-            av_strlcpy(fc->flow.status, "ingesting", sizeof(fc->flow.status));
+            av_strlcpy(fc->flow.status, "awaiting_content", sizeof(fc->flow.status));
             ret = tams_create_flow(s, &fc->flow);
             if (ret < 0)
                 return ret;
@@ -1672,19 +1719,27 @@ static int tams_create_mono_flows(AVFormatContext *s)
 }
 
 /*
- * Flows are marked "ingesting" while segments are written and
- * "closed_complete" once the trailer is written.
+ * Set the status of the Flows this muxer created (pinned Flows are left
+ * alone) skipping any already at that status. Flows are created
+ * "awaiting_content", set to "ingesting" once their container's first segment
+ * is registered and set to "closed_complete" once the trailer is written.
+ *
+ * If only is NULL, every created Flow is updated. Otherwise only the Flows
+ * written to that specified container are as well as any multi-Flow it belongs to.
  */
-static int tams_set_created_flow_status(AVFormatContext *s, const char *status)
+static int tams_set_created_flow_status(AVFormatContext *s, const TAMSContainerContext *only,
+                                        const char *status)
 {
     TAMSMuxContext *c = s->priv_data;
     int ret = 0;
 
     for (int i = 0; i < c->nb_container_ctxs; i++) {
         TAMSContainerContext *cc = &c->container_ctxs[i];
+        if (only && cc != only)
+            continue;
         for (int j = 0; j < cc->nb_streams; j++) {
             TAMSFlowContext *fc = &cc->flow_ctxs[j];
-            if (!fc->created)
+            if (!fc->created || !strcmp(fc->flow.status, status))
                 continue;
             av_strlcpy(fc->flow.status, status, sizeof(fc->flow.status));
             ret = tams_create_flow(s, &fc->flow);
@@ -1694,7 +1749,8 @@ static int tams_set_created_flow_status(AVFormatContext *s, const char *status)
     }
     for (int i = 0; i < c->nb_multi_flow_ctxs; i++) {
         TAMSMultiFlowContext *mc = &c->multi_flow_ctxs[i];
-        if (!mc->created)
+        if (!mc->created || !strcmp(mc->flow.status, status) ||
+            (only && (!only->has_multi_flow || only->multi_flow_index != mc->index)))
             continue;
         av_strlcpy(mc->flow.status, status, sizeof(mc->flow.status));
         ret = tams_create_flow(s, &mc->flow);
@@ -1892,47 +1948,148 @@ static int tams_alloc_next_storage(AVFormatContext *s, TAMSContainerContext *cc)
 }
 
 /*
- * ts_offset for the segment just written by cc->sub_ctx (whose trailer has
- * been written but which has not been freed yet): flow_ts - media_ts.
+ * Determine ts_offset of the current object: the value a reader adds to a
+ * timestamp inside the object to get its TAI time on the Flow timeline
+ * (flow_ts = media_ts + ts_offset).
  *
- * Every segment object's timestamps start at 0 at its first reference
- * keyframe (the origin), so ts_offset is the origin's position on the Flow
- * timeline (the start of the input's timeline for the first segment), minus
- * any negative-ts shift lavf applied and mpegts's fixed mux delay. Raw FLAC
- * frames carry their sample number, so FLAC keeps continuous timestamps.
+ * A packet's Flow time is start_tai_ns plus its input timestamp. The
+ * timestamp written into the object is its input timestamp plus two shifts:
+ *
+ *   - ts_shift: set by tams_set_ts_shift() when the object starts
+ *   - mux_ts_offset: added by lavf when the first timestamps written would
+ *     be negative e.g. B-frame dts or audio priming.
+ *
+ * So ts_offset = start_tai_ns - (ts_shift + mux_ts_offset). It is calculated
+ * in the reference stream's time base.
+ *
+ * Raw elementary-stream formats store no timestamps. In this case
+ * a reader numbers their frames from 0 at the object's first packet and
+ * therefore ts_offset is that packet's Flow time. Raw FLAC is the exception:
+ * its frame headers carry the sample number from the start of the stream.
+ * Therefore it is never shifted and ts_offset stays start_tai_ns.
  */
-static int64_t tams_segment_ts_offset(const TAMSMuxContext *c, const TAMSContainerContext *cc,
-                                      int64_t seg_start_tai_ns)
+static int64_t tams_segment_ts_offset(const TAMSMuxContext *c, const TAMSContainerContext *cc)
 {
     const AVFormatContext *oc = cc->sub_ctx;
     const AVStream *st = oc->streams[cc->reference_stream_index];
-    int64_t offset_ns = c->start_tai_ns;
+    int64_t shift;
 
-    if (cc->origin_set)
-        offset_ns += av_rescale_q(cc->origin_pts, cc->origin_tb, (AVRational){ 1, TAMS_TIMEBASE });
-
-    /* raw FLAC frames carry their sample number, so stay continuous */
     if ((oc->oformat->flags & AVFMT_NOTIMESTAMPS) && strcmp(oc->oformat->name, "flac"))
-        return cc->origin_set ? offset_ns : seg_start_tai_ns;
+        return c->start_tai_ns + (cc->first_ns != AV_NOPTS_VALUE ? cc->first_ns : cc->segment_start_ns);
 
-    offset_ns -= av_rescale_q(cffstream(st)->mux_ts_offset, st->time_base,
-                              (AVRational){ 1, TAMS_TIMEBASE });
-    /* mpegtsenc.c shifts every pts/dts by twice max_delay */
-    if (!strcmp(oc->oformat->name, "mpegts") && oc->max_delay > 0)
-        offset_ns -= 2 * av_rescale(oc->max_delay, TAMS_TIMEBASE, AV_TIME_BASE);
-    return offset_ns;
+    shift = av_rescale_q(cc->ts_shift, cc->ts_shift_tb, st->time_base) + cffstream(st)->mux_ts_offset;
+    return c->start_tai_ns - av_rescale_q(shift, st->time_base, (AVRational){ 1, TAMS_TIMEBASE });
+}
+
+/*
+ * Set the timestamp shift for the object that pkt (of stream ist) starts.
+ *
+ * The first object is not shifted: it keeps the input's timestamps, so any
+ * audio priming stays before the start of the Flow. A later object starts
+ * at 0 at its origin for the pts of the keyframe it was cut on.
+ */
+static void tams_set_ts_shift(const TAMSMuxContext *c, TAMSContainerContext *cc,
+                              const AVStream *ist, const AVPacket *pkt)
+{
+    const char *name = cc->oformat->name;
+    AVRational tb = ist->time_base;
+    int first = !cc->segment_index && !cc->has_prev;
+    int64_t origin = pkt->pts != AV_NOPTS_VALUE ? pkt->pts : 0;
+
+    /*
+     * MPEG-TS follows appnote 0002: PTS is the Flow time at 90 kHz modulo 2^33
+     * and ts_offset the time the counter last rolled over.
+     */
+    if (!strcmp(name, "mpegts")) {
+        int64_t start90 = av_rescale(c->start_tai_ns, 90000, TAMS_TIMEBASE);
+        int64_t abs90   = FFMAX(av_rescale(c->start_tai_ns + av_rescale_q(origin, tb, (AVRational){ 1, TAMS_TIMEBASE }),
+                                           90000, TAMS_TIMEBASE), 0);
+
+        cc->ts_shift    = start90 - (abs90 & ~((INT64_C(1) << 33) - 1));
+        cc->ts_shift_tb = (AVRational){ 1, 90000 };
+        return;
+    }
+
+    cc->ts_shift_tb = tb;
+
+    /* Raw FLAC frames carry their sample number, so stay continuous. */
+    if (!strcmp(name, "flac")) {
+        cc->ts_shift = 0;
+        return;
+    }
+
+    /* The first object keeps the input's timestamps, so any priming stays negative. */
+    if (first) {
+        cc->ts_shift = 0;
+        return;
+    }
+
+    /*
+     * Vorbis decodes each packet by overlapping it with the one before, so
+     * the first packet of a stream outputs no samples: its audio only comes
+     * out with the second packet. Ogg timestamps count decoded samples,
+     * so an Ogg reader takes the end of a stream's first packet as the
+     * point where the stream starts. Moving the origin to the end of the
+     * cut packet (duration d) puts it at [-d, 0), where the reader places it,
+     * so it reads back at its input time.
+     */
+    if (ist->codecpar->codec_id == AV_CODEC_ID_VORBIS && pkt->duration > 0 &&
+        (!strcmp(name, "ogg") || !strcmp(name, "oga")))
+        origin += pkt->duration;
+
+    cc->ts_shift = -origin;
+}
+
+/* Write pkt to the current object, rescaled and shifted into its stream's time base */
+static int tams_write_object(AVFormatContext *s, AVFormatContext *oc, int sub_idx,
+                             int64_t shift, AVRational shift_tb, AVPacket *pkt)
+{
+    AVRational itb = s->streams[pkt->stream_index]->time_base;
+    AVRational otb = oc->streams[sub_idx]->time_base;
+    int64_t pts = pkt->pts, dts = pkt->dts, duration = pkt->duration;
+    int stream_index = pkt->stream_index;
+    AVRational time_base = pkt->time_base;
+    int64_t off = av_rescale_q(shift, shift_tb, otb);
+    int ret;
+
+    pkt->stream_index = sub_idx;
+    av_packet_rescale_ts(pkt, itb, otb);
+    if (pkt->pts != AV_NOPTS_VALUE)
+        pkt->pts += off;
+    if (pkt->dts != AV_NOPTS_VALUE)
+        pkt->dts += off;
+    ret = av_write_frame(oc, pkt);
+    pkt->pts          = pts;
+    pkt->dts          = dts;
+    pkt->duration     = duration;
+    pkt->stream_index = stream_index;
+    pkt->time_base    = time_base;
+    return ret;
 }
 
 static int tams_restart_container_mux(AVFormatContext *s, TAMSContainerContext *cc)
 {
     int ret;
 
-    avformat_free_context(cc->sub_ctx);
-    cc->sub_ctx = NULL;
-
     ret = tams_build_container_mux(s, cc);
     if (ret < 0)
         return ret;
+
+    /*
+     * Only the first object holds the encoder's priming. A later object's
+     * header must not declare it (Opus pre-skip), or readers would trim
+     * real audio from its start.
+     */
+    for (int i = 0; i < cc->sub_ctx->nb_streams; i++) {
+        AVCodecParameters *par = cc->sub_ctx->streams[i]->codecpar;
+
+        if (par->codec_id != AV_CODEC_ID_OPUS)
+            continue;
+        par->initial_padding = 0;
+        if (par->extradata_size >= 19 && !memcmp(par->extradata, "OpusHead", 8))
+            AV_WL16(par->extradata + 10, 0);
+    }
+
     ret = avio_open_dyn_buf(&cc->sub_ctx->pb);
     if (ret < 0)
         return ret;
@@ -1942,52 +2099,79 @@ static int tams_restart_container_mux(AVFormatContext *s, TAMSContainerContext *
     return ret;
 }
 
-/*
- * Close the current segment's dyn-buf (the nested muxer's trailer must already
- * have been written). PUT its bytes to the container's owner Flow and
- * POST one /segments registration.
- *
- * If not final then call tams_alloc_next_storage() to eagerly allocate storage
- * for the next segment.
- */
-static int tams_flush_segment(AVFormatContext *s, TAMSContainerContext *cc,
-                              int64_t end_ns, int is_final)
+/* Move the current object to cc->prev, with the timerange ending at end_ns. */
+static int tams_close_current(AVFormatContext *s, TAMSContainerContext *cc, int64_t end_ns)
 {
     TAMSMuxContext *c = s->priv_data;
+    TAMSClosingObject *o = &cc->prev;
+
+    if (!cc->next_put_url) {
+        av_log(s, AV_LOG_ERROR, "TAMS: no pre-allocated storage for Flow %s\n", cc->owner_flow_id);
+        return AVERROR(EINVAL);
+    }
+
+    o->ts_offset   = tams_segment_ts_offset(c, cc);
+    o->sub_ctx     = cc->sub_ctx;
+    o->put_url     = cc->next_put_url;
+    o->object_id   = cc->next_object_id;
+    av_strlcpy(o->put_content_type, cc->next_put_content_type, sizeof(o->put_content_type));
+    o->start_ns    = cc->segment_start_ns;
+    o->end_ns      = FFMAX(end_ns, cc->segment_start_ns + 1);
+    o->last_ref_ns = cc->last_ref_ns;
+    o->nb_pending  = cc->nb_streams - 1;
+    memset(cc->passed_cut, 0, cc->nb_streams);
+    cc->sub_ctx        = NULL;
+    cc->next_put_url   = NULL;
+    cc->next_object_id = NULL;
+    cc->has_prev         = 1;
+    cc->has_segment_data = 0;
+    return 0;
+}
+
+/*
+ * Write the trailer of cc->prev, PUT its bytes to the container's owner Flow
+ * and POST one /segments registration.
+ */
+static int tams_flush_segment(AVFormatContext *s, TAMSContainerContext *cc)
+{
+    TAMSMuxContext *c = s->priv_data;
+    TAMSClosingObject *o = &cc->prev;
     uint8_t *data = NULL;
-    int size, ret = 0;
-    TAMSTimeRange tr = { 0 };
+    int size, ret;
     TAMSFlowSegment seg = { 0 };
     char segs_url[2100];
     AVBPrint json;
 
-    size = avio_close_dyn_buf(cc->sub_ctx->pb, &data);
-    cc->sub_ctx->pb = NULL;
-
-    tr.has_start = 1;
-    tr.start_inclusive = 1;
-    tr.start = c->start_tai_ns + cc->segment_start_ns;
-    tr.has_end = 1;
-    tr.end_inclusive = 0;
-    tr.end = c->start_tai_ns + FFMAX(end_ns, cc->segment_start_ns + 1);
-
-    if (!cc->next_put_url) {
-        av_log(s, AV_LOG_ERROR, "TAMS: no pre-allocated storage for Flow %s\n", cc->owner_flow_id);
-        ret = AVERROR(EINVAL);
+    cc->has_prev = 0;
+    /* no flush first: Ogg must keep a page for the trailer to mark end-of-stream */
+    ret = av_write_trailer(o->sub_ctx);
+    size = avio_close_dyn_buf(o->sub_ctx->pb, &data);
+    o->sub_ctx->pb = NULL;
+    avformat_free_context(o->sub_ctx);
+    o->sub_ctx = NULL;
+    if (ret < 0)
         goto end;
-    }
 
-    ret = tams_request(s, cc->next_put_url, "PUT", data, size,
-                       cc->next_put_content_type[0] ? cc->next_put_content_type : NULL, NULL);
+    ret = tams_request(s, o->put_url, "PUT", data, size,
+                       o->put_content_type[0] ? o->put_content_type : NULL, NULL);
     if (ret < 0) {
         av_log(s, AV_LOG_ERROR, "TAMS: failed to PUT segment bytes for Flow %s: %s\n",
                cc->owner_flow_id, av_err2str(ret));
         goto end;
     }
 
-    av_strlcpy(seg.object_id, cc->next_object_id, sizeof(seg.object_id));
-    seg.timerange = tr;
-    seg.ts_offset = tams_segment_ts_offset(c, cc, tr.start);
+    av_strlcpy(seg.object_id, o->object_id, sizeof(seg.object_id));
+    seg.timerange.has_start       = 1;
+    seg.timerange.start_inclusive = 1;
+    seg.timerange.start           = c->start_tai_ns + o->start_ns;
+    seg.timerange.has_end         = 1;
+    seg.timerange.end_inclusive   = 0;
+    seg.timerange.end             = c->start_tai_ns + o->end_ns;
+    seg.ts_offset = o->ts_offset;
+    if (o->last_ref_ns != INT64_MIN && o->last_ref_ns < o->end_ns) {
+        seg.last_duration     = o->end_ns - o->last_ref_ns;
+        seg.has_last_duration = 1;
+    }
 
     av_bprint_init(&json, 0, INT_MAX);
     ret = ff_tams_flow_segment_to_json(&json, &seg);
@@ -2004,22 +2188,16 @@ static int tams_flush_segment(AVFormatContext *s, TAMSContainerContext *cc,
         goto end;
     }
 
-    av_freep(&cc->next_put_url);
-    av_freep(&cc->next_object_id);
-
-    cc->segment_index++;
-    cc->has_segment_data  = 0;
-    cc->origin_set        = 0;
-    cc->segment_start_ns = end_ns;
-
-    if (!is_final) {
-        ret = tams_restart_container_mux(s, cc);
-        if (ret < 0)
-            goto end;
-        ret = tams_alloc_next_storage(s, cc);
-    }
+    cc->total_bytes += size;
+    cc->total_ns    += o->end_ns - o->start_ns;
+    cc->max_bit_rate = FFMAX(cc->max_bit_rate,
+                             av_rescale(size * INT64_C(8), TAMS_TIMEBASE, o->end_ns - o->start_ns));
+    if (!cc->segment_index++)
+        ret = tams_set_created_flow_status(s, cc, "ingesting");
 
 end:
+    av_freep(&o->put_url);
+    av_freep(&o->object_id);
     av_free(data);
     return ret;
 }
@@ -2164,6 +2342,9 @@ static int tams_init_flows(AVFormatContext *s)
         cc->has_segment_data = 0;
         cc->segment_start_ns = 0;
         cc->next_boundary_ns = cc->segment_duration_ns;
+        cc->passed_cut = av_calloc(cc->nb_streams, 1);
+        if (!cc->passed_cut)
+            return AVERROR(ENOMEM);
 
         ret = tams_alloc_next_storage(s, cc);
         if (ret < 0)
@@ -2191,6 +2372,7 @@ static int tams_write_packet(AVFormatContext *s, AVPacket *pkt)
     int container_idx = c->stream_to_container[pkt->stream_index];
     int sub_idx = c->stream_to_subindex[pkt->stream_index];
     TAMSContainerContext *cc = &c->container_ctxs[container_idx];
+    AVStream *ist = s->streams[pkt->stream_index];
     int64_t ts_ns = AV_NOPTS_VALUE;
     int ret;
 
@@ -2198,42 +2380,51 @@ static int tams_write_packet(AVFormatContext *s, AVPacket *pkt)
         return cc->error;
 
     if (pkt->pts != AV_NOPTS_VALUE)
-        ts_ns = av_rescale_q(pkt->pts, s->streams[pkt->stream_index]->time_base,
-                             (AVRational){ 1, TAMS_TIMEBASE });
+        ts_ns = av_rescale_q(pkt->pts, ist->time_base, (AVRational){ 1, TAMS_TIMEBASE });
+
+    if (cc->has_prev && sub_idx != cc->reference_stream_index && !cc->passed_cut[sub_idx]) {
+        /* still before the cut so the packet belongs to the previous object */
+        if (ts_ns != AV_NOPTS_VALUE && ts_ns < cc->prev.end_ns)
+            return tams_write_object(s, cc->prev.sub_ctx, sub_idx, cc->ts_shift_prev,
+                                     cc->ts_shift_prev_tb, pkt);
+        cc->passed_cut[sub_idx] = 1;
+        if (!--cc->prev.nb_pending && (ret = tams_flush_segment(s, cc)) < 0)
+            return cc->error = ret;
+    }
 
     /* cut at the first reference keyframe at/after the planned boundary */
     if (sub_idx == cc->reference_stream_index && (pkt->flags & AV_PKT_FLAG_KEY) &&
         cc->has_segment_data && ts_ns != AV_NOPTS_VALUE && ts_ns >= cc->next_boundary_ns) {
-        av_write_frame(cc->sub_ctx, NULL);
-        ret = av_write_trailer(cc->sub_ctx);
-        if (ret >= 0)
-            ret = tams_flush_segment(s, cc, ts_ns, 0);
-        if (ret < 0)
+        if (cc->has_prev && (ret = tams_flush_segment(s, cc)) < 0)
             return cc->error = ret;
-        cc->next_boundary_ns = ts_ns + cc->segment_duration_ns;
-        if (strcmp(cc->sub_ctx->oformat->name, "flac")) {
-            const char *name = cc->sub_ctx->oformat->name;
+        cc->ts_shift_prev    = cc->ts_shift;
+        cc->ts_shift_prev_tb = cc->ts_shift_tb;
+        if ((ret = tams_close_current(s, cc, ts_ns)) < 0 ||
+            (ret = tams_restart_container_mux(s, cc)) < 0 ||
+            (ret = tams_alloc_next_storage(s, cc)) < 0)
+            return cc->error = ret;
+        if (!cc->prev.nb_pending && (ret = tams_flush_segment(s, cc)) < 0)
+            return cc->error = ret;
 
-            cc->origin_pts = pkt->pts;
-            cc->origin_tb  = s->streams[pkt->stream_index]->time_base;
-            cc->origin_set = 1;
-            /*
-             * The first packet of a Vorbis stream decodes to no samples, so
-             * an Ogg reader takes it as ending where the stream starts: make
-             * the object start at 0 at the end of that packet.
-             */
-            if (s->streams[pkt->stream_index]->codecpar->codec_id == AV_CODEC_ID_VORBIS &&
-                (!strcmp(name, "ogg") || !strcmp(name, "oga")) && pkt->duration > 0)
-                cc->origin_pts += pkt->duration;
-        }
+        tams_set_ts_shift(c, cc, ist, pkt);
+        cc->has_segment_data = 1;
+        cc->segment_start_ns = ts_ns;
+        cc->segment_end_ns   = INT64_MIN;
+        cc->first_ns         = ts_ns;
+        cc->last_ref_ns      = INT64_MIN;
+        cc->next_boundary_ns = ts_ns + cc->segment_duration_ns;
     }
 
     if (!cc->has_segment_data) {
         cc->has_segment_data = 1;
         cc->segment_end_ns   = INT64_MIN;
+        cc->first_ns         = ts_ns;
+        cc->last_ref_ns      = INT64_MIN;
+        tams_set_ts_shift(c, cc, ist, pkt);
+        /* priming (negative timestamps) stays before the timeline start */
         if (sub_idx == cc->reference_stream_index && ts_ns != AV_NOPTS_VALUE) {
-            cc->segment_start_ns = ts_ns;
-            cc->next_boundary_ns  = ts_ns + cc->segment_duration_ns;
+            cc->segment_start_ns = FFMAX(ts_ns, 0);
+            cc->next_boundary_ns  = cc->segment_start_ns + cc->segment_duration_ns;
         }
     }
 
@@ -2242,59 +2433,64 @@ static int tams_write_packet(AVFormatContext *s, AVPacket *pkt)
      * audio ahead of video delayed for B-frames, so it is not left outside the
      * segment's timerange. Priming (negative) timestamps stay before it.
      */
-    if (!cc->segment_index && ts_ns != AV_NOPTS_VALUE && ts_ns >= 0 &&
+    if (!cc->segment_index && !cc->has_prev && ts_ns != AV_NOPTS_VALUE && ts_ns >= 0 &&
         ts_ns < cc->segment_start_ns)
         cc->segment_start_ns = ts_ns;
 
-    if (ts_ns != AV_NOPTS_VALUE)
+    if (ts_ns != AV_NOPTS_VALUE) {
         cc->segment_end_ns = FFMAX(cc->segment_end_ns, ts_ns +
-                                   av_rescale_q(pkt->duration, s->streams[pkt->stream_index]->time_base,
+                                   av_rescale_q(pkt->duration, ist->time_base,
                                                 (AVRational){ 1, TAMS_TIMEBASE }));
-
-    if (cc->origin_set) {
-        int64_t pts = pkt->pts, dts = pkt->dts;
-        int64_t origin = av_rescale_q(cc->origin_pts, cc->origin_tb,
-                                      s->streams[pkt->stream_index]->time_base);
-
-        if (pts != AV_NOPTS_VALUE)
-            pkt->pts -= origin;
-        if (dts != AV_NOPTS_VALUE)
-            pkt->dts -= origin;
-        ret = ff_write_chained(cc->sub_ctx, sub_idx, pkt, s, 0);
-        pkt->pts = pts;
-        pkt->dts = dts;
-        return ret;
+        if (cc->first_ns == AV_NOPTS_VALUE)
+            cc->first_ns = ts_ns;
+        if (sub_idx == cc->reference_stream_index && pkt->size)
+            cc->last_ref_ns = FFMAX(cc->last_ref_ns, ts_ns);
     }
 
-    return ff_write_chained(cc->sub_ctx, sub_idx, pkt, s, 0);
+    return tams_write_object(s, cc->sub_ctx, sub_idx, cc->ts_shift, cc->ts_shift_tb, pkt);
 }
 
 static int tams_finalize_container(AVFormatContext *s, TAMSContainerContext *cc)
 {
-    int ret, final_ret = 0;
+    int ret;
 
     if (cc->error || !cc->sub_ctx || !cc->sub_ctx->pb)
         return 0;
 
-    av_write_frame(cc->sub_ctx, NULL);
-    ret = av_write_trailer(cc->sub_ctx);
-    if (ret < 0)
-        final_ret = ret;
+    if (cc->has_prev && (ret = tams_flush_segment(s, cc)) < 0)
+        return ret;
 
-    if (avio_tell(cc->sub_ctx->pb) > 0 || cc->has_segment_data) {
+    if (cc->has_segment_data) {
         int64_t end_ns = cc->segment_end_ns != INT64_MIN ? cc->segment_end_ns
                                                          : cc->next_boundary_ns;
-        ret = tams_flush_segment(s, cc, end_ns, 1);
-        if (ret < 0 && final_ret >= 0)
-            final_ret = ret;
-    } else {
-        uint8_t *buf = NULL;
-        avio_close_dyn_buf(cc->sub_ctx->pb, &buf);
-        cc->sub_ctx->pb = NULL;
-        av_free(buf);
+        if ((ret = tams_close_current(s, cc, end_ns)) < 0)
+            return ret;
+        return tams_flush_segment(s, cc);
     }
+    return 0;
+}
 
-    return final_ret;
+/* avg_bit_rate/max_bit_rate in kbit/s, per appnote 0013 */
+static void tams_set_bit_rates(AVFormatContext *s, TAMSContainerContext *cc)
+{
+    TAMSMuxContext *c = s->priv_data;
+    TAMSFlow *flow = NULL;
+
+    if (!cc->total_ns)
+        return;
+    if (cc->nb_streams == 1) {
+        if (cc->flow_ctxs[0].created)
+            flow = &cc->flow_ctxs[0].flow;
+    } else {
+        for (int i = 0; i < c->nb_multi_flow_ctxs; i++)
+            if (c->multi_flow_ctxs[i].created &&
+                !strcmp(c->multi_flow_ctxs[i].flow_id, cc->owner_flow_id))
+                flow = &c->multi_flow_ctxs[i].flow;
+    }
+    if (!flow)
+        return;
+    flow->avg_bit_rate = av_rescale(cc->total_bytes * 8, TAMS_TIMEBASE, cc->total_ns * INT64_C(1000));
+    flow->max_bit_rate = cc->max_bit_rate / 1000;
 }
 
 static int tams_write_trailer(AVFormatContext *s)
@@ -2306,10 +2502,11 @@ static int tams_write_trailer(AVFormatContext *s)
         int r = tams_finalize_container(s, &c->container_ctxs[i]);
         if (r < 0 && ret >= 0)
             ret = r;
+        tams_set_bit_rates(s, &c->container_ctxs[i]);
     }
 
     if (ret >= 0)
-        ret = tams_set_created_flow_status(s, "closed_complete");
+        ret = tams_set_created_flow_status(s, NULL, "closed_complete");
 
     return ret;
 }
@@ -2371,7 +2568,7 @@ static const AVOption tams_options[] = {
         "standalone mono Flow)",
         OFFSET(flow_map_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS },
     { "container", "container format (default: codec-specific raw ES for a single-stream "
-        "container, fragmented mp4 for a shared multi-stream container)",
+        "container, else mp4)",
         OFFSET(container_name), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS },
     { "start_timestamp", "TAMS timestamp string overriding the wall-clock timeline origin",
         OFFSET(start_timestamp_str), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS },
