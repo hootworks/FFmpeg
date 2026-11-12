@@ -1939,7 +1939,7 @@ retry:
                 return ret;
 
             av_log(s, AV_LOG_TRACE, "Sub-stream segment packet: ");
-            av_pkt_dump_log2(s, AV_LOG_TRACE, pkt, 0, s->streams[pkt->stream_index]);
+            av_pkt_dump_log2(s, AV_LOG_TRACE, pkt, 0, segc->sub_ctx->streams[pkt->stream_index]);
 
             /*
              * best only picks the segment context: a shared container's next
