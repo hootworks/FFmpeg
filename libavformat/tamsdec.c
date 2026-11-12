@@ -1804,7 +1804,7 @@ static int tams_classify_packet(AVFormatContext *s,
 
         /*
          * Handle Flow and Segment start boundaries. A packet straddling the
-         * Flow start is kept as AV_PKT_DATA_SKIP_SAMPLES will indicate 
+         * Flow start is kept as AV_PKT_DATA_SKIP_SAMPLES will indicate
          * the number of samples to skip.
          */
         if (pts_ns < 0) {
