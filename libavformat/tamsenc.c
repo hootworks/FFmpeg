@@ -108,7 +108,7 @@ typedef struct TAMSContainerContext {
     /*
      * Added to every timestamp written to the current object
      * minus the pts of the reference keyframe that starts it. So each object
-     * starts at 0 (the first object and raw FLAC are not shifted) or for
+     * starts at 0 (the first object is not shifted) or for
      * MPEG-TS the shift that makes its PTS the Flow time at 90 kHz modulo 2^33.
      */
     int64_t ts_shift;           /* in ts_shift_tb */
@@ -217,11 +217,8 @@ static const struct {
     { AV_CODEC_ID_MPEG2VIDEO, "mpeg2video" },
     { AV_CODEC_ID_RAWVIDEO,   "matroska"   },
     { AV_CODEC_ID_AAC,        "adts"       },
-    { AV_CODEC_ID_OPUS,       "opus"       },
     { AV_CODEC_ID_MP2,        "mp2"        },
     { AV_CODEC_ID_MP3,        "mp3"        },
-    { AV_CODEC_ID_FLAC,       "flac"       },
-    { AV_CODEC_ID_VORBIS,     "oga"        },
     { AV_CODEC_ID_AC3,        "ac3"        },
     { AV_CODEC_ID_EAC3,       "eac3"       },
     { AV_CODEC_ID_WEBVTT,     "webvtt"     },
@@ -1964,9 +1961,7 @@ static int tams_alloc_next_storage(AVFormatContext *s, TAMSContainerContext *cc)
  *
  * Raw elementary-stream formats store no timestamps. In this case
  * a reader numbers their frames from 0 at the object's first packet and
- * therefore ts_offset is that packet's Flow time. Raw FLAC is the exception:
- * its frame headers carry the sample number from the start of the stream.
- * Therefore it is never shifted and ts_offset stays start_tai_ns.
+ * therefore ts_offset is that packet's Flow time.
  */
 static int64_t tams_segment_ts_offset(const TAMSMuxContext *c, const TAMSContainerContext *cc)
 {
@@ -1974,7 +1969,7 @@ static int64_t tams_segment_ts_offset(const TAMSMuxContext *c, const TAMSContain
     const AVStream *st = oc->streams[cc->reference_stream_index];
     int64_t shift;
 
-    if ((oc->oformat->flags & AVFMT_NOTIMESTAMPS) && strcmp(oc->oformat->name, "flac"))
+    if (oc->oformat->flags & AVFMT_NOTIMESTAMPS)
         return c->start_tai_ns + (cc->first_ns != AV_NOPTS_VALUE ? cc->first_ns : cc->segment_start_ns);
 
     shift = av_rescale_q(cc->ts_shift, cc->ts_shift_tb, st->time_base) + cffstream(st)->mux_ts_offset;
@@ -2012,30 +2007,11 @@ static void tams_set_ts_shift(const TAMSMuxContext *c, TAMSContainerContext *cc,
 
     cc->ts_shift_tb = tb;
 
-    /* Raw FLAC frames carry their sample number, so stay continuous. */
-    if (!strcmp(name, "flac")) {
-        cc->ts_shift = 0;
-        return;
-    }
-
     /* The first object keeps the input's timestamps, so any priming stays negative. */
     if (first) {
         cc->ts_shift = 0;
         return;
     }
-
-    /*
-     * Vorbis decodes each packet by overlapping it with the one before, so
-     * the first packet of a stream outputs no samples: its audio only comes
-     * out with the second packet. Ogg timestamps count decoded samples,
-     * so an Ogg reader takes the end of a stream's first packet as the
-     * point where the stream starts. Moving the origin to the end of the
-     * cut packet (duration d) puts it at [-d, 0), where the reader places it,
-     * so it reads back at its input time.
-     */
-    if (ist->codecpar->codec_id == AV_CODEC_ID_VORBIS && pkt->duration > 0 &&
-        (!strcmp(name, "ogg") || !strcmp(name, "oga")))
-        origin += pkt->duration;
 
     cc->ts_shift = -origin;
 }
@@ -2074,21 +2050,6 @@ static int tams_restart_container_mux(AVFormatContext *s, TAMSContainerContext *
     ret = tams_build_container_mux(s, cc);
     if (ret < 0)
         return ret;
-
-    /*
-     * Only the first object holds the encoder's priming. A later object's
-     * header must not declare it (Opus pre-skip), or readers would trim
-     * real audio from its start.
-     */
-    for (int i = 0; i < cc->sub_ctx->nb_streams; i++) {
-        AVCodecParameters *par = cc->sub_ctx->streams[i]->codecpar;
-
-        if (par->codec_id != AV_CODEC_ID_OPUS)
-            continue;
-        par->initial_padding = 0;
-        if (par->extradata_size >= 19 && !memcmp(par->extradata, "OpusHead", 8))
-            AV_WL16(par->extradata + 10, 0);
-    }
 
     ret = avio_open_dyn_buf(&cc->sub_ctx->pb);
     if (ret < 0)
@@ -2143,7 +2104,6 @@ static int tams_flush_segment(AVFormatContext *s, TAMSContainerContext *cc)
     AVBPrint json;
 
     cc->has_prev = 0;
-    /* no flush first: Ogg must keep a page for the trailer to mark end-of-stream */
     ret = av_write_trailer(o->sub_ctx);
     size = avio_close_dyn_buf(o->sub_ctx->pb, &data);
     o->sub_ctx->pb = NULL;

@@ -599,6 +599,14 @@ static int tams_create_stream(AVFormatContext *s, const TAMSFlow *flow,
     AVStream *st;
     int ret;
 
+    /* Skip a video or audio Flow whose codec has no TAMS MIME mapping, so other Flows still play */
+    if ((flow->format == TAMS_FORMAT_VIDEO || flow->format == TAMS_FORMAT_AUDIO) &&
+        flow->codec[0] && ff_tams_codec_from_mime(flow->codec) == AV_CODEC_ID_NONE) {
+        av_log(s, AV_LOG_WARNING, "TAMS flow %.8s: unsupported codec %s, skipping\n",
+               flow->id, flow->codec);
+        return 0;
+    }
+
     st = avformat_new_stream(s, NULL);
     if (!st)
         return AVERROR(ENOMEM);
@@ -1630,29 +1638,10 @@ static int tams_update_extradata(AVFormatContext *s, TAMSStreamContext *sc, int 
     sub_par = segc->sub_ctx->streams[sc->sub_stream_index]->codecpar;
     par     = parent_st->codecpar;
 
-    if (!sub_par->extradata || sub_par->extradata_size <= 0)
+    if (!sub_par->extradata || sub_par->extradata_size <= 0 ||
+        (sc->extradata_size == sub_par->extradata_size &&
+         !memcmp(sc->extradata, sub_par->extradata, sub_par->extradata_size)))
         return 0;
-    if (sc->extradata_size == sub_par->extradata_size) {
-        const uint8_t *a = sc->extradata, *b = sub_par->extradata;
-        int n = sub_par->extradata_size;
-
-        /*
-         * Bytes 10-11 of an Opus header are the pre-skip: the number of
-         * priming samples to drop when decoding starts at that object. The
-         * TAMS muxer writes 0 in every object after the first, as only the
-         * first holds priming. Headers differing only there are the same
-         * stream, so they are not passed on as new extradata: the Opus
-         * decoder resets on a new header and its output would then differ
-         * from a continuous decode. The nested demuxer already applies any
-         * pre-skip as skip samples on the object's first packet.
-         */
-        if (sub_par->codec_id == AV_CODEC_ID_OPUS && n >= 19 &&
-            !memcmp(b, "OpusHead", 8) &&
-            !memcmp(a, b, 10) && !memcmp(a + 12, b + 12, n - 12))
-            return 0;
-        if (!memcmp(a, b, n))
-            return 0;
-    }
 
     av_freep(&sc->extradata);
     sc->extradata = av_memdup(sub_par->extradata, sub_par->extradata_size);

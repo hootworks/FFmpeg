@@ -140,12 +140,9 @@ static const struct {
     { "video/raw",       AV_CODEC_ID_RAWVIDEO,   1 },
     { "audio/aac",       AV_CODEC_ID_AAC,        1 },
     { "audio/mp4a-latm", AV_CODEC_ID_AAC,        0 },
-    { "audio/opus",      AV_CODEC_ID_OPUS,       1 },
     { "audio/mp2",       AV_CODEC_ID_MP2,        1 },
     { "audio/mp3",       AV_CODEC_ID_MP3,        1 },
     { "audio/mpeg",      AV_CODEC_ID_MP3,        0 },
-    { "audio/flac",      AV_CODEC_ID_FLAC,       1 },
-    { "audio/vorbis",    AV_CODEC_ID_VORBIS,     1 },
     { "audio/ac3",       AV_CODEC_ID_AC3,        1 },
     { "audio/eac3",      AV_CODEC_ID_EAC3,       1 },
     /* one MIME each for integer and float PCM; bit_depth selects the sample size */
