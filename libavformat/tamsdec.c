@@ -1630,10 +1630,29 @@ static int tams_update_extradata(AVFormatContext *s, TAMSStreamContext *sc, int 
     sub_par = segc->sub_ctx->streams[sc->sub_stream_index]->codecpar;
     par     = parent_st->codecpar;
 
-    if (!sub_par->extradata || sub_par->extradata_size <= 0 ||
-        (sc->extradata_size == sub_par->extradata_size &&
-         !memcmp(sc->extradata, sub_par->extradata, sub_par->extradata_size)))
+    if (!sub_par->extradata || sub_par->extradata_size <= 0)
         return 0;
+    if (sc->extradata_size == sub_par->extradata_size) {
+        const uint8_t *a = sc->extradata, *b = sub_par->extradata;
+        int n = sub_par->extradata_size;
+
+        /*
+         * Bytes 10-11 of an Opus header are the pre-skip: the number of
+         * priming samples to drop when decoding starts at that object. The
+         * TAMS muxer writes 0 in every object after the first, as only the
+         * first holds priming. Headers differing only there are the same
+         * stream, so they are not passed on as new extradata: the Opus
+         * decoder resets on a new header and its output would then differ
+         * from a continuous decode. The nested demuxer already applies any
+         * pre-skip as skip samples on the object's first packet.
+         */
+        if (sub_par->codec_id == AV_CODEC_ID_OPUS && n >= 19 &&
+            !memcmp(b, "OpusHead", 8) &&
+            !memcmp(a, b, 10) && !memcmp(a + 12, b + 12, n - 12))
+            return 0;
+        if (!memcmp(a, b, n))
+            return 0;
+    }
 
     av_freep(&sc->extradata);
     sc->extradata = av_memdup(sub_par->extradata, sub_par->extradata_size);
@@ -1770,7 +1789,8 @@ static void tams_map_packet_timestamps(AVFormatContext *s,
  * Decide what to do with a packet by its position relative to the Flow
  * and segment boundaries:
  *
- *   - PTS before flow start                              -> TAMS_PKT_DISCARD (may be a decode reference)
+ *   - PTS and end before flow start                      -> TAMS_PKT_DISCARD (may be a decode reference)
+ *   - PTS before flow start, end after it                -> TAMS_PKT_OK (skip samples trim the priming)
  *   - PTS before segment start, before where this stream
  *     ended in the previous segment (prev_seg_end_ns)    -> TAMS_PKT_DISCARD (already delivered)
  *   - PTS before segment start, at/after prev_seg_end_ns -> TAMS_PKT_OK (new: see below)
@@ -1793,9 +1813,16 @@ static int tams_classify_packet(AVFormatContext *s,
     if (pts_ns != AV_NOPTS_VALUE) {
         int64_t flow_start = flow->timerange.has_start ? flow->timerange.start : 0;
 
-        /* Handle Flow and Segment start boundaries */
-        if (pts_ns < 0)
-            return TAMS_PKT_DISCARD;
+        /*
+         * Handle Flow and Segment start boundaries. A packet straddling the
+         * Flow start is kept as AV_PKT_DATA_SKIP_SAMPLES will indicate 
+         * the number of samples to skip.
+         */
+        if (pts_ns < 0) {
+            if (dur_ns <= 0 || pts_ns + dur_ns <= 0)
+                return TAMS_PKT_DISCARD;
+            return TAMS_PKT_OK;
+        }
 
         /*
          * A packet before the segment start is kept if it continues from where

@@ -3922,9 +3922,17 @@ rather than overwritten.
 Every segment is a self-contained Media Object written by a fresh instance of
 the container muxer, uploaded to a presigned URL obtained from the store and
 then registered against the Flow. Flows created by the muxer are given the
-@code{status} @code{ingesting} while segments are written and
-@code{closed_complete} once the output is finalized, which lets the TAMS
-demuxer follow the Flow live.
+@code{status} @code{awaiting_content} until their first segment is registered,
+@code{ingesting} while segments are written and @code{closed_complete} once the
+output is finalized, which lets the TAMS demuxer follow the Flow live. Their
+@code{avg_bit_rate} and @code{max_bit_rate} are set when the output is finalized.
+
+The first segment keeps the input's timestamps and every later segment's
+timestamps start at 0 at the keyframe it was cut on, except for MPEG-TS, whose
+PTS are the Flow time at 90 kHz modulo 2^33, and raw FLAC, which keeps the
+input's timestamps. The segment's @code{ts_offset} maps them onto the Flow
+timeline. MP4 segments are not fragmented: their edit lists keep the tracks in
+sync and mark the audio priming.
 
 A mono Flow's @code{label}/@code{description} come from that AVStream's
 @code{title}/@code{comment} metadata (settable via
@@ -3972,10 +3980,11 @@ space are the attr and token delimiters, @code{label=}/@code{description=}/
 
 @item container @var{format}
 Force the physical container format for every mapped container. Supported
-values are @code{mp4}, @code{mov}, @code{mpegts} and @code{matroska}, plus
-the codec-specific raw elementary-stream muxers (e.g. @code{h264}). By
-default, a single-stream container uses a raw elementary-stream muxer where
-one exists (Matroska for raw video), and anything else,
+values are @code{mp4}, @code{mov}, @code{mpegts}, @code{matroska} and
+@code{ogg}, plus the codec-specific raw elementary-stream muxers (e.g.
+@code{h264}). By default, a single-stream container uses a raw
+elementary-stream muxer where one exists (Matroska for raw video, Ogg for
+Vorbis), and anything else,
 including a multi-stream (multi-Flow) container, uses MP4.
 
 @item start_timestamp @var{timestamp}
