@@ -841,6 +841,7 @@ library:
 @item Super Audio CD (SACD)     @tab   @tab X
 @item SVAG                      @tab   @tab X
     @tab Audio format used in Konami PS2 games.
+@item TAMS (Time-Addressable Media Store) @tab @tab X
 @item TDSC                      @tab   @tab X
 @item Text files                @tab   @tab X
 @item THP                       @tab   @tab X
