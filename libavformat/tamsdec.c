@@ -600,7 +600,7 @@ static int tams_create_stream(AVFormatContext *s, const TAMSFlow *flow,
     AVStream *st;
     int ret;
 
-    /* Skip a video or audio Flow whose codec has no TAMS MIME mapping, so other Flows still play */
+    /* Skip a video or audio Flow when the codec has no TAMS MIME mapping */
     if ((flow->format == TAMS_FORMAT_VIDEO || flow->format == TAMS_FORMAT_AUDIO) &&
         flow->codec[0] && ff_tams_codec_from_mime(flow->codec) == AV_CODEC_ID_NONE) {
         av_log(s, AV_LOG_WARNING, "TAMS flow %.8s: unsupported codec %s, skipping\n",
@@ -1776,21 +1776,6 @@ static void tams_map_packet_timestamps(AVFormatContext *s,
 }
 
 /*
- * Decide what to do with a packet by its position relative to the Flow
- * and segment boundaries:
- *
- *   - PTS before flow start                              -> TAMS_PKT_DISCARD (may be a decode reference)
- *     except audio ending after the flow start            -> TAMS_PKT_OK (trimmed with skip samples)
- *   - PTS before segment start, before where this stream
- *     ended in the previous segment (prev_seg_end_ns)    -> TAMS_PKT_DISCARD (already delivered)
- *   - PTS before segment start, at/after prev_seg_end_ns -> TAMS_PKT_OK (new: see below)
- *   - PTS at/past flow end, DTS before flow end          -> TAMS_PKT_DISCARD (may be a decode reference)
- *   - PTS at/past flow end, DTS at/past flow end         -> TAMS_PKT_EOF
- *   - PTS at/past segment end, DTS at/before segment end -> TAMS_PKT_DISCARD (may be a decode reference)
- *   - PTS at/past segment end, DTS past segment end      -> TAMS_PKT_EOSEG
- *   - otherwise                                          -> TAMS_PKT_OK
- */
-/*
  * Mark the part of an audio packet before the Flow start as skip samples,
  * so the decoder drops it, e.g. the priming that shares the first packet
  * with real audio, or the audio before a segment that starts part way
@@ -1823,6 +1808,21 @@ static int tams_trim_flow_start(const TAMSSegmentContext *segc, const TAMSStream
     return 0;
 }
 
+/*
+ * Decide what to do with a packet by its position relative to the Flow
+ * and segment boundaries:
+ *
+ *   - PTS before flow start                              -> TAMS_PKT_DISCARD (may be a decode reference)
+ *     except audio ending after the flow start           -> TAMS_PKT_OK (trimmed with skip samples)
+ *   - PTS before segment start, before where this stream
+ *     ended in the previous segment (prev_seg_end_ns)    -> TAMS_PKT_DISCARD (already delivered)
+ *   - PTS before segment start, at/after prev_seg_end_ns -> TAMS_PKT_OK (new: see below)
+ *   - PTS at/past flow end, DTS before flow end          -> TAMS_PKT_DISCARD (may be a decode reference)
+ *   - PTS at/past flow end, DTS at/past flow end         -> TAMS_PKT_EOF
+ *   - PTS at/past segment end, DTS at/before segment end -> TAMS_PKT_DISCARD (may be a decode reference)
+ *   - PTS at/past segment end, DTS past segment end      -> TAMS_PKT_EOSEG
+ *   - otherwise                                          -> TAMS_PKT_OK
+ */
 static int tams_classify_packet(AVFormatContext *s,
                                 const TAMSSegmentContext *segc,
                                 const TAMSFlowSegment *seg,
@@ -1838,7 +1838,7 @@ static int tams_classify_packet(AVFormatContext *s,
 
         /*
          * Handle Flow and Segment start boundaries. An audio packet straddling
-         * the Flow start is kept: tams_trim_flow_start() then marks the part
+         * the Flow start is kept. Later tams_trim_flow_start() will mark the part
          * before the start as skip samples.
          */
         if (pts_ns < 0) {
