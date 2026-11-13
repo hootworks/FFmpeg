@@ -12,6 +12,8 @@
 /rtpdec
 /seek
 /srtp
+/tams
+/tamsdec
 /url
 /seek_utils
 /http
