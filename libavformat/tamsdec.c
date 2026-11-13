@@ -1778,8 +1778,7 @@ static void tams_map_packet_timestamps(AVFormatContext *s,
  * Decide what to do with a packet by its position relative to the Flow
  * and segment boundaries:
  *
- *   - PTS and end before flow start                      -> TAMS_PKT_DISCARD (may be a decode reference)
- *   - PTS before flow start, end after it                -> TAMS_PKT_OK (skip samples trim the priming)
+ *   - PTS before flow start                              -> TAMS_PKT_DISCARD (may be a decode reference)
  *   - PTS before segment start, before where this stream
  *     ended in the previous segment (prev_seg_end_ns)    -> TAMS_PKT_DISCARD (already delivered)
  *   - PTS before segment start, at/after prev_seg_end_ns -> TAMS_PKT_OK (new: see below)
@@ -1802,16 +1801,9 @@ static int tams_classify_packet(AVFormatContext *s,
     if (pts_ns != AV_NOPTS_VALUE) {
         int64_t flow_start = flow->timerange.has_start ? flow->timerange.start : 0;
 
-        /*
-         * Handle Flow and Segment start boundaries. A packet straddling the
-         * Flow start is kept as AV_PKT_DATA_SKIP_SAMPLES will indicate
-         * the number of samples to skip.
-         */
-        if (pts_ns < 0) {
-            if (dur_ns <= 0 || pts_ns + dur_ns <= 0)
-                return TAMS_PKT_DISCARD;
-            return TAMS_PKT_OK;
-        }
+        /* Handle Flow and Segment start boundaries */
+        if (pts_ns < 0)
+            return TAMS_PKT_DISCARD;
 
         /*
          * A packet before the segment start is kept if it continues from where
