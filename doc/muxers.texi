@@ -3930,8 +3930,8 @@ output is finalized, which lets the TAMS demuxer follow the Flow live. Their
 The first segment keeps the input's timestamps and every later segment's
 timestamps start at 0 at the keyframe it was cut on, except for MPEG-TS, whose
 PTS are the Flow time at 90 kHz modulo 2^33. The segment's @code{ts_offset}
-maps them onto the Flow timeline. MP4 segments are not fragmented: their edit lists keep the tracks in
-sync and mark the audio priming.
+maps them onto the Flow timeline. MP4 segments are not fragmented: their edit
+lists keep the tracks in sync and mark the audio priming.
 
 A mono Flow's @code{label}/@code{description} come from that AVStream's
 @code{title}/@code{comment} metadata (settable via
