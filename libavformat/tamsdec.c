@@ -41,6 +41,7 @@
 #include "libavutil/avstring.h"
 #include "libavutil/bprint.h"
 #include "libavutil/channel_layout.h"
+#include "libavutil/intreadwrite.h"
 #include "libavutil/macros.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
@@ -1779,6 +1780,7 @@ static void tams_map_packet_timestamps(AVFormatContext *s,
  * and segment boundaries:
  *
  *   - PTS before flow start                              -> TAMS_PKT_DISCARD (may be a decode reference)
+ *     except audio ending after the flow start            -> TAMS_PKT_OK (trimmed with skip samples)
  *   - PTS before segment start, before where this stream
  *     ended in the previous segment (prev_seg_end_ns)    -> TAMS_PKT_DISCARD (already delivered)
  *   - PTS before segment start, at/after prev_seg_end_ns -> TAMS_PKT_OK (new: see below)
@@ -1788,6 +1790,39 @@ static void tams_map_packet_timestamps(AVFormatContext *s,
  *   - PTS at/past segment end, DTS past segment end      -> TAMS_PKT_EOSEG
  *   - otherwise                                          -> TAMS_PKT_OK
  */
+/*
+ * Mark the part of an audio packet before the Flow start as skip samples,
+ * so the decoder drops it, e.g. the priming that shares the first packet
+ * with real audio, or the audio before a segment that starts part way
+ * through an object. An existing larger skip is kept.
+ */
+static int tams_trim_flow_start(const TAMSSegmentContext *segc, const TAMSStreamContext *sc,
+                                AVPacket *pkt)
+{
+    const AVCodecParameters *par = segc->sub_ctx->streams[sc->sub_stream_index]->codecpar;
+    uint8_t *side;
+    size_t size;
+    int64_t skip;
+
+    if (sc->media_type != AVMEDIA_TYPE_AUDIO || pkt->pts == AV_NOPTS_VALUE || pkt->pts >= 0 ||
+        par->sample_rate <= 0)
+        return 0;
+
+    skip = av_rescale_rnd(-pkt->pts, par->sample_rate, TAMS_TIMEBASE, AV_ROUND_NEAR_INF);
+    side = av_packet_get_side_data(pkt, AV_PKT_DATA_SKIP_SAMPLES, &size);
+    if (side && size >= 4) {
+        if (AV_RL32(side) < skip)
+            AV_WL32(side, skip);
+        return 0;
+    }
+    side = av_packet_new_side_data(pkt, AV_PKT_DATA_SKIP_SAMPLES, 10);
+    if (!side)
+        return AVERROR(ENOMEM);
+    memset(side, 0, 10);
+    AV_WL32(side, skip);
+    return 0;
+}
+
 static int tams_classify_packet(AVFormatContext *s,
                                 const TAMSSegmentContext *segc,
                                 const TAMSFlowSegment *seg,
@@ -1801,9 +1836,16 @@ static int tams_classify_packet(AVFormatContext *s,
     if (pts_ns != AV_NOPTS_VALUE) {
         int64_t flow_start = flow->timerange.has_start ? flow->timerange.start : 0;
 
-        /* Handle Flow and Segment start boundaries */
-        if (pts_ns < 0)
-            return TAMS_PKT_DISCARD;
+        /*
+         * Handle Flow and Segment start boundaries. An audio packet straddling
+         * the Flow start is kept: tams_trim_flow_start() then marks the part
+         * before the start as skip samples.
+         */
+        if (pts_ns < 0) {
+            if (sc->media_type != AVMEDIA_TYPE_AUDIO || dur_ns <= 0 || pts_ns + dur_ns <= 0)
+                return TAMS_PKT_DISCARD;
+            return TAMS_PKT_OK;
+        }
 
         /*
          * A packet before the segment start is kept if it continues from where
@@ -1983,6 +2025,11 @@ retry:
                     tams_close_segment(segc);
                     segc->cur_flow_segment_index++;
                     continue;
+                }
+
+                if ((ret = tams_trim_flow_start(segc, sc, pkt)) < 0) {
+                    av_packet_unref(pkt);
+                    return ret;
                 }
 
                 av_log(s, AV_LOG_TRACE, "Mapped TAMS packet: ");

@@ -2051,6 +2051,21 @@ static int tams_restart_container_mux(AVFormatContext *s, TAMSContainerContext *
     if (ret < 0)
         return ret;
 
+    /*
+     * Only the first object holds the encoder's priming. A later object's
+     * header must not declare any (e.g. Matroska CodecDelay, or the MP3
+     * Xing/LAME header from which a reader trims the decoder delay):
+     * the TAMS demuxer decodes it continuing from the previous object, so
+     * a reader trimming there would drop real audio.
+     */
+    for (int i = 0; i < cc->sub_ctx->nb_streams; i++)
+        cc->sub_ctx->streams[i]->codecpar->initial_padding = 0;
+    if (!strcmp(cc->oformat->name, "mp3")) {
+        ret = av_opt_set_int(cc->sub_ctx->priv_data, "write_xing", 0, 0);
+        if (ret < 0)
+            return ret;
+    }
+
     ret = avio_open_dyn_buf(&cc->sub_ctx->pb);
     if (ret < 0)
         return ret;
